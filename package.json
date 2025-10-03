@@ -10,7 +10,9 @@
     "start": "next start",
     "workers": "tsx scripts/run-workers.ts",
     "db:migrate": "tsx scripts/migrate.ts",
-    "load:test": "tsx scripts/load-test.ts"
+    "load:test": "tsx scripts/load-test.ts",
+    "test:auto-init": "tsx scripts/test-auto-init.ts",
+    "verify:auto-init": "tsx scripts/verify-auto-init-setup.ts"
   },
   "dependencies": {
     "@bsv/sdk": "^1.6.24",

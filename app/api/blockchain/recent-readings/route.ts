@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { query } from '@/lib/db'
+import { getBSVNetwork } from '@/lib/utils'
 
 export const runtime = 'nodejs'
 
@@ -25,22 +26,26 @@ export async function GET(req: NextRequest) {
         onchain_at,
         status
        FROM tx_log
-       WHERE status = 'confirmed'
+       WHERE status IN ('confirmed', 'pending')
          AND txid IS NOT NULL
          AND txid != 'failed'
          AND txid != ''
          AND txid NOT LIKE 'local_%'
+         AND txid NOT LIKE 'error_%'
+         AND LENGTH(txid) = 64
+         AND txid ~ '^[0-9a-fA-F]{64}$'
          AND COALESCE(onchain_at, collected_at) > NOW() - INTERVAL '24 hours'
        ORDER BY type, COALESCE(onchain_at, collected_at) DESC`
     )
 
-    const network = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
+    const network = getBSVNetwork()
 
     // Transform tx_log records into display format
     const readings = result.rows.map((tx) => ({
       txid: tx.txid,
       type: tx.type,
       timestamp: tx.onchain_at || tx.collected_at,
+      status: tx.status,
       data: {
         provider: tx.provider,
       },
@@ -59,4 +64,3 @@ export async function GET(req: NextRequest) {
     )
   }
 }
-

@@ -518,3 +518,90 @@ export async function setContactMessageArchived(id: number, archived: boolean): 
   await query(`UPDATE contact_messages SET archived = $2 WHERE id = $1`, [id, archived])
 }
 
+
+// Duplicate check helpers
+export async function hasAirQualityTxId(source_hash: string): Promise<boolean> {
+  const res = await query<{ txid: string | null }>(
+    `SELECT txid FROM air_quality_readings
+     WHERE source_hash = $1
+       AND txid IS NOT NULL
+       AND txid NOT LIKE 'local_%'
+       AND txid NOT LIKE 'error_%'
+     LIMIT 1`,
+    [source_hash],
+  )
+  return res.rows.length > 0 && !!res.rows[0].txid
+}
+
+export async function hasWaterLevelTxId(source_hash: string): Promise<boolean> {
+  const res = await query<{ txid: string | null }>(
+    `SELECT txid FROM water_level_readings
+     WHERE source_hash = $1
+       AND txid IS NOT NULL
+       AND txid NOT LIKE 'local_%'
+       AND txid NOT LIKE 'error_%'
+     LIMIT 1`,
+    [source_hash],
+  )
+  return res.rows.length > 0 && !!res.rows[0].txid
+}
+
+export async function hasSeismicTxId(source_hash: string): Promise<boolean> {
+  const res = await query<{ txid: string | null }>(
+    `SELECT txid FROM seismic_readings
+     WHERE source_hash = $1
+       AND txid IS NOT NULL
+       AND txid NOT LIKE 'local_%'
+       AND txid NOT LIKE 'error_%'
+     LIMIT 1`,
+    [source_hash],
+  )
+  return res.rows.length > 0 && !!res.rows[0].txid
+}
+
+export async function hasSeismicEventTxId(event_id: string): Promise<boolean> {
+  const res = await query<{ txid: string | null }>(
+    `SELECT txid FROM seismic_readings
+     WHERE event_id = $1
+       AND txid IS NOT NULL
+       AND txid NOT LIKE 'local_%'
+       AND txid NOT LIKE 'error_%'
+     LIMIT 1`,
+    [event_id],
+  )
+  return res.rows.length > 0 && !!res.rows[0].txid
+}
+
+export async function seismicEventExists(event_id: string): Promise<boolean> {
+  const res = await query<{ exists: boolean }>(
+    `SELECT true AS exists FROM seismic_readings WHERE event_id = $1 LIMIT 1`,
+    [event_id],
+  )
+  return res.rows.length > 0
+}
+
+export async function getSeismicByEventId(event_id: string): Promise<{ source_hash: string; txid: string | null } | null> {
+  const res = await query<{ source_hash: string; txid: string | null }>(
+    `SELECT source_hash, txid
+     FROM seismic_readings
+     WHERE event_id = $1
+     ORDER BY collected_at DESC
+     LIMIT 1`,
+    [event_id],
+  )
+  return res.rows?.[0] || null
+}
+
+export async function hasAdvancedTxId(source_hash: string): Promise<boolean> {
+  const res = await query<{ txid: string | null }>(
+    `SELECT txid FROM advanced_metrics_readings
+     WHERE source_hash = $1
+       AND txid IS NOT NULL
+       AND txid NOT LIKE 'local_%'
+       AND txid NOT LIKE 'error_%'
+     LIMIT 1`,
+    [source_hash],
+  )
+  return res.rows.length > 0 && !!res.rows[0].txid
+}
+

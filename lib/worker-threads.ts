@@ -9,7 +9,7 @@ import {
 import { TOP_100_CITIES } from './city-seeds'
 import { dedupeStore } from './stores'
 import { fetchJsonWithRetry } from './provider-fetch'
-import { insertAdvanced, insertAirQuality, insertWaterLevel, insertSeismic, calculateSourceHash, getOwmStationsPage, getStationsByProviderPage, readCursor, writeCursor } from './repositories'
+import { insertAdvanced, insertAirQuality, insertWaterLevel, insertSeismic, calculateSourceHash, getOwmStationsPage, getStationsByProviderPage, readCursor, writeCursor, hasAirQualityTxId, hasWaterLevelTxId, hasSeismicTxId, hasSeismicEventTxId, hasAdvancedTxId, getSeismicByEventId } from './repositories'
 import { providerConfigs } from './provider-registry'
 import { cursorStore } from './stores'
 
@@ -115,6 +115,15 @@ export abstract class BaseWorker {
           if (item.type === 'air-quality') {
             const envelope = { type: 'air_quality', aq: { ...item.measurement, location: item.location, timestamp: new Date(item.timestamp).toISOString(), source: item.source } }
             unifiedHash = calculateSourceHash(envelope)
+            // Skip if already on-chain
+            try {
+              if (await hasAirQualityTxId(unifiedHash)) {
+                if (bsvConfig.logging.level === 'debug') {
+                  console.log(`⏭️  Skipping air-quality - already on-chain (${unifiedHash.slice(0, 12)}...)`)
+                }
+                continue
+              }
+            } catch {}
             // WAQI sometimes returns '-' for pollutants; coerce to nulls
             const { toNumberOrNull } = await import('./utils')
             await insertAirQuality({
@@ -142,6 +151,15 @@ export abstract class BaseWorker {
           } else if (item.type === 'water-level') {
             const envelope = { type: 'water_levels', w: { ...item.measurement, location: item.location, timestamp: new Date(item.timestamp).toISOString(), source: item.source } }
             unifiedHash = calculateSourceHash(envelope)
+            // Skip if already on-chain
+            try {
+              if (await hasWaterLevelTxId(unifiedHash)) {
+                if (bsvConfig.logging.level === 'debug') {
+                  console.log(`⏭️  Skipping water-level - already on-chain (${unifiedHash.slice(0, 12)}...)`)
+                }
+                continue
+              }
+            } catch {}
             await insertWaterLevel({
               provider: item.source,
               station_code: String((item as any)?.stationId ?? (item.measurement as any)?.station_id ?? '' ) || null,
@@ -165,6 +183,17 @@ export abstract class BaseWorker {
           } else if (item.type === 'seismic') {
             const envelope = { type: 'seismic', s: { magnitude: (item.measurement as any)?.magnitude, depth: (item.measurement as any)?.depth, location: item.location, coordinates: { lat: (item.measurement as any)?.latitude, lon: (item.measurement as any)?.longitude }, timestamp: new Date(item.timestamp).toISOString(), source: item.source, event_id: item.eventId } }
             unifiedHash = calculateSourceHash(envelope)
+            // Skip if this event_id or hash is already on-chain/persisted
+            try {
+              const alreadyByHash = await hasSeismicTxId(unifiedHash)
+              const alreadyByEvent = item.eventId ? await hasSeismicEventTxId(item.eventId) : false
+              if (alreadyByHash || alreadyByEvent) {
+                if (bsvConfig.logging.level === 'debug') {
+                  console.log(`⏭️  Skipping seismic ${item.eventId || 'unknown'} - already on-chain`)
+                }
+                continue
+              }
+            } catch {}
             await insertSeismic({
               provider: item.source,
               event_id: item.eventId ?? null,
@@ -180,6 +209,15 @@ export abstract class BaseWorker {
             // Already persisted in AdvancedMetricsWorker with calculateSourceHash; mirror that envelope
             const envelope = { type: 'advanced', a: { ...item.measurement, location: item.location, timestamp: new Date(item.timestamp).toISOString(), source: item.source } }
             unifiedHash = calculateSourceHash(envelope)
+            // Skip if already on-chain
+            try {
+              if (await hasAdvancedTxId(unifiedHash)) {
+                if (bsvConfig.logging.level === 'debug') {
+                  console.log(`⏭️  Skipping advanced-metrics - already on-chain (${unifiedHash.slice(0, 12)}...)`)
+                }
+                continue
+              }
+            } catch {}
           } else {
             unifiedHash = this.generateSourceHash(item)
           }

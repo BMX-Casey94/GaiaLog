@@ -12,6 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { getBSVNetwork, getBSVExplorerUrl, getBSVAddressUrl, isValidTxId } from "@/lib/utils"
 
 interface ReadingData {
   provider?: string
@@ -21,6 +22,7 @@ interface Reading {
   txid: string
   type: string
   timestamp: string
+  status?: string
   data: ReadingData
 }
 
@@ -54,12 +56,12 @@ export function BlockchainExplorer() {
         
         // Transform the readings into display format with actual data
         const displayTransactions: TransactionDisplay[] = result.readings
-          .filter((reading: Reading) => reading.txid && reading.txid !== 'failed')
+          .filter((reading: Reading) => reading.txid && reading.txid !== 'failed' && isValidTxId(reading.txid))
           .map((reading: Reading) => ({
             id: reading.txid,
             type: formatType(reading.type),
             timestamp: formatTimestamp(reading.timestamp),
-            status: 'confirmed',
+            status: reading.status || 'confirmed',
             data: formatReadingData(reading.type, reading.data),
           }))
         
@@ -170,7 +172,12 @@ export function BlockchainExplorer() {
                         <div>
                           <div className="flex items-center space-x-2 mb-1">
                             <span className="font-medium text-white">{tx.type}</span>
-                            <Badge variant="secondary" className="bg-green-900/50 text-green-400 rounded-sm">
+                            <Badge 
+                              variant="secondary" 
+                              className={tx.status === 'pending' 
+                                ? "bg-yellow-900/50 text-yellow-400 rounded-sm" 
+                                : "bg-green-900/50 text-green-400 rounded-sm"}
+                            >
                               {tx.status}
                             </Badge>
                           </div>

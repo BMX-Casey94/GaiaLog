@@ -60,7 +60,8 @@ export async function markQueueItemProcessing(id: string): Promise<void> {
 }
 
 export async function markQueueItemCompleted(id: string): Promise<void> {
-  await query(`UPDATE worker_queue SET status='completed', last_error=NULL, updated_at=now() WHERE id=$1`, [id])
+  // Completed items are transient; remove them immediately to avoid DB bloat
+  await query(`DELETE FROM worker_queue WHERE id=$1`, [id])
 }
 
 export async function markQueueItemFailed(id: string, error: string): Promise<void> {
@@ -76,6 +77,17 @@ export async function requeueQueueItem(id: string, nextRetryCount: number, whenM
      WHERE id=$1`,
     [id, nextRetryCount, nextTs]
   )
+}
+
+// Delete failed items older than the provided retention window (default 24 hours)
+export async function cleanupOldFailedItems(hoursToRetain: number = 24): Promise<number> {
+  const res = await query(
+    `DELETE FROM worker_queue
+     WHERE status='failed'
+       AND updated_at < now() - interval '${hoursToRetain} hours'
+     RETURNING id`
+  )
+  return ((res as any).rows || []).length || 0
 }
 
 

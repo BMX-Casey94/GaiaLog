@@ -125,6 +125,9 @@ export class BlockchainService {
     usedKeys: Set<string>
     inFlight: Promise<void> | null
   }> = new Map()
+  // Transaction status aggregation to reduce log noise
+  private txStatusBatch: { confirmed: string[], pending: string[], notFound: string[] } = { confirmed: [], pending: [], notFound: [] }
+  private batchIntervalId: NodeJS.Timeout | null = null
 
   constructor() {
     try {
@@ -145,6 +148,9 @@ export class BlockchainService {
         configured.forEach(k => pushUnique(k))
         this.wifsForSend = list
       } catch {}
+      
+      // Start transaction status batch logging
+      this.startTxStatusBatchLogging()
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
       this.lastInitError = msg
@@ -163,6 +169,29 @@ export class BlockchainService {
         console.error('Failed to lazily initialize wallet:', msg)
       }
     }
+  }
+
+  private startTxStatusBatchLogging(): void {
+    // Log aggregated transaction statuses every 60 seconds instead of individually
+    this.batchIntervalId = setInterval(() => {
+      const { confirmed, pending, notFound } = this.txStatusBatch
+      
+      if (confirmed.length > 0 || pending.length > 0 || notFound.length > 0) {
+        console.log(`📊 Transaction Status Update:`)
+        if (confirmed.length > 0) {
+          console.log(`   ✅ Confirmed: ${confirmed.length} transactions`)
+        }
+        if (pending.length > 0) {
+          console.log(`   ⏳ Pending in mempool: ${pending.length} transactions`)
+        }
+        if (notFound.length > 0) {
+          console.log(`   ⚠️  Not found on WOC: ${notFound.length} transactions (may be rejected or still propagating)`)
+        }
+        
+        // Reset batch
+        this.txStatusBatch = { confirmed: [], pending: [], notFound: [] }
+      }
+    }, 60000) // Every 60 seconds
   }
 
   private async getFirstWalletWithSpendableUtxos(): Promise<{ wif: string; index: number; address: string; utxos: any[] } | null> {
@@ -400,14 +429,14 @@ export class BlockchainService {
       }
 
       this.transactionLog.push(transactionLog)
-      // Persist to tx_log (confirmed on broadcast)
+      // Persist to tx_log (pending on broadcast, will be confirmed later)
       try {
         await upsertTxLog({
           txid,
           type: data.stream,
           provider: (data as any)?.payload?.source || 'unknown',
           collected_at: new Date(data.timestamp),
-          status: 'confirmed',
+          status: 'pending',
           onchain_at: new Date(),
           fee_sats: null,
           wallet_index: walletIndexForLog,
@@ -417,6 +446,9 @@ export class BlockchainService {
       } catch (e) {
         // Non-fatal
       }
+
+      // Schedule confirmation check after a delay to update status
+      this.scheduleConfirmationCheck(txid, data.stream).catch(() => {})
 
       this.broadcastCountSinceLastSample++
       // Release global reservation after successful broadcast
@@ -656,36 +688,64 @@ export class BlockchainService {
         }
       }
 
-      // Fallback: GorillaPool mAPI
-      const gpUrl = `${GORILLAPOOL_MAPI_ENDPOINT.replace(/\/$/, '')}/mapi/tx`
-      const gpRes = await fetch(gpUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rawtx: serializedTx })
-      })
-      const gpText = await gpRes.text()
-      if (!gpRes.ok) {
-        throw new Error(`Broadcast failed: ${gpRes.status} ${gpText}`)
-      }
-      try {
-        const parsed = JSON.parse(gpText)
-        // mAPI may return txid at top-level or inside JSON string payload
-        if (parsed && typeof parsed.txid === 'string' && parsed.txid.length > 0) return parsed.txid
-        const payloadStr = parsed && typeof parsed.payload === 'string' ? parsed.payload : null
-        if (payloadStr) {
-          try {
-            const inner = JSON.parse(payloadStr)
-            if (inner && typeof inner.txid === 'string' && inner.txid.length > 0) return inner.txid
-            if (inner && typeof inner.hash === 'string' && inner.hash.length > 0) return inner.hash
-          } catch {}
-        }
-      } catch {}
-      return gpText.replace(/"/g, '').trim()
+      // No fallback - let the transaction fail and be re-queued
+      throw new Error(`ARC broadcast failed: ${arcText}`)
     } catch (error) {
       console.error('Error broadcasting transaction:', error)
       throw error
     }
   }
+
+  private async scheduleConfirmationCheck(txid: string, streamType: string): Promise<void> {
+    // Wait 60 seconds for transaction to propagate and get indexed (increased from 30s)
+    setTimeout(async () => {
+      try {
+        const network = WOC_NETWORK
+        const wocUrl = `https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`
+        const headers: Record<string, string> = {}
+        if (WHATSONCHAIN_API_KEY) {
+          headers['woc-api-key'] = WHATSONCHAIN_API_KEY
+        }
+        
+        const response = await fetch(wocUrl, { headers })
+        
+        if (response.ok) {
+          const txData = await response.json()
+          const confirmations = txData.confirmations || 0
+          
+          // Update status to confirmed if it has at least 1 confirmation
+          if (confirmations > 0) {
+            await upsertTxLog({
+              txid,
+              type: streamType,
+              provider: 'auto-confirmed',
+              collected_at: new Date(),
+              status: 'confirmed',
+              onchain_at: new Date(),
+              fee_sats: null,
+              wallet_index: null,
+              retries: null,
+              error: null,
+            })
+            // Add to batch instead of logging immediately
+            this.txStatusBatch.confirmed.push(txid.substring(0, 12))
+          } else {
+            // Still in mempool, check again later (increased delay to 2 minutes)
+            this.txStatusBatch.pending.push(txid.substring(0, 12))
+            setTimeout(() => this.scheduleConfirmationCheck(txid, streamType).catch(() => {}), 120000)
+          }
+        } else if (response.status === 404) {
+          // Transaction not found - might have been rejected or not yet indexed
+          this.txStatusBatch.notFound.push(txid.substring(0, 12))
+          // Check one more time after 2 minutes (increased from 60s)
+          setTimeout(() => this.scheduleConfirmationCheck(txid, streamType).catch(() => {}), 120000)
+        }
+      } catch (error) {
+        // Silently fail - confirmation checking is best-effort
+      }
+    }, 60000) // Initial check after 60 seconds (increased from 30s)
+  }
+
   private p2pkhLockingScriptHexFromWif(wif: string): string {
     const key = SDKPrivateKey.fromWif(wif)
     const pubKeyHash = Buffer.from(key.toPublicKey().toHash())
@@ -786,6 +846,14 @@ export class BlockchainService {
     } catch (error) {
       console.error('Error verifying transaction:', error)
       return false
+    }
+  }
+
+  // Cleanup method to stop batch logging
+  destroy(): void {
+    if (this.batchIntervalId) {
+      clearInterval(this.batchIntervalId)
+      this.batchIntervalId = null
     }
   }
 }

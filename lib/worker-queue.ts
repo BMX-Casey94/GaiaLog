@@ -2,8 +2,8 @@ import { bsvTransactionService, BSVTransactionData } from './bsv-transaction-ser
 import { blockchainService } from './blockchain'
 import { bsvConfig } from './bsv-config'
 import { walletManager } from './wallet-manager'
-import { setAdvancedTxId, setAirQualityTxId, setSeismicTxId, setWaterLevelTxId } from './repositories'
-import { ensureQueueTable, enqueueQueueItem, loadPendingQueueItems, markQueueItemCompleted, markQueueItemFailed, markQueueItemProcessing, requeueQueueItem } from './queue-repository'
+import { setAdvancedTxId, setAirQualityTxId, setSeismicTxId, setWaterLevelTxId, hasAirQualityTxId, hasWaterLevelTxId, hasSeismicTxId, hasAdvancedTxId } from './repositories'
+import { ensureQueueTable, enqueueQueueItem, loadPendingQueueItems, markQueueItemCompleted, markQueueItemFailed, markQueueItemProcessing, requeueQueueItem, cleanupOldFailedItems } from './queue-repository'
 
 export interface QueueItem {
   id: string
@@ -34,6 +34,7 @@ export class WorkerQueue {
   private failedItems: QueueItem[] = []
   private isProcessing = false
   private processingInterval: NodeJS.Timeout | null = null
+  private cleanupInterval: NodeJS.Timeout | null = null
   private stats = {
     totalProcessed: 0,
     totalFailed: 0,
@@ -158,6 +159,20 @@ export class WorkerQueue {
     this.processingInterval = setInterval(async () => {
       await this.processQueue()
     }, bsvConfig.queue.processingIntervalMs)
+
+    // Periodic cleanup of old failed items (keep 24h for debugging)
+    this.cleanupInterval = setInterval(async () => {
+      try {
+        await cleanupOldFailedItems(24)
+      } catch {}
+    }, 60 * 60 * 1000)
+
+    // Run an initial delayed cleanup shortly after startup
+    setTimeout(async () => {
+      try {
+        await cleanupOldFailedItems(24)
+      } catch {}
+    }, 5 * 60 * 1000)
   }
 
   private async processQueue(): Promise<void> {
@@ -239,6 +254,26 @@ export class WorkerQueue {
       // Prefer direct on-chain write via blockchain service
       const stream = this.mapTypeToStream(item.data.type)
       const payload = this.buildPayloadFromItem(item)
+      // Hard idempotency guard: if DB already has a txid for this reading, skip
+      try {
+        const sourceHash = item.data.source_hash
+        if (typeof sourceHash === 'string' && sourceHash.length > 0) {
+          let alreadyOnChain = false
+          if (stream === 'air_quality') alreadyOnChain = await hasAirQualityTxId(sourceHash)
+          else if (stream === 'water_levels') alreadyOnChain = await hasWaterLevelTxId(sourceHash)
+          else if (stream === 'seismic_activity') alreadyOnChain = await hasSeismicTxId(sourceHash)
+          else if (stream === 'advanced_metrics') alreadyOnChain = await hasAdvancedTxId(sourceHash)
+          if (alreadyOnChain) {
+            if (bsvConfig.logging.level === 'debug') {
+              console.log(`⏭️  Skipping already-on-chain item ${item.id} for stream ${stream}`)
+            }
+            this.completedItems.push(item)
+            this.stats.totalProcessed++
+            markQueueItemCompleted(item.id).catch(() => {})
+            return
+          }
+        }
+      } catch {}
       let resultTxid: string | null = null
       let wasBroadcast = false
       try {
@@ -249,31 +284,15 @@ export class WorkerQueue {
         })
         wasBroadcast = true
       } catch (e) {
-        // Optional placeholder path for development only
-        const allowFallback = process.env.BSV_ENABLE_PLACEHOLDER_FALLBACK === 'true'
-        if (!allowFallback) {
-          await this.handleFailedItem(item, e instanceof Error ? e.message : 'Unknown error')
-          return
-        }
-        const result = await bsvTransactionService.createBRC100Transaction(item.data)
-        if (!result.success) {
-          await this.handleFailedItem(item, result.error || 'Unknown error')
-          return
-        }
-        resultTxid = result.txid || null
-        wasBroadcast = false
+        // Always re-queue failed transactions instead of using fallbacks
+        await this.handleFailedItem(item, e instanceof Error ? e.message : 'Unknown error')
+        return
       }
 
-      // If no txid yet (e.g. temporary broadcast issue), try brief backoff+retry once
+      // If no txid yet, the transaction failed and should be re-queued
       if (!resultTxid) {
-        await new Promise(r => setTimeout(r, 1500))
-        try {
-          resultTxid = await blockchainService.writeToChain({
-            stream,
-            timestamp: item.data.timestamp,
-            payload,
-          })
-        } catch {}
+        await this.handleFailedItem(item, 'Transaction broadcast failed - no txid returned')
+        return
       }
 
       if (resultTxid && wasBroadcast) {
@@ -415,9 +434,65 @@ export class WorkerQueue {
     this.stats.totalRetries++
 
     if (item.retryCount <= item.maxRetries) {
-      // Retry with exponential backoff
-      const delay = bsvConfig.transaction.retryDelayMs * Math.pow(2, item.retryCount - 1)
-      console.log(`🔄 Retrying item ${item.id} (attempt ${item.retryCount}/${item.maxRetries}) in ${delay}ms`)
+      // Determine retry strategy based on error type
+      let delay = bsvConfig.transaction.retryDelayMs * Math.pow(2, item.retryCount - 1)
+      let shouldForceUtxoRefresh = false
+      let retryMessage = ''
+
+      // Enhanced error-specific retry strategies
+      if (error.includes('MEMPOOL_CONFLICT')) {
+        // Mempool conflict: wait longer and force UTXO refresh to use different inputs
+        delay = Math.max(delay, 30000) // At least 30 seconds
+        shouldForceUtxoRefresh = true
+        retryMessage = 'mempool conflict detected, forcing UTXO refresh'
+      } else if (error.includes('ALREADY_KNOWN')) {
+        // Transaction already in mempool/blockchain - don't retry
+        console.log(`ℹ️  Transaction ${item.id} already known to network - marking as completed`)
+        this.completedItems.push(item)
+        this.stats.totalProcessed++
+        markQueueItemCompleted(item.id).catch(() => {})
+        return
+      } else if (error.includes('LOW_FEE')) {
+        // Insufficient fee: wait for mempool to clear or increase retry delay
+        delay = Math.max(delay, 60000) // At least 60 seconds
+        retryMessage = 'low fee, waiting for mempool to clear'
+      } else if (error.includes('No UTXOs available') || error.includes('No reservable UTXO')) {
+        // UTXO exhaustion: wait longer for UTXOs to confirm
+        delay = Math.max(delay, 45000) // At least 45 seconds
+        shouldForceUtxoRefresh = true
+        retryMessage = 'UTXO exhaustion, waiting for confirmations'
+      } else if (error.includes('already reserved')) {
+        // UTXO lock conflict: short delay and refresh
+        delay = Math.max(delay, 5000) // At least 5 seconds
+        shouldForceUtxoRefresh = true
+        retryMessage = 'UTXO lock conflict, refreshing UTXO pool'
+      } else if (error.includes('ARC broadcast failed')) {
+        // ARC broadcast failure: wait longer and force UTXO refresh
+        delay = Math.max(delay, 30000) // At least 30 seconds
+        shouldForceUtxoRefresh = true
+        retryMessage = 'ARC broadcast failed, refreshing UTXOs and retrying'
+      } else if (error.includes('Missing inputs')) {
+        // Missing inputs: wait longer and force UTXO refresh
+        delay = Math.max(delay, 45000) // At least 45 seconds
+        shouldForceUtxoRefresh = true
+        retryMessage = 'missing inputs, refreshing UTXOs and retrying'
+      } else {
+        retryMessage = 'general error'
+      }
+
+      console.log(`🔄 Retrying item ${item.id} (attempt ${item.retryCount}/${item.maxRetries}) in ${(delay/1000).toFixed(1)}s [${retryMessage}]`)
+      
+      // Force UTXO lock cleanup if needed
+      if (shouldForceUtxoRefresh) {
+        try {
+          // Clear any stale UTXO locks to free up previously reserved UTXOs
+          const { releaseAllExpiredLocks } = await import('./utxo-locks')
+          await releaseAllExpiredLocks()
+          // Note: UTXO provider fetches fresh data on each call, no cache to clear
+        } catch (e) {
+          // Continue even if lock cleanup fails
+        }
+      }
       
       setTimeout(() => {
         if (item.priority === 'high') {
@@ -470,6 +545,10 @@ export class WorkerQueue {
     if (this.processingInterval) {
       clearInterval(this.processingInterval)
       this.processingInterval = null
+    }
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval)
+      this.cleanupInterval = null
     }
     this.isProcessing = false
     console.log('🛑 Worker queue processing stopped')

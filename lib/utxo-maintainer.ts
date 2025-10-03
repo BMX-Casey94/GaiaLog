@@ -116,6 +116,8 @@ export function startUtxoMaintainer(): void {
   if (disabled) return
   let running = false
   let lastSplitAt: number | null = null
+  let lastErrorLoggedAt: number | null = null
+  
   const cycle = async () => {
     if (running) return
     running = true
@@ -129,7 +131,13 @@ export function startUtxoMaintainer(): void {
             console.log(`🔧 UTXO split broadcasted for ${split.address}: ${split.txid}`)
           }
         } catch (e) {
-          console.warn('UTXO maintainer error:', e)
+          const msg = e instanceof Error ? e.message : String(e)
+          // Only log errors every 5 minutes to avoid spam
+          const now = Date.now()
+          if (!lastErrorLoggedAt || (now - lastErrorLoggedAt) > 300000) {
+            console.error('UTXO maintainer error:', msg)
+            lastErrorLoggedAt = now
+          }
         }
       }
     } finally {
