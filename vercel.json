@@ -1,0 +1,9 @@
+{
+  "crons": [
+    {
+      "path": "/api/workers/auto-start",
+      "schedule": "*/10 * * * *"
+    }
+  ]
+}
+
