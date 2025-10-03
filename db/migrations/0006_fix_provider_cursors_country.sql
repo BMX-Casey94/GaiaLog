@@ -8,3 +8,4 @@ ALTER TABLE provider_cursors ALTER COLUMN country SET NOT NULL;
 
 
 
+

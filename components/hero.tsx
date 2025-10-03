@@ -27,21 +27,42 @@ export function Hero() {
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const response = await fetch('/api/hero-stats')
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 10000) // 10 second timeout
+        
+        const response = await fetch('/api/hero-stats', {
+          signal: controller.signal,
+          headers: {
+            'Cache-Control': 'max-age=30' // Client-side caching
+          }
+        })
+        
+        clearTimeout(timeoutId)
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`)
+        }
+        
         const result = await response.json()
         if (result.success) {
           setStats(result.data)
         }
       } catch (error) {
-        console.error('Error fetching hero stats:', error)
+        if (error instanceof Error && error.name === 'AbortError') {
+          console.warn('Hero stats request timed out')
+        } else {
+          console.error('Error fetching hero stats:', error)
+        }
       } finally {
         setLoading(false)
       }
     }
 
+    // Initial fetch
     fetchStats()
-    // Refresh every 60 seconds
-    const interval = setInterval(fetchStats, 60000)
+    
+    // Refresh every 30 seconds (reduced from 60s for better UX)
+    const interval = setInterval(fetchStats, 30000)
     return () => clearInterval(interval)
   }, [])
 

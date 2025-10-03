@@ -1,59 +1,76 @@
 import { NextResponse } from 'next/server'
 import { query } from '@/lib/db'
+import { heroStatsCache } from '@/lib/hero-cache'
 
 export const runtime = 'nodejs'
 
 export async function GET() {
   try {
-    // Get latest air quality data
-    const airQualityResult = await query(
-      `SELECT aqi, collected_at
-       FROM air_quality_readings
-       WHERE aqi IS NOT NULL
-       ORDER BY collected_at DESC
-       LIMIT 1`
-    )
+    // Check cache first
+    const cachedData = heroStatsCache.get('hero-stats')
+    if (cachedData) {
+      return NextResponse.json({
+        success: true,
+        data: cachedData,
+        cached: true
+      })
+    }
 
-    // Get total transaction count from tx_log
-    const txCountResult = await query(
-      `SELECT COUNT(*)::text as count
-       FROM tx_log
-       WHERE status = 'confirmed'
-         AND txid IS NOT NULL
-         AND txid != 'failed'
-         AND txid != ''
-         AND txid NOT LIKE 'local_%'`
-    )
+    // Single optimized query to get all hero stats data
+    const result = await query(`
+      WITH air_quality_latest AS (
+        SELECT aqi, collected_at
+        FROM air_quality_readings
+        WHERE aqi IS NOT NULL
+        ORDER BY collected_at DESC
+        LIMIT 1
+      ),
+      blockchain_stats AS (
+        SELECT 
+          COUNT(*) as total_transactions,
+          MAX(COALESCE(onchain_at, collected_at)) as latest_transaction
+        FROM tx_log
+        WHERE status IN ('confirmed', 'pending')
+          AND txid IS NOT NULL
+          AND txid != 'failed'
+          AND txid != ''
+          AND txid NOT LIKE 'local_%'
+          AND txid NOT LIKE 'error_%'
+          AND LENGTH(txid) = 64
+          AND txid ~ '^[0-9a-fA-F]{64}$'
+      )
+      SELECT 
+        aq.aqi,
+        aq.collected_at as air_quality_updated,
+        bs.total_transactions,
+        bs.latest_transaction
+      FROM air_quality_latest aq
+      CROSS JOIN blockchain_stats bs
+    `)
 
-    // Get latest blockchain transaction timestamp
-    const latestTxResult = await query(
-      `SELECT COALESCE(onchain_at, collected_at) as timestamp
-       FROM tx_log
-       WHERE status = 'confirmed'
-         AND txid IS NOT NULL
-         AND txid != 'failed'
-         AND txid != ''
-         AND txid NOT LIKE 'local_%'
-       ORDER BY COALESCE(onchain_at, collected_at) DESC
-       LIMIT 1`
-    )
+    const row = result.rows[0] || {}
+    const airQuality = { aqi: row.aqi, collected_at: row.air_quality_updated }
+    const txCount = parseInt(row.total_transactions || '0')
+    const latestTx = row.latest_transaction || null
 
-    const airQuality = airQualityResult.rows[0] || { aqi: null, collected_at: null }
-    const txCount = parseInt(txCountResult.rows[0]?.count || '0')
-    const latestTx = latestTxResult.rows[0]?.timestamp || null
+    const responseData = {
+      airQuality: {
+        aqi: airQuality.aqi,
+        lastUpdated: airQuality.collected_at,
+      },
+      blockchain: {
+        totalTransactions: txCount,
+        lastTransaction: latestTx,
+      },
+    }
+
+    // Update cache
+    heroStatsCache.set('hero-stats', responseData, 30000) // 30 seconds TTL
 
     return NextResponse.json({
       success: true,
-      data: {
-        airQuality: {
-          aqi: airQuality.aqi,
-          lastUpdated: airQuality.collected_at,
-        },
-        blockchain: {
-          totalTransactions: txCount,
-          lastTransaction: latestTx,
-        },
-      },
+      data: responseData,
+      cached: false
     })
   } catch (error) {
     console.error('Hero stats API error:', error)
@@ -63,4 +80,5 @@ export async function GET() {
     )
   }
 }
+
 
