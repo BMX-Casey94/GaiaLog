@@ -784,7 +784,9 @@ export class DataCollector {
           }
         }
       } catch (e) {
-        console.error('tx_log upsert error:', e)
+        if (process.env.DEBUG_DB_WRITES === '1') {
+          try { console.error('tx_log upsert error:', e) } catch {}
+        }
       }
       console.log(`✅ Successfully wrote ${stream} data to blockchain`)
     } catch (error) {
@@ -803,7 +805,9 @@ export class DataCollector {
           error: error instanceof Error ? error.message : 'Unknown error',
         })
       } catch (e) {
-        console.error('tx_log upsert (failure) error:', e)
+        if (process.env.DEBUG_DB_WRITES === '1') {
+          try { console.error('tx_log upsert (failure) error:', e) } catch {}
+        }
       }
     }
   }

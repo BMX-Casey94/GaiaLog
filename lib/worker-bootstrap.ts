@@ -45,6 +45,8 @@ async function bootstrapWorkers() {
 if (typeof process !== 'undefined' && process.versions?.node) {
   // Only bootstrap if not in build process
   if (process.env.NEXT_PHASE !== 'phase-production-build') {
+    // Mirror standalone worker behavior so API gates allow writes
+    try { process.env.GAIALOG_WORKER_PROCESS = '1' } catch {}
     bootstrapWorkers()
   }
 }
