@@ -8,6 +8,7 @@ interface GlowCardProps {
   width?: string | number;
   height?: string | number;
   customSize?: boolean; // When true, ignores size prop and uses width/height or className
+  disableGlow?: boolean;
 }
 
 const glowColorMap = {
@@ -31,12 +32,14 @@ const GlowCard: React.FC<GlowCardProps> = ({
   size = 'md',
   width,
   height,
-  customSize = false
+  customSize = false,
+  disableGlow = false
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    if (disableGlow) return;
     const syncPointer = (e: PointerEvent) => {
       const { clientX: x, clientY: y } = e;
       
@@ -50,7 +53,7 @@ const GlowCard: React.FC<GlowCardProps> = ({
 
     document.addEventListener('pointermove', syncPointer);
     return () => document.removeEventListener('pointermove', syncPointer);
-  }, []);
+  }, [disableGlow]);
 
   const { base, spread } = glowColorMap[glowColor];
 
@@ -75,7 +78,7 @@ const GlowCard: React.FC<GlowCardProps> = ({
       '--border-size': 'calc(var(--border, 2) * 1px)',
       '--spotlight-size': 'calc(var(--size, 150) * 1px)',
       '--hue': 'calc(var(--base) + (var(--xp, 0) * var(--spread, 0)))',
-      backgroundImage: `radial-gradient(
+      backgroundImage: disableGlow ? 'none' : `radial-gradient(
         var(--spotlight-size) var(--spotlight-size) at
         calc(var(--x, 0) * 1px)
         calc(var(--y, 0) * 1px),
@@ -84,8 +87,8 @@ const GlowCard: React.FC<GlowCardProps> = ({
       backgroundColor: 'var(--backdrop, transparent)',
       backgroundSize: 'calc(100% + (2 * var(--border-size))) calc(100% + (2 * var(--border-size)))',
       backgroundPosition: '50% 50%',
-      backgroundAttachment: 'fixed',
-      border: 'var(--border-size) solid var(--backup-border)',
+      backgroundAttachment: disableGlow ? 'initial' : 'fixed',
+      border: disableGlow ? '1px solid rgba(148, 163, 184, 0.2)' : 'var(--border-size) solid var(--backup-border)',
       position: 'relative' as const,
       touchAction: 'none' as const,
     };
@@ -156,6 +159,30 @@ const GlowCard: React.FC<GlowCardProps> = ({
       border-width: 10px;
     }
   `;
+
+  if (disableGlow) {
+    return (
+      <div
+        ref={cardRef}
+        style={getInlineStyles()}
+        className={`
+          ${getSizeClasses()}
+          ${!customSize ? 'aspect-[3/4]' : ''}
+          rounded-2xl 
+          relative 
+          grid 
+          grid-rows-[1fr_auto] 
+          shadow-[0_1rem_2rem_-1rem_black] 
+          p-4 
+          gap-4 
+          backdrop-blur-[5px]
+          ${className}
+        `}
+      >
+        {children}
+      </div>
+    );
+  }
 
   return (
     <>

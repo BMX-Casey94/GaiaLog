@@ -27,42 +27,21 @@ export function Hero() {
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 10000) // 10 second timeout
-        
-        const response = await fetch('/api/hero-stats', {
-          signal: controller.signal,
-          headers: {
-            'Cache-Control': 'max-age=30' // Client-side caching
-          }
-        })
-        
-        clearTimeout(timeoutId)
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
-        }
-        
+        const response = await fetch('/api/hero-stats')
         const result = await response.json()
         if (result.success) {
           setStats(result.data)
         }
       } catch (error) {
-        if (error instanceof Error && error.name === 'AbortError') {
-          console.warn('Hero stats request timed out')
-        } else {
-          console.error('Error fetching hero stats:', error)
-        }
+        console.error('Error fetching hero stats:', error)
       } finally {
         setLoading(false)
       }
     }
 
-    // Initial fetch
     fetchStats()
-    
-    // Refresh every 30 seconds (reduced from 60s for better UX)
-    const interval = setInterval(fetchStats, 30000)
+    // Refresh every 60 seconds
+    const interval = setInterval(fetchStats, 60000)
     return () => clearInterval(interval)
   }, [])
 
@@ -129,8 +108,8 @@ export function Hero() {
         </div>
       </div>
 
-      <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6 md:pt-20 pb-16 h-full flex flex-col justify-start md:justify-center">
-        <div className="text-center mb-10 md:mb-16">
+      <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-12 md:pt-20 pb-16 h-full flex flex-col justify-start md:justify-center">
+        <div className="text-center mb-10 md:mb-16 mt-12 md:mt-0">
           <h1 className="text-4xl md:text-6xl lg:text-7xl font-bold text-white mb-6 relative z-20">
             <span className="text-white">GaiaLog</span>
           </h1>
@@ -163,7 +142,7 @@ export function Hero() {
           </div>
         </div>
 
-        <div className="absolute bottom-28 md:bottom-16 left-1/2 transform -translate-x-1/2 max-w-5xl w-full px-4 z-20">
+        <div className="absolute bottom-12 md:bottom-16 left-1/2 transform -translate-x-1/2 max-w-5xl w-full px-4 z-20">
           <div className="p-6">
             <div className="flex items-center space-x-2 mb-4">
               <div className="w-3 h-3 bg-red-500 rounded-full" />

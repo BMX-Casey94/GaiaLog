@@ -170,25 +170,10 @@ export function LiveDashboard() {
             </p>
           </div>
 
-          <div className="text-center mb-8">
-            <Button 
-              onClick={fetchData} 
-              disabled={loading}
-              variant="outline" 
-              className="border-slate-600 text-slate-300 hover:bg-slate-800 bg-transparent"
-            >
-              <RefreshCw className={`mr-2 h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
-              {loading ? 'Fetching Data...' : 'Refresh Data'}
-            </Button>
-            {error && (
-              <div className="mt-4 text-red-400 text-sm">
-                Error: {error}
-              </div>
-            )}
-          </div>
+          
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-            <GlowCard glowColor="blue" customSize className="h-64">
+            <GlowCard glowColor="blue" customSize disableGlow className="h-64">
               <div className="flex items-center justify-center space-x-2 text-blue-400 mb-1">
                 <Database className="h-5 w-5" />
                 <span className="font-semibold">Air Quality Alerts</span>
@@ -246,7 +231,7 @@ export function LiveDashboard() {
               </div>
             </GlowCard>
 
-            <GlowCard glowColor="blue" customSize className="h-64">
+            <GlowCard glowColor="blue" customSize disableGlow className="h-64">
               <div className="flex items-center justify-center space-x-2 text-blue-400 mb-1">
                 <Droplets className="h-5 w-5" />
                 <span className="font-semibold">Water Level Alerts</span>
@@ -304,8 +289,8 @@ export function LiveDashboard() {
               </div>
             </GlowCard>
 
-            <GlowCard glowColor="orange" customSize className="h-64">
-              <div className="flex items-center justify-center space-x-2 text-orange-400 mb-1">
+            <GlowCard glowColor="blue" customSize disableGlow className="h-64">
+              <div className="flex items-center justify-center space-x-2 text-blue-400 mb-1">
                 <Activity className="h-5 w-5" />
                 <span className="font-semibold">Seismic Alerts</span>
               </div>
@@ -356,14 +341,14 @@ export function LiveDashboard() {
                 </div>
               )}
               <div className="flex justify-center mt-2">
-                <Badge variant="secondary" className="bg-orange-900/50 text-orange-400">
+                <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
                 </Badge>
               </div>
             </GlowCard>
 
-            <GlowCard glowColor="green" customSize className="h-64">
-              <div className="flex items-center justify-center space-x-2 text-green-400 mb-1">
+            <GlowCard glowColor="blue" customSize disableGlow className="h-64">
+              <div className="flex items-center justify-center space-x-2 text-blue-400 mb-1">
                 <Thermometer className="h-5 w-5" />
                 <span className="font-semibold">Environmental Alerts</span>
               </div>
@@ -414,11 +399,28 @@ export function LiveDashboard() {
                 </div>
               )}
               <div className="flex justify-center mt-2">
-                <Badge variant="secondary" className="bg-green-900/50 text-green-400">
+                <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
                 </Badge>
               </div>
             </GlowCard>
+          </div>
+
+          <div className="text-center mt-6">
+            <Button 
+              onClick={fetchData} 
+              disabled={loading}
+              variant="outline" 
+              className="border-slate-600 text-slate-300 hover:bg-slate-800 bg-transparent"
+            >
+              <RefreshCw className={`mr-2 h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+              {loading ? 'Fetching Data...' : 'Refresh Data'}
+            </Button>
+            {error && (
+              <div className="mt-4 text-red-400 text-sm">
+                Error: {error}
+              </div>
+            )}
           </div>
 
 

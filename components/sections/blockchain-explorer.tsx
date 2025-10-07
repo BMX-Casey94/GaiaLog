@@ -112,7 +112,7 @@ export function BlockchainExplorer() {
     
     switch (type) {
       case 'air_quality':
-        return `Air quality data recorded from ${provider}`
+        return `Air quality data recorded from various sources.`
       
       case 'water_levels':
         return `Water level measurements from ${provider}`
@@ -121,7 +121,7 @@ export function BlockchainExplorer() {
         return `Seismic activity detected by ${provider}`
       
       case 'advanced_metrics':
-        return `Environmental metrics recorded from ${provider}`
+        return `Environmental metrics from various sources, processed via ${provider}`
       
       default:
         return `Environmental data recorded from ${provider}`

@@ -70,6 +70,7 @@ const ShaderCanvas = () => {
       float variation(vec2 v1,vec2 v2,float strength,float speed){ return sin(dot(normalize(v1),normalize(v2))*strength+iTime*speed)/100.0; }
       vec3 paintCircle(vec2 uv,vec2 center,float rad,float width){
         vec2 diff = center-uv;
+        diff.x *= iResolution.x / iResolution.y; // aspect-correct distance
         float len = length(diff);
         len += variation(diff,vec2(0.,1.),5.,2.);
         len -= variation(diff,vec2(1.,0.),5.,2.);
@@ -77,18 +78,26 @@ const ShaderCanvas = () => {
         return vec3(circle);
       }
       void main(){
-        vec2 uv = gl_FragCoord.xy/iResolution.xy;
-        uv.x *= 1.5; uv.x -= 0.25;
+        vec2 uv0 = gl_FragCoord.xy / iResolution.xy;
+        // Keep the ring perfectly circular by computing mask in unscaled space
         float mask = 0.0;
         float radius = .35;
         vec2 center = vec2(.5);
-        mask += paintCircle(uv,center,radius,.035).r * 0.6;
-        mask += paintCircle(uv,center,radius-.018,.01).r * 0.6;
-        mask += paintCircle(uv,center,radius+.018,.005).r * 0.6;
-        vec2 v=rotate2d(iTime)*uv;
+        mask += paintCircle(uv0,center,radius,.035).r * 0.6;
+        mask += paintCircle(uv0,center,radius-.018,.01).r * 0.6;
+        mask += paintCircle(uv0,center,radius+.018,.005).r * 0.6;
+
+        // Only widen the color field on desktop; does not affect circle geometry
+        float aspect = iResolution.x / iResolution.y;
+        float widen = smoothstep(1.1, 1.6, aspect);
+        float xScale = mix(1.0, 2.1, widen); // up to ~40% wider on desktop
+        float xOffset = 0.5 * (xScale - 1.0);
+        vec2 uvColor = uv0;
+        uvColor.x = uvColor.x * xScale - xOffset;
+        vec2 v=rotate2d(iTime)*uvColor;
         vec3 foregroundColor=vec3(v.x,v.y,.7-v.y*v.x);
         vec3 color=mix(uBackgroundColor,foregroundColor,mask);
-        color=mix(color,vec3(1.),paintCircle(uv,center,radius,.003).r);
+        color=mix(color,vec3(1.),paintCircle(uv0,center,radius,.003).r);
         gl_FragColor=vec4(color,1.);
       }`;
 
@@ -133,9 +142,15 @@ const ShaderCanvas = () => {
       animationFrameId = requestAnimationFrame(render);
     };
     const handleResize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-      gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+      const dpr = window.devicePixelRatio || 1.0;
+      const rect = canvas.getBoundingClientRect();
+      const targetWidth = Math.max(1, Math.floor(rect.width * dpr));
+      const targetHeight = Math.max(1, Math.floor(rect.height * dpr));
+      if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+        gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+      }
     };
     handleResize();
     window.addEventListener('resize', handleResize);
