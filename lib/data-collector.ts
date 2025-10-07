@@ -534,94 +534,110 @@ export class DataCollector {
   private async persistAirQuality(aq: AirQualityData): Promise<string> {
     const obj = { type: 'air_quality', aq }
     const source_hash = Buffer.from(JSON.stringify(obj)).toString('base64').slice(0, 64)
-    await insertAirQuality({
-      provider: aq.source,
-      station_code: null,
-      city: aq.location,
-      lat: aq.coordinates?.lat ?? null,
-      lon: aq.coordinates?.lon ?? null,
-      aqi: aq.aqi,
-      pm25: aq.pm25,
-      pm10: aq.pm10,
-      co: aq.co,
-      no2: aq.no2,
-      o3: aq.o3,
-      so2: aq.so2 ?? null,
-      temperature_c: (aq as any).temperature ?? null,
-      humidity_pct: (aq as any).humidity ?? null,
-      pressure_mb: (aq as any).pressure ?? null,
-      wind_kph: (aq as any).windSpeed ?? null,
-      wind_deg: (aq as any).windDirection ?? null,
-      source: aq.source,
-      source_hash,
-      collected_at: new Date(aq.timestamp),
-    })
+    try {
+      await insertAirQuality({
+        provider: aq.source,
+        station_code: null,
+        city: aq.location,
+        lat: aq.coordinates?.lat ?? null,
+        lon: aq.coordinates?.lon ?? null,
+        aqi: aq.aqi,
+        pm25: aq.pm25,
+        pm10: aq.pm10,
+        co: aq.co,
+        no2: aq.no2,
+        o3: aq.o3,
+        so2: aq.so2 ?? null,
+        temperature_c: (aq as any).temperature ?? null,
+        humidity_pct: (aq as any).humidity ?? null,
+        pressure_mb: (aq as any).pressure ?? null,
+        wind_kph: (aq as any).windSpeed ?? null,
+        wind_deg: (aq as any).windDirection ?? null,
+        source: aq.source,
+        source_hash,
+        collected_at: new Date(aq.timestamp),
+      })
+    } catch (e) {
+      console.warn('DB persist (air_quality) failed; continuing without persistence:', (e as any)?.message || e)
+    }
     return source_hash
   }
 
   private async persistWater(w: WaterLevelData): Promise<string> {
     const obj = { type: 'water_levels', w }
     const source_hash = Buffer.from(JSON.stringify(obj)).toString('base64').slice(0, 64)
-    await insertWaterLevel({
-      provider: w.source,
-      station_code: w.station_id ?? null,
-      location: w.location ?? null,
-      lat: w.coordinates?.lat ?? null,
-      lon: w.coordinates?.lon ?? null,
-      level_m: w.sea_level,
-      tide_height_m: w.tide_height ?? null,
-      wave_height_m: w.wave_height_m ?? null,
-      salinity_psu: w.salinity_psu ?? null,
-      dissolved_oxygen_mg_l: w.dissolved_oxygen_mg_l ?? null,
-      turbidity_ntu: w.turbidity_ntu ?? null,
-      current_speed_ms: w.current_speed_ms ?? null,
-      current_direction_deg: w.current_direction_deg ?? null,
-      wind_kph: w.wind_speed_kph ?? null,
-      wind_deg: w.wind_direction_deg ?? null,
-      source: w.source,
-      source_hash,
-      collected_at: new Date(w.timestamp),
-    })
+    try {
+      await insertWaterLevel({
+        provider: w.source,
+        station_code: w.station_id ?? null,
+        location: w.location ?? null,
+        lat: w.coordinates?.lat ?? null,
+        lon: w.coordinates?.lon ?? null,
+        level_m: w.sea_level,
+        tide_height_m: w.tide_height ?? null,
+        wave_height_m: w.wave_height_m ?? null,
+        salinity_psu: w.salinity_psu ?? null,
+        dissolved_oxygen_mg_l: w.dissolved_oxygen_mg_l ?? null,
+        turbidity_ntu: w.turbidity_ntu ?? null,
+        current_speed_ms: w.current_speed_ms ?? null,
+        current_direction_deg: w.current_direction_deg ?? null,
+        wind_kph: w.wind_speed_kph ?? null,
+        wind_deg: w.wind_direction_deg ?? null,
+        source: w.source,
+        source_hash,
+        collected_at: new Date(w.timestamp),
+      })
+    } catch (e) {
+      console.warn('DB persist (water_levels) failed; continuing without persistence:', (e as any)?.message || e)
+    }
     return source_hash
   }
 
   private async persistSeismic(s: SeismicData): Promise<string> {
     const obj = { type: 'seismic', s }
     const source_hash = Buffer.from(JSON.stringify(obj)).toString('base64').slice(0, 64)
-    await insertSeismic({
-      provider: s.source,
-      event_id: s.event_id ?? null,
-      location: s.location,
-      magnitude: s.magnitude,
-      depth_km: s.depth,
-      lat: s.coordinates.lat,
-      lon: s.coordinates.lon,
-      source_hash,
-      collected_at: new Date(s.timestamp),
-    })
+    try {
+      await insertSeismic({
+        provider: s.source,
+        event_id: s.event_id ?? null,
+        location: s.location,
+        magnitude: s.magnitude,
+        depth_km: s.depth,
+        lat: s.coordinates.lat,
+        lon: s.coordinates.lon,
+        source_hash,
+        collected_at: new Date(s.timestamp),
+      })
+    } catch (e) {
+      console.warn('DB persist (seismic) failed; continuing without persistence:', (e as any)?.message || e)
+    }
     return source_hash
   }
 
   private async persistAdvanced(a: AdvancedMetricsData): Promise<string> {
     const obj = { type: 'advanced', a }
     const source_hash = Buffer.from(JSON.stringify(obj)).toString('base64').slice(0, 64)
-    await insertAdvanced({
-      provider: a.source,
-      city: a.location,
-      lat: a.coordinates?.lat ?? null,
-      lon: a.coordinates?.lon ?? null,
-      uv_index: a.uv_index,
-      soil_moisture_pct: Math.round((a.soil_moisture ?? 0) * 100),
-      wildfire_risk: a.wildfire_risk,
-      environmental_score: a.environmental_quality_score,
-      temperature_c: a.temperature_c ?? null,
-      humidity_pct: a.humidity_pct ?? null,
-      pressure_mb: a.pressure_mb ?? null,
-      wind_kph: a.wind_kph ?? null,
-      wind_deg: a.wind_deg ?? null,
-      source_hash,
-      collected_at: new Date(a.timestamp),
-    })
+    try {
+      await insertAdvanced({
+        provider: a.source,
+        city: a.location,
+        lat: a.coordinates?.lat ?? null,
+        lon: a.coordinates?.lon ?? null,
+        uv_index: a.uv_index,
+        soil_moisture_pct: Math.round((a.soil_moisture ?? 0) * 100),
+        wildfire_risk: a.wildfire_risk,
+        environmental_score: a.environmental_quality_score,
+        temperature_c: a.temperature_c ?? null,
+        humidity_pct: a.humidity_pct ?? null,
+        pressure_mb: a.pressure_mb ?? null,
+        wind_kph: a.wind_kph ?? null,
+        wind_deg: a.wind_deg ?? null,
+        source_hash,
+        collected_at: new Date(a.timestamp),
+      })
+    } catch (e) {
+      console.warn('DB persist (advanced_metrics) failed; continuing without persistence:', (e as any)?.message || e)
+    }
     return source_hash
   }
 
