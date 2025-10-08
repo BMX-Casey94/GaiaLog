@@ -444,9 +444,7 @@ export class BlockchainService {
           error: null,
         })
       } catch (e) {
-        if (process.env.DEBUG_DB_WRITES === '1') {
-          try { console.error('upsertTxLog (pending) error:', e) } catch {}
-        }
+        // Non-fatal
       }
 
       // Schedule confirmation check after a delay to update status
@@ -502,11 +500,7 @@ export class BlockchainService {
             retries: 0,
             error: failedLog.error || 'Unknown error',
           })
-        } catch (e2) {
-          if (process.env.DEBUG_DB_WRITES === '1') {
-            try { console.error('upsertTxLog (failed) error:', e2) } catch {}
-          }
-        }
+        } catch {}
       }
       
       throw error

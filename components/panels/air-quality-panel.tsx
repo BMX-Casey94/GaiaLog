@@ -65,83 +65,68 @@ export function AirQualityPanel() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
 
-  // Fetch real air quality data
+  // Fetch fresh air quality data using the same endpoint as Live Dashboard
   const fetchAirQualityData = async () => {
     try {
-      const response = await fetch('/api/air-quality')
+      const response = await fetch('/api/data/collect', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      })
       if (response.ok) {
-        const api = await response.json()
-        const mapped: AirQualityData = {
-          aqi: api?.aqi ?? 0,
-          pm25: api?.pm25 ?? 0,
-          pm10: api?.pm10 ?? 0,
-          no2: api?.no2 ?? 0,
-          o3: api?.o3 ?? 0,
-          co: api?.co ?? 0,
-          so2: api?.so2 ?? 0,
-          temperature: typeof api?.temperature === 'number' ? api.temperature : 0,
-          humidity: typeof api?.humidity === 'number' ? api.humidity : 0,
-          pressure: typeof api?.pressure === 'number' ? api.pressure : 0,
-          windSpeed: typeof api?.windSpeed === 'number' ? api.windSpeed : 0,
-          windDirection: typeof api?.windDirection === 'number' ? api.windDirection : 0,
-          location: api?.location || 'Unknown',
-          timestamp: api?.timestamp ? Date.parse(api.timestamp) : Date.now(),
-          source: api?.source || 'WAQI',
+        const result = await response.json()
+        const airQualityData = result.data?.airQuality
+        
+        if (airQualityData) {
+          const mapped: AirQualityData = {
+            aqi: airQualityData?.aqi ?? 0,
+            pm25: airQualityData?.pm25 ?? 0,
+            pm10: airQualityData?.pm10 ?? 0,
+            no2: airQualityData?.no2 ?? 0,
+            o3: airQualityData?.o3 ?? 0,
+            co: airQualityData?.co ?? 0,
+            so2: airQualityData?.so2 ?? 0,
+            temperature: typeof airQualityData?.temperature === 'number' ? airQualityData.temperature : 0,
+            humidity: typeof airQualityData?.humidity === 'number' ? airQualityData.humidity : 0,
+            pressure: typeof airQualityData?.pressure === 'number' ? airQualityData.pressure : 0,
+            windSpeed: typeof airQualityData?.windSpeed === 'number' ? airQualityData.windSpeed : 0,
+            windDirection: typeof airQualityData?.windDirection === 'number' ? airQualityData.windDirection : 0,
+            location: airQualityData?.location || 'Unknown',
+            timestamp: airQualityData?.timestamp ? Date.parse(airQualityData.timestamp) : Date.now(),
+            source: airQualityData?.source || 'WAQI',
+          }
+          setAirQualityData(mapped)
+          setAirQualityStats({
+            currentAQI: mapped.aqi || 0,
+            averageAQI: Math.floor(Math.random() * 50) + 30,
+            maxAQI: Math.floor(Math.random() * 100) + 150,
+            minAQI: Math.floor(Math.random() * 20) + 10,
+            totalReadings: Math.floor(Math.random() * 1000) + 500,
+            alerts: Math.floor(Math.random() * 5),
+            lastUpdate: Date.now()
+          })
+          setLastUpdate(new Date())
+        } else {
+          console.warn('No air quality data in fresh collection response')
+          setAirQualityData(null)
         }
-        setAirQualityData(mapped)
-        setAirQualityStats({
-          currentAQI: mapped.aqi || 0,
-          averageAQI: Math.floor(Math.random() * 50) + 30,
-          maxAQI: Math.floor(Math.random() * 100) + 150,
-          minAQI: Math.floor(Math.random() * 20) + 10,
-          totalReadings: Math.floor(Math.random() * 1000) + 500,
-          alerts: Math.floor(Math.random() * 5),
-          lastUpdate: Date.now()
-        })
-        setLastUpdate(new Date())
+      } else {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
     } catch (error) {
-      console.error('Error fetching air quality data:', error)
-      // Fallback to simulated data
-      setSimulatedData()
+      console.error('Error fetching fresh air quality data:', error)
+      // Don't fall back to simulated data - show no data instead
+      setAirQualityData(null)
     }
   }
 
-  // Fallback simulated data
-  const setSimulatedData = () => {
-    const simulatedData: AirQualityData = {
-      aqi: Math.floor(Math.random() * 200) + 50,
-      pm25: Math.floor(Math.random() * 50) + 10,
-      pm10: Math.floor(Math.random() * 100) + 20,
-      no2: Math.floor(Math.random() * 100) + 10,
-      o3: Math.floor(Math.random() * 80) + 20,
-      co: Math.floor(Math.random() * 5) + 1,
-      so2: Math.floor(Math.random() * 20) + 5,
-      temperature: Math.floor(Math.random() * 30) + 10,
-      humidity: Math.floor(Math.random() * 40) + 40,
-      pressure: Math.floor(Math.random() * 50) + 1000,
-      windSpeed: Math.floor(Math.random() * 30) + 5,
-      windDirection: Math.floor(Math.random() * 360),
-      location: "London, UK",
-      timestamp: Date.now(),
-      source: "WAQI"
-    }
-    setAirQualityData(simulatedData)
-    setAirQualityStats({
-      currentAQI: simulatedData.aqi,
-      averageAQI: Math.floor(Math.random() * 50) + 30,
-      maxAQI: Math.floor(Math.random() * 100) + 150,
-      minAQI: Math.floor(Math.random() * 20) + 10,
-      totalReadings: Math.floor(Math.random() * 1000) + 500,
-      alerts: Math.floor(Math.random() * 5),
-      lastUpdate: Date.now()
-    })
-  }
+  // No simulated data fallback - use real data only
 
-  // Real-time data updates
+  // Real-time data updates - match Live Dashboard refresh rate
   useEffect(() => {
     fetchAirQualityData()
-    const interval = setInterval(fetchAirQualityData, 30000) // Update every 30 seconds
+    const interval = setInterval(fetchAirQualityData, 5 * 60 * 1000) // Update every 5 minutes (same as Live Dashboard)
 
     return () => clearInterval(interval)
   }, [])

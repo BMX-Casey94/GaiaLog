@@ -74,11 +74,7 @@ export class WorkerQueue {
     }
 
     // Persist to DB so the queue survives restarts
-    enqueueQueueItem({ id, priority, data, timestamp: item.timestamp, retry_count: 0, max_retries: item.maxRetries }).catch((e) => {
-      if (process.env.DEBUG_DB_WRITES === '1') {
-        try { console.error('enqueueQueueItem error:', e) } catch {}
-      }
-    })
+    enqueueQueueItem({ id, priority, data, timestamp: item.timestamp, retry_count: 0, max_retries: item.maxRetries }).catch(() => {})
     this.queuedCountSinceLastSample++
     if (bsvConfig.logging.level === 'debug') {
       console.log(`📥 Added ${priority} priority item to queue: ${id}`)
@@ -273,11 +269,7 @@ export class WorkerQueue {
             }
             this.completedItems.push(item)
             this.stats.totalProcessed++
-      markQueueItemCompleted(item.id).catch((e) => {
-        if (process.env.DEBUG_DB_WRITES === '1') {
-          try { console.error('markQueueItemCompleted error:', e) } catch {}
-        }
-      })
+            markQueueItemCompleted(item.id).catch(() => {})
             return
           }
         }
@@ -521,11 +513,7 @@ export class WorkerQueue {
       if (bsvConfig.logging.level !== 'error') {
         console.error(`❌ Failed item ${item.id} after ${item.maxRetries} retries: ${error}`)
       }
-      markQueueItemFailed(item.id, error).catch((e) => {
-        if (process.env.DEBUG_DB_WRITES === '1') {
-          try { console.error('markQueueItemFailed error:', e) } catch {}
-        }
-      })
+      markQueueItemFailed(item.id, error).catch(() => {})
     }
   }
 

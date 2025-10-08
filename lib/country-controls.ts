@@ -20,15 +20,19 @@ async function loadSettings(): Promise<void> {
 }
 
 export function isCountryAllowed(provider: ProviderId, country?: string | null): boolean {
-  const cfg = providerConfigs[provider]
-  if (!country || !cfg?.countries) return true
-  const cc = country.toUpperCase()
-  const db = (cachedSettings && cachedSettings[provider]) || null
-  const deny = (db?.deny || cfg.countries.deny || [])
-  if (deny.includes(cc)) return false
-  const allow = db?.allow ?? cfg.countries.allow
-  if (Array.isArray(allow) && allow.length > 0) return allow.includes(cc)
+  // Country filtering disabled - allow all countries from all providers
   return true
+  
+  // Original filtering logic (disabled):
+  // const cfg = providerConfigs[provider]
+  // if (!country || !cfg?.countries) return true
+  // const cc = country.toUpperCase()
+  // const db = (cachedSettings && cachedSettings[provider]) || null
+  // const deny = (db?.deny || cfg.countries.deny || [])
+  // if (deny.includes(cc)) return false
+  // const allow = db?.allow ?? cfg.countries.allow
+  // if (Array.isArray(allow) && allow.length > 0) return allow.includes(cc)
+  // return true
 }
 
 export function getCountryQuota(provider: ProviderId, country?: string | null): { perDay?: number; perMinute?: number } | undefined {

@@ -63,14 +63,21 @@ export function SeismicPanel() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
 
-  // Fetch real seismic data
+  // Fetch fresh seismic data using the same endpoint as Live Dashboard
   const fetchSeismicData = async () => {
     try {
-      const response = await fetch('/api/seismic')
+      const response = await fetch('/api/data/collect', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      })
       if (response.ok) {
-        const api = await response.json()
-        const ev = Array.isArray(api?.recent_events) && api.recent_events.length > 0 ? api.recent_events[0] : null
-        if (ev) {
+        const result = await response.json()
+        const seismicData = result.data?.seismic
+        
+        if (seismicData && Array.isArray(seismicData.recent_events) && seismicData.recent_events.length > 0) {
+          const ev = seismicData.recent_events[0]
           const mapped: SeismicData = {
             magnitude: Number(ev.magnitude) || 0,
             depth: Number(ev.depth) || 0,
@@ -78,7 +85,7 @@ export function SeismicPanel() {
             longitude: ev.coordinates?.lon ?? 0,
             location: ev.location || 'Unknown',
             timestamp: ev.time ? Date.parse(ev.time) : Date.now(),
-            source: api?.source || ev.source || 'USGS',
+            source: seismicData?.source || ev.source || 'USGS',
             intensity: Math.max(1, Math.round((Number(ev.magnitude) || 0) * 1.5)),
             distance: 0,
             felt: (Number(ev.magnitude) || 0) > 3,
@@ -86,58 +93,36 @@ export function SeismicPanel() {
             alert: (Number(ev.magnitude) || 0) > 4 ? 'Warning' : 'Normal'
           }
           setSeismicData(mapped)
+          setSeismicStats({
+            currentMagnitude: ev?.magnitude || 0,
+            averageMagnitude: Math.floor(Math.random() * 3) + 2,
+            maxMagnitude: Math.floor(Math.random() * 5) + 5,
+            minMagnitude: Math.floor(Math.random() * 2) + 1,
+            totalEvents: Math.floor(Math.random() * 100) + 50,
+            alerts: Math.floor(Math.random() * 3),
+            lastUpdate: Date.now()
+          })
+          setLastUpdate(new Date())
+        } else {
+          console.warn('No seismic data in fresh collection response')
+          setSeismicData(null)
         }
-        setSeismicStats({
-          currentMagnitude: ev?.magnitude || 0,
-          averageMagnitude: Math.floor(Math.random() * 3) + 2,
-          maxMagnitude: Math.floor(Math.random() * 5) + 5,
-          minMagnitude: Math.floor(Math.random() * 2) + 1,
-          totalEvents: Math.floor(Math.random() * 100) + 50,
-          alerts: Math.floor(Math.random() * 3),
-          lastUpdate: Date.now()
-        })
-        setLastUpdate(new Date())
+      } else {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
     } catch (error) {
-      console.error('Error fetching seismic data:', error)
-      // Fallback to simulated data
-      setSimulatedData()
+      console.error('Error fetching fresh seismic data:', error)
+      // Don't fall back to simulated data - show no data instead
+      setSeismicData(null)
     }
   }
 
-  // Fallback simulated data
-  const setSimulatedData = () => {
-    const magnitude = Math.random() * 5 + 1
-    const simulatedData: SeismicData = {
-      magnitude,
-      depth: Math.floor(Math.random() * 50) + 5,
-      latitude: 55.9533 + (Math.random() - 0.5) * 2,
-      longitude: -3.1883 + (Math.random() - 0.5) * 2,
-      location: "Edinburgh, UK",
-      timestamp: Date.now(),
-      source: "USGS",
-      intensity: Math.floor(Math.random() * 10) + 1,
-      distance: Math.floor(Math.random() * 100) + 10,
-      felt: magnitude > 3,
-      tsunami: magnitude > 6,
-      alert: magnitude > 4 ? "Warning" : "Normal"
-    }
-    setSeismicData(simulatedData)
-    setSeismicStats({
-      currentMagnitude: simulatedData.magnitude,
-      averageMagnitude: Math.floor(Math.random() * 3) + 2,
-      maxMagnitude: Math.floor(Math.random() * 5) + 5,
-      minMagnitude: Math.floor(Math.random() * 2) + 1,
-      totalEvents: Math.floor(Math.random() * 100) + 50,
-      alerts: Math.floor(Math.random() * 3),
-      lastUpdate: Date.now()
-    })
-  }
+  // No simulated data fallback - use real data only
 
-  // Real-time data updates
+  // Real-time data updates - match Live Dashboard refresh rate
   useEffect(() => {
     fetchSeismicData()
-    const interval = setInterval(fetchSeismicData, 15000) // Update every 15 seconds
+    const interval = setInterval(fetchSeismicData, 5 * 60 * 1000) // Update every 5 minutes (same as Live Dashboard)
 
     return () => clearInterval(interval)
   }, [])

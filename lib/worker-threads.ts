@@ -12,6 +12,7 @@ import { fetchJsonWithRetry } from './provider-fetch'
 import { insertAdvanced, insertAirQuality, insertWaterLevel, insertSeismic, calculateSourceHash, getOwmStationsPage, getStationsByProviderPage, readCursor, writeCursor, hasAirQualityTxId, hasWaterLevelTxId, hasSeismicTxId, hasSeismicEventTxId, hasAdvancedTxId, getSeismicByEventId } from './repositories'
 import { providerConfigs } from './provider-registry'
 import { cursorStore } from './stores'
+import { blockchainService } from './blockchain'
 
 export interface WorkerStats {
   workerId: string
@@ -235,10 +236,43 @@ export abstract class BaseWorker {
           source_hash: unifiedHash
         }
 
-        const queueId = workerQueue.addToQueue(bsvData, item.priority)
-        this.stats.totalTransactions++
-        if (bsvConfig.logging.level === 'debug') {
-          console.log(`📥 ${this.workerId}: Queued ${item.type} data (${item.priority} priority): ${queueId}`)
+        // Check if we should bypass queue for direct broadcasting
+        const BYPASS_QUEUE = process.env.BSV_BYPASS_QUEUE === 'true'
+
+        if (BYPASS_QUEUE) {
+          // Direct broadcast - bypass queue to avoid Supabase bottleneck
+          try {
+            const stream = item.type === 'air-quality' ? 'air_quality' 
+              : item.type === 'water-level' ? 'water_levels'
+              : item.type === 'seismic' ? 'seismic_activity'
+              : 'advanced_metrics'
+            
+            const txid = await blockchainService.writeToChain({
+              stream,
+              timestamp: item.timestamp,
+              payload: {
+                location: item.location,
+                timestamp: new Date(item.timestamp).toISOString(),
+                source: item.source,
+                ...item.measurement,
+                source_hash: unifiedHash
+              }
+            })
+            
+            if (bsvConfig.logging.level !== 'error') {
+              console.log(`✅ ${this.workerId}: Direct broadcast ${item.type} - ${txid.substring(0, 12)}...`)
+            }
+            this.stats.totalTransactions++
+          } catch (e) {
+            console.error(`❌ ${this.workerId}: Direct broadcast failed:`, e)
+          }
+        } else {
+          // Normal queue path (when Supabase is stable)
+          const queueId = workerQueue.addToQueue(bsvData, item.priority)
+          this.stats.totalTransactions++
+          if (bsvConfig.logging.level === 'debug') {
+            console.log(`📥 ${this.workerId}: Queued ${item.type} data (${item.priority} priority): ${queueId}`)
+          }
         }
       }
 

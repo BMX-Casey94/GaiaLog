@@ -83,94 +83,73 @@ export function AdvancedPanel() {
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
   const [trends, setTrends] = useState<any>(null)
 
-  // Fetch real advanced metrics data
+  // Fetch fresh advanced metrics data using the same endpoint as Live Dashboard
   const fetchAdvancedData = async () => {
     try {
-      const response = await fetch('/api/advanced-metrics')
+      const response = await fetch('/api/data/collect', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      })
       if (response.ok) {
-        const api = await response.json()
-        const mapped = {
-          airQualityIndex: 0,
-          waterQualityIndex: 0,
-          soilMoisture: typeof api?.soil_moisture?.value === 'number'
-            ? Math.round(api.soil_moisture.value)
-            : (typeof api?.soil_moisture === 'number' ? Math.round(api.soil_moisture) : 0),
-          vegetationIndex: 0,
-          temperature: typeof api?.temperature_c === 'number' ? api.temperature_c : 0,
-          humidity: typeof api?.humidity_pct === 'number' ? api.humidity_pct : 0,
-          pressure: typeof api?.pressure_mb === 'number' ? api.pressure_mb : 0,
-          windSpeed: typeof api?.wind_kph === 'number' ? api.wind_kph : 0,
-          windDirection: 0,
-          precipitation: 0,
-          radiationLevel: 0,
-          noiseLevel: 0,
-          lightIntensity: 0,
-          magneticField: 0,
-          location: api?.location || 'Unknown',
-          timestamp: Date.now(),
-          source: api?.source || 'Derived',
-          coordinates: { latitude: api?.coordinates?.lat ?? 0, longitude: api?.coordinates?.lon ?? 0 },
-        } as AdvancedMetricsData
-        setAdvancedData(mapped)
-        setAdvancedStats({
-          currentScore: api?.environmental_quality_score || 0,
-          averageScore: Math.floor(Math.random() * 50) + 30,
-          maxScore: Math.floor(Math.random() * 100) + 150,
-          minScore: Math.floor(Math.random() * 20) + 10,
-          totalReadings: Math.floor(Math.random() * 1000) + 500,
-          alerts: Math.floor(Math.random() * 5),
-          lastUpdate: Date.now()
-        })
-        setLastUpdate(new Date())
+        const result = await response.json()
+        const advancedData = result.data?.advancedMetrics
+        
+        if (advancedData) {
+          const mapped = {
+            airQualityIndex: 0,
+            waterQualityIndex: 0,
+            soilMoisture: typeof advancedData?.soil_moisture?.value === 'number'
+              ? Math.round(advancedData.soil_moisture.value)
+              : (typeof advancedData?.soil_moisture === 'number' ? Math.round(advancedData.soil_moisture) : 0),
+            vegetationIndex: 0,
+            temperature: typeof advancedData?.temperature_c === 'number' ? advancedData.temperature_c : 0,
+            humidity: typeof advancedData?.humidity_pct === 'number' ? advancedData.humidity_pct : 0,
+            pressure: typeof advancedData?.pressure_mb === 'number' ? advancedData.pressure_mb : 0,
+            windSpeed: typeof advancedData?.wind_kph === 'number' ? advancedData.wind_kph : 0,
+            windDirection: 0,
+            precipitation: 0,
+            radiationLevel: 0,
+            noiseLevel: 0,
+            lightIntensity: 0,
+            magneticField: 0,
+            location: advancedData?.location || 'Unknown',
+            timestamp: Date.now(),
+            source: advancedData?.source || 'Derived',
+            coordinates: { latitude: advancedData?.coordinates?.lat ?? 0, longitude: advancedData?.coordinates?.lon ?? 0 },
+          } as AdvancedMetricsData
+          setAdvancedData(mapped)
+          setAdvancedStats({
+            currentScore: advancedData?.environmental_quality_score || 0,
+            averageScore: Math.floor(Math.random() * 50) + 30,
+            maxScore: Math.floor(Math.random() * 100) + 150,
+            minScore: Math.floor(Math.random() * 20) + 10,
+            totalReadings: Math.floor(Math.random() * 1000) + 500,
+            alerts: Math.floor(Math.random() * 5),
+            lastUpdate: Date.now()
+          })
+          setLastUpdate(new Date())
+        } else {
+          console.warn('No advanced metrics data in fresh collection response')
+          setAdvancedData(null)
+        }
+      } else {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
     } catch (error) {
-      console.error('Error fetching advanced metrics data:', error)
-      // Fallback to simulated data
-      setSimulatedData()
+      console.error('Error fetching fresh advanced metrics data:', error)
+      // Don't fall back to simulated data - show no data instead
+      setAdvancedData(null)
     }
   }
 
-  // Fallback simulated data
-  const setSimulatedData = () => {
-    const simulatedData: AdvancedMetricsData = {
-      airQualityIndex: Math.floor(Math.random() * 200) + 50,
-      waterQualityIndex: Math.floor(Math.random() * 100) + 50,
-      soilMoisture: Math.floor(Math.random() * 40) + 20,
-      vegetationIndex: Math.floor(Math.random() * 30) + 40,
-      temperature: Math.floor(Math.random() * 30) + 10,
-      humidity: Math.floor(Math.random() * 40) + 40,
-      pressure: Math.floor(Math.random() * 50) + 1000,
-      windSpeed: Math.floor(Math.random() * 30) + 5,
-      windDirection: Math.floor(Math.random() * 360),
-      precipitation: Math.floor(Math.random() * 10),
-      radiationLevel: Math.floor(Math.random() * 5) + 1,
-      noiseLevel: Math.floor(Math.random() * 50) + 30,
-      lightIntensity: Math.floor(Math.random() * 1000) + 500,
-      magneticField: Math.floor(Math.random() * 10) + 45,
-      location: "Osaka, Japan",
-      timestamp: Date.now(),
-      source: "Multi-Sensor Array",
-      coordinates: {
-        latitude: 34.6937 + (Math.random() - 0.5) * 2,
-        longitude: 135.5023 + (Math.random() - 0.5) * 2
-      }
-    }
-    setAdvancedData(simulatedData)
-    setAdvancedStats({
-      currentScore: simulatedData.airQualityIndex,
-      averageScore: Math.floor(Math.random() * 50) + 30,
-      maxScore: Math.floor(Math.random() * 100) + 150,
-      minScore: Math.floor(Math.random() * 20) + 10,
-      totalReadings: Math.floor(Math.random() * 1000) + 500,
-      alerts: Math.floor(Math.random() * 5),
-      lastUpdate: Date.now()
-    })
-  }
+  // No simulated data fallback - use real data only
 
-  // Real-time data updates
+  // Real-time data updates - match Live Dashboard refresh rate
   useEffect(() => {
     fetchAdvancedData()
-    const interval = setInterval(fetchAdvancedData, 30000) // Update every 30 seconds
+    const interval = setInterval(fetchAdvancedData, 5 * 60 * 1000) // Update every 5 minutes (same as Live Dashboard)
 
     return () => clearInterval(interval)
   }, [])
