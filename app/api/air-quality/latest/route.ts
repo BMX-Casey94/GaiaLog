@@ -108,10 +108,20 @@ export async function GET() {
       })
     } catch (fallbackError) {
       console.error('Supabase REST API fallback failed:', fallbackError)
+      console.error('Supabase config check:', {
+        hasUrl: !!process.env.NEXT_PUBLIC_SUPABASE_URL,
+        hasServiceKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+        hasAnonKey: !!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+        url: process.env.NEXT_PUBLIC_SUPABASE_URL
+      })
       return NextResponse.json({
         success: false,
         message: fallbackError instanceof Error ? fallbackError.message : 'Database connection error',
-        error: fallbackError instanceof Error ? fallbackError.stack : String(fallbackError)
+        error: fallbackError instanceof Error ? fallbackError.stack : String(fallbackError),
+        debug: {
+          hasUrl: !!process.env.NEXT_PUBLIC_SUPABASE_URL,
+          hasKey: !!(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY)
+        }
       }, { status: 500 })
     }
   }
