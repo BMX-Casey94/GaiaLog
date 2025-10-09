@@ -40,49 +40,56 @@ export async function GET() {
 
       } catch (dbErr) {
         // Fallback: Use Supabase REST API directly with fetch
-        console.warn('Direct DB query failed, trying Supabase REST API:', dbErr)
+        console.log('PostgreSQL connection failed (expected on Vercel), using Supabase REST API')
         const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
         const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
         
         if (!supabaseUrl || !supabaseKey) {
           console.error('Supabase env missing:', { supabaseUrl: !!supabaseUrl, supabaseKey: !!supabaseKey })
-          throw new Error('Supabase configuration missing')
-        }
+          // Return defaults instead of throwing
+          airQuality = { aqi: null, collected_at: null }
+          txCount = 0
+          latestTx = null
+        } else {
+          const headers = {
+            'apikey': supabaseKey,
+            'Authorization': `Bearer ${supabaseKey}`,
+            'Content-Type': 'application/json'
+          }
 
-        const headers = {
-          'apikey': supabaseKey,
-          'Authorization': `Bearer ${supabaseKey}`,
-          'Content-Type': 'application/json'
-        }
+          try {
+            // Run Supabase REST API queries in parallel
+            const [aqRes, txCntRes, latestRes] = await Promise.all([
+              fetch(`${supabaseUrl}/rest/v1/air_quality_readings?select=aqi,collected_at&order=collected_at.desc&limit=1`, { headers }),
+              fetch(`${supabaseUrl}/rest/v1/tx_log?select=count`, { headers: { ...headers, 'Prefer': 'count=exact' }, method: 'HEAD' }),
+              fetch(`${supabaseUrl}/rest/v1/tx_log?select=onchain_at,collected_at&status=in.(pending,confirmed)&onchain_at=not.is.null&order=onchain_at.desc&limit=1`, { headers })
+            ])
 
-        try {
-          // Run Supabase REST API queries in parallel
-          const [aqRes, txCntRes, latestRes] = await Promise.all([
-            fetch(`${supabaseUrl}/rest/v1/air_quality_readings?select=aqi,collected_at&aqi=not.is.null&order=collected_at.desc&limit=1`, { headers }),
-            fetch(`${supabaseUrl}/rest/v1/tx_log?select=count`, { headers: { ...headers, 'Prefer': 'count=exact' }, method: 'HEAD' }),
-            fetch(`${supabaseUrl}/rest/v1/tx_log?select=onchain_at,collected_at&status=in.(pending,confirmed)&order=collected_at.desc&limit=1`, { headers })
-          ])
+            console.log('Supabase REST API responses:', { aq: aqRes.status, txCnt: txCntRes.status, latest: latestRes.status })
 
-          if (aqRes.ok) {
-            const aqData = await aqRes.json()
-            if (aqData?.[0]) {
-              airQuality = { aqi: aqData[0].aqi ?? null, collected_at: aqData[0].collected_at ?? null }
+            if (aqRes.ok) {
+              const aqData = await aqRes.json()
+              if (aqData?.[0]) {
+                airQuality = { aqi: aqData[0].aqi ?? null, collected_at: aqData[0].collected_at ?? null }
+              }
             }
-          }
-          
-          if (txCntRes.ok) {
-            const count = txCntRes.headers.get('content-range')?.split('/')[1]
-            txCount = count ? parseInt(count) : 0
-          }
-          
-          if (latestRes.ok) {
-            const latestData = await latestRes.json()
-            if (latestData?.[0]) {
-              latestTx = latestData[0].onchain_at || latestData[0].collected_at || null
+            
+            if (txCntRes.ok) {
+              const count = txCntRes.headers.get('content-range')?.split('/')[1]
+              txCount = count ? parseInt(count) : 0
+              console.log('TX count from Supabase:', txCount)
             }
+            
+            if (latestRes.ok) {
+              const latestData = await latestRes.json()
+              if (latestData?.[0]) {
+                latestTx = latestData[0].onchain_at || latestData[0].collected_at || null
+              }
+            }
+          } catch (apiErr) {
+            console.error('Supabase REST API fallback failed:', apiErr)
+            // Continue with defaults
           }
-        } catch (apiErr) {
-          console.error('Supabase REST API fallback also failed:', apiErr)
         }
       }
 
