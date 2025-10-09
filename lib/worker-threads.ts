@@ -326,19 +326,33 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
     const data: EnvironmentalData[] = []
     try {
       // Ensure WAQI station index is being discovered and persisted
-      try { const { ensureWaqiStationIndex } = await import('./data-collector'); await ensureWaqiStationIndex(5) } catch {}
+      try { const { ensureWaqiStationIndex } = await import('./data-collector'); await ensureWaqiStationIndex(5) } catch (e) {
+        console.log(`⚠️ WAQI: Station index discovery failed:`, (e as Error).message)
+      }
       // Iterate WAQI stations by allowed countries using persisted registry
       const allow = (providerConfigs as any)?.waqi?.countries?.allow || []
       const countries = Array.isArray(allow) && allow.length > 0 ? allow : undefined
       const key = 'stations'
-      const offset = await readCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key)
-      const pageSize = Number(process.env.WAQI_STATION_PAGE_SIZE || 150)
-      const stations = await getStationsByProviderPage({ provider: 'waqi', countries, offset, limit: pageSize })
-      const nextOffset = stations.length ? offset + stations.length : 0
-      await writeCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key, nextOffset)
+      let offset = 0
+      let stations: any[] = []
+      try {
+        offset = await readCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key)
+        const pageSize = Number(process.env.WAQI_STATION_PAGE_SIZE || 150)
+        console.log(`📡 WAQI: Querying stations (provider=waqi, countries=${countries || 'ALL'}, offset=${offset}, limit=${pageSize})`)
+        stations = await getStationsByProviderPage({ provider: 'waqi', countries, offset, limit: pageSize })
+        console.log(`✅ WAQI: Found ${stations.length} stations from database`)
+        const nextOffset = stations.length ? offset + stations.length : 0
+        await writeCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key, nextOffset)
+      } catch (e) {
+        console.error(`❌ WAQI: Error fetching stations from database:`, e)
+        stations = []
+      }
 
       const items: any[] = []
       if (stations.length && process.env.WAQI_API_KEY) {
+        console.log(`🌐 WAQI: Fetching data from ${stations.length} stations via WAQI API...`)
+        let successCount = 0
+        let errorCount = 0
         for (const s of stations) {
           try {
             const url = `https://api.waqi.info/feed/@${encodeURIComponent(s.station_code)}/?token=${process.env.WAQI_API_KEY}`
@@ -361,9 +375,18 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
                 humidity: d.data?.iaqi?.h?.['v'],
                 pressure: d.data?.iaqi?.p?.['v'],
               })
+              successCount++
             }
-        } catch {}
+          } catch (e) {
+            errorCount++
+            if (errorCount === 1) {
+              console.error(`❌ WAQI API error (station ${s.station_code}):`, (e as Error).message)
+            }
+          }
         }
+        console.log(`📊 WAQI API results: ${successCount} success, ${errorCount} errors from ${stations.length} stations`)
+      } else {
+        console.log(`⚠️ WAQI: Skipping API calls (stations=${stations.length}, hasApiKey=${!!process.env.WAQI_API_KEY})`)
       }
 
       let aqItems = items
