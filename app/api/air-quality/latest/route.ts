@@ -66,7 +66,7 @@ export async function GET() {
         'Prefer': 'return=representation'
       }
 
-      const url = `${supabaseUrl}/rest/v1/air_quality_readings?select=aqi,pm25,pm10,city,country,lat,lon,provider,collected_at&order=collected_at.desc&limit=1`
+      const url = `${supabaseUrl}/rest/v1/air_quality_readings?select=aqi,pm25,pm10,city,lat,lon,provider,collected_at&order=collected_at.desc&limit=1`
       console.log('Fetching from Supabase:', url)
       
       const response = await fetch(url, { headers })
@@ -98,7 +98,7 @@ export async function GET() {
           pm25: reading.pm25 || 0,
           pm10: reading.pm10 || 0,
           location: reading.city || 'Unknown',
-          country: reading.country || '',
+          country: '',
           lat: reading.lat || 0,
           lon: reading.lon || 0,
           source: reading.provider || 'Unknown',

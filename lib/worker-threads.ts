@@ -341,7 +341,20 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
         console.log(`📡 WAQI: Querying stations (provider=waqi, countries=${countries || 'ALL'}, offset=${offset}, limit=${pageSize})`)
         stations = await getStationsByProviderPage({ provider: 'waqi', countries, offset, limit: pageSize })
         console.log(`✅ WAQI: Found ${stations.length} stations from database`)
-        const nextOffset = stations.length ? offset + stations.length : 0
+        
+        // Auto-reset cursor if we've gone past the end
+        let nextOffset: number
+        if (stations.length === 0 && offset > 0) {
+          console.log(`🔄 WAQI: Reached end of stations (offset=${offset}), resetting cursor to 0`)
+          nextOffset = 0
+        } else if (stations.length < pageSize && stations.length > 0) {
+          // Partial page means we're near the end, wrap around
+          console.log(`🔄 WAQI: Partial page (${stations.length}/${pageSize}), wrapping cursor to 0`)
+          nextOffset = 0
+        } else {
+          nextOffset = offset + stations.length
+        }
+        
         await writeCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key, nextOffset)
       } catch (e) {
         console.error(`❌ WAQI: Error fetching stations from database:`, e)
