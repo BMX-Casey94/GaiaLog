@@ -353,10 +353,15 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
         console.log(`🌐 WAQI: Fetching data from ${stations.length} stations via WAQI API...`)
         let successCount = 0
         let errorCount = 0
+        let invalidStatusCount = 0
+        let firstError: string | null = null
+        let firstInvalidStatus: any = null
+        
         for (const s of stations) {
           try {
             const url = `https://api.waqi.info/feed/@${encodeURIComponent(s.station_code)}/?token=${process.env.WAQI_API_KEY}`
             const d = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'waqi' })
+            
             if (d?.status === 'ok') {
               items.push({
                 aqi: d.data?.aqi,
@@ -376,15 +381,27 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
                 pressure: d.data?.iaqi?.p?.['v'],
               })
               successCount++
+            } else {
+              invalidStatusCount++
+              if (!firstInvalidStatus) {
+                firstInvalidStatus = { station: s.station_code, response: d }
+              }
             }
           } catch (e) {
             errorCount++
-            if (errorCount === 1) {
-              console.error(`❌ WAQI API error (station ${s.station_code}):`, (e as Error).message)
+            if (!firstError) {
+              firstError = `Station ${s.station_code}: ${(e as Error).message}`
             }
           }
         }
-        console.log(`📊 WAQI API results: ${successCount} success, ${errorCount} errors from ${stations.length} stations`)
+        
+        console.log(`📊 WAQI API results: ${successCount} success, ${errorCount} errors, ${invalidStatusCount} invalid status from ${stations.length} stations`)
+        if (firstError) {
+          console.error(`❌ First WAQI error: ${firstError}`)
+        }
+        if (firstInvalidStatus) {
+          console.warn(`⚠️ First invalid status example:`, JSON.stringify(firstInvalidStatus))
+        }
       } else {
         console.log(`⚠️ WAQI: Skipping API calls (stations=${stations.length}, hasApiKey=${!!process.env.WAQI_API_KEY})`)
       }
@@ -759,5 +776,7 @@ export class WorkerManager {
   }
 }
 
+// Export singleton instance
+export const workerManager = new WorkerManager()
 // Export singleton instance
 export const workerManager = new WorkerManager()
