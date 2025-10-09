@@ -778,5 +778,3 @@ export class WorkerManager {
 
 // Export singleton instance
 export const workerManager = new WorkerManager()
-// Export singleton instance
-export const workerManager = new WorkerManager()
