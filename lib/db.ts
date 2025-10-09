@@ -1,11 +1,9 @@
 import { Pool } from 'pg'
 
-// SSL configuration: accept all certificates including self-signed
-// This must be defined before creating the Pool to override PGSSLMODE env var
-const sslConfig = {
-  rejectUnauthorized: false,
-  checkServerIdentity: () => undefined, // Skip server identity check
-}
+// SSL configuration for Supabase
+// For localhost, disable SSL. For Supabase, use proper SSL with rejectUnauthorized: false
+const isSupabase = process.env.PGHOST?.includes('supabase.co')
+const sslConfig = isSupabase ? { rejectUnauthorized: false } : false
 
 // Build connection config explicitly to override environment variables
 const connectionConfig = {
@@ -19,7 +17,7 @@ const connectionConfig = {
   connectionTimeoutMillis: 10000,
 }
 
-const shouldUseSSL = true
+const shouldUseSSL = isSupabase
 
 export const dbPool = new Pool(connectionConfig)
 

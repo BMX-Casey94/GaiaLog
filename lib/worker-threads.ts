@@ -368,6 +368,7 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
 
       let aqItems = items
       if (aqItems.length === 0) {
+        console.log(`⚠️ WAQI: No stations found, using fallback (WeatherAPI/TOP_100_CITIES)`)
         // Fallback to WeatherAPI using OWM station names by allowed countries
         const waAllow = (providerConfigs as any)?.weatherapi?.countries?.allow || []
         const waCountries = Array.isArray(waAllow) && waAllow.length > 0 ? waAllow : undefined
@@ -378,7 +379,9 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
         const nextCityOffset = owmCities.length ? cityOffset + owmCities.length : 0
         await writeCursor('weatherapi', waCountries && waCountries.length === 1 ? waCountries[0] : null, cityKey, nextCityOffset)
         const cities = owmCities.length ? owmCities.map(c => c.name || c.station_code) : TOP_100_CITIES
+        console.log(`📍 WAQI: Using ${cities.length} cities for air quality collection (owmCities=${owmCities.length})`)
         const batch = await collectAirQualityDataBatch(cities, false)
+        console.log(`📊 WAQI: Collected ${batch.length} air quality readings from fallback`)
         aqItems = batch as any
       }
       for (const item of aqItems) {
