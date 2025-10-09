@@ -28,11 +28,28 @@ export function Hero() {
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const response = await fetch('/api/hero-stats')
-        const result = await response.json()
-        if (result.success) {
-          setStats(result.data)
-          setIsStale(result.stale || false)
+        // Fetch fresh data from the same endpoint as Live Alerts for consistency
+        const [heroResponse, freshDataResponse] = await Promise.all([
+          fetch('/api/hero-stats'),
+          fetch('/api/data/collect', { method: 'POST' })
+        ])
+        
+        const heroResult = await heroResponse.json()
+        const freshResult = await freshDataResponse.json()
+        
+        // Use fresh API data for air quality if available
+        const freshAQI = freshResult.data?.airQuality?.aqi
+        const freshAQITimestamp = freshResult.data?.airQuality?.timestamp
+        
+        if (heroResult.success) {
+          setStats({
+            airQuality: {
+              aqi: freshAQI ?? heroResult.data.airQuality.aqi,
+              lastUpdated: freshAQITimestamp ?? heroResult.data.airQuality.lastUpdated
+            },
+            blockchain: heroResult.data.blockchain
+          })
+          setIsStale(heroResult.stale || false)
         }
       } catch (error) {
         console.error('Error fetching hero stats:', error)
