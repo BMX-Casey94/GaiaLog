@@ -23,6 +23,7 @@ export function Hero() {
     blockchain: { totalTransactions: 0, lastTransaction: null },
   })
   const [loading, setLoading] = useState(true)
+  const [isStale, setIsStale] = useState(false)
 
   useEffect(() => {
     const fetchStats = async () => {
@@ -31,17 +32,19 @@ export function Hero() {
         const result = await response.json()
         if (result.success) {
           setStats(result.data)
+          setIsStale(result.stale || false)
         }
       } catch (error) {
         console.error('Error fetching hero stats:', error)
+        // Keep showing last known data on error instead of clearing
       } finally {
         setLoading(false)
       }
     }
 
     fetchStats()
-    // Refresh every 60 seconds
-    const interval = setInterval(fetchStats, 60000)
+    // Refresh every 15 seconds to match server cache TTL for faster updates
+    const interval = setInterval(fetchStats, 15000)
     return () => clearInterval(interval)
   }, [])
 

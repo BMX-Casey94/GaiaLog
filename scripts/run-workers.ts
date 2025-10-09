@@ -91,6 +91,16 @@ async function main() {
       }
     }, 5000)
 
+    // Update tx_log statistics every 30 seconds for near real-time count updates
+    setInterval(async () => {
+      try {
+        const { updateTxLogStats } = await import('../lib/tx-stats-updater')
+        await updateTxLogStats()
+      } catch (err) {
+        console.error('Stats update failed:', err)
+      }
+    }, 30000) // 30 seconds
+
     process.on('SIGINT', () => {
       console.log('\n🛑 Shutting down GaiaLog worker service...')
       workerManager.stopAll()

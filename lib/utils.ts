@@ -72,13 +72,13 @@ export function getBSVNetwork(): 'main' | 'test' {
 
 export function getBSVExplorerUrl(txid: string, network?: 'main' | 'test'): string {
   const net = network || getBSVNetwork()
-  const baseUrl = net === 'main' ? 'https://whatsonchain.com' : 'https://test.whatsonchain.com'
+  const baseUrl = net === 'main' ? 'https://whatsonchain.com' : 'https://whatsonchain.com'
   return `${baseUrl}/tx/${txid}`
 }
 
 export function getBSVAddressUrl(address: string, network?: 'main' | 'test'): string {
   const net = network || getBSVNetwork()
-  const baseUrl = net === 'main' ? 'https://whatsonchain.com' : 'https://test.whatsonchain.com'
+  const baseUrl = net === 'main' ? 'https://whatsonchain.com' : 'https://whatsonchain.com'
   return `${baseUrl}/address/${address}`
 }
 

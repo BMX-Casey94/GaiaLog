@@ -21,11 +21,11 @@ interface TxLogRecord {
 export async function GET(req: NextRequest) {
   const network = getBSVNetwork()
   try {
-    // TEMPORARY WORKAROUND: Use a much simpler query that won't timeout on 1.8M records
-    // This gets recent transactions without complex filtering that causes timeouts
+    // Get the latest confirmed transaction for each data type (max 4 entries)
+    // Using DISTINCT ON with time window for efficient query on large tables
     const result = await Promise.race([
       query<TxLogRecord>(
-        `SELECT 
+        `SELECT DISTINCT ON (type)
           txid, 
           type, 
           provider,
@@ -36,11 +36,12 @@ export async function GET(req: NextRequest) {
          WHERE status = 'confirmed'
            AND txid IS NOT NULL
            AND LENGTH(txid) = 64
-         ORDER BY collected_at DESC
-         LIMIT 20`
+           AND type IN ('air_quality', 'water_levels', 'seismic_activity', 'advanced_metrics')
+           AND collected_at > NOW() - INTERVAL '7 days'
+         ORDER BY type, collected_at DESC`
       ),
       new Promise<never>((_, reject) => 
-        setTimeout(() => reject(new Error('Query timeout')), 5000)
+        setTimeout(() => reject(new Error('Query timeout')), 10000)
       )
     ])
 
@@ -62,6 +63,8 @@ export async function GET(req: NextRequest) {
           provider: tx.provider,
         },
       }))
+      // Sort by timestamp descending for display
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
 
     return NextResponse.json({ success: true, network, readings })
   } catch (error) {

@@ -54,7 +54,8 @@ export function BlockchainExplorer() {
       if (result.success && result.readings) {
         setNetwork(result.network || 'test')
         
-        // Transform the readings into display format with actual data
+        // Transform the readings into display format
+        // API returns max 4 entries (one latest transaction per data type)
         const displayTransactions: TransactionDisplay[] = result.readings
           .filter((reading: Reading) => reading.txid && reading.txid !== 'failed' && isValidTxId(reading.txid))
           .map((reading: Reading) => ({
@@ -131,7 +132,7 @@ export function BlockchainExplorer() {
   const getWhatsonChainUrl = (txid: string): string => {
     const baseUrl = network === 'main' 
       ? 'https://whatsonchain.com' 
-      : 'https://test.whatsonchain.com'
+      : 'https://whatsonchain.com'
     return `${baseUrl}/tx/${txid}`
   }
 
@@ -239,7 +240,7 @@ export function BlockchainExplorer() {
                 onClick={() => {
                   const baseUrl = network === 'main' 
                     ? 'https://whatsonchain.com' 
-                    : 'https://test.whatsonchain.com'
+                    : 'https://whatsonchain.com'
                   window.open(`${baseUrl}/address/${wallet.address}`, '_blank')
                   setShowWalletModal(false)
                 }}

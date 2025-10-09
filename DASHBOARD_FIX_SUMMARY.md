@@ -117,3 +117,7 @@ Check these to ensure it's working:
 - Console logs should NOT show "Recent readings API error"
 - API response time should be < 1 second
 - Browser network tab: `/api/blockchain/recent-readings` should return 200 OK
+
+
+
+

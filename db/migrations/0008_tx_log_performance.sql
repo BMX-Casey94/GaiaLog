@@ -20,5 +20,14 @@ WHERE status IN ('confirmed', 'pending');
 CREATE INDEX IF NOT EXISTS idx_tx_log_type_time 
 ON tx_log (type, collected_at DESC);
 
+-- Index for latest transaction query (used by hero stats "Last TX")
+CREATE INDEX IF NOT EXISTS idx_tx_log_onchain_time
+ON tx_log (onchain_at DESC)
+WHERE status IN ('confirmed', 'pending')
+  AND onchain_at IS NOT NULL;
+
 -- Analyze the table to update statistics
 ANALYZE tx_log;
+
+
+
