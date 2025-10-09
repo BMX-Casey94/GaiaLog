@@ -47,7 +47,7 @@ export async function GET() {
       }
     })
   } catch (error) {
-    console.error('Error fetching latest air quality from DB:', error)
+    console.error('PostgreSQL connection failed (expected on Vercel), using Supabase REST API')
     
     // Fallback: Use Supabase REST API
     try {
@@ -55,27 +55,35 @@ export async function GET() {
       const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
       
       if (!supabaseUrl || !supabaseKey) {
+        console.error('Missing Supabase config:', { hasUrl: !!supabaseUrl, hasKey: !!supabaseKey })
         throw new Error('Supabase configuration missing')
       }
 
       const headers = {
         'apikey': supabaseKey,
         'Authorization': `Bearer ${supabaseKey}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation'
       }
 
-      const response = await fetch(
-        `${supabaseUrl}/rest/v1/air_quality_readings?select=aqi,pm25,pm10,city,country,lat,lon,provider,collected_at&aqi=not.is.null&order=collected_at.desc&limit=1`,
-        { headers }
-      )
+      const url = `${supabaseUrl}/rest/v1/air_quality_readings?select=aqi,pm25,pm10,city,country,lat,lon,provider,collected_at&order=collected_at.desc&limit=1`
+      console.log('Fetching from Supabase:', url)
+      
+      const response = await fetch(url, { headers })
 
+      console.log('Supabase response status:', response.status)
+      
       if (!response.ok) {
-        throw new Error(`Supabase API error: ${response.status}`)
+        const errorText = await response.text()
+        console.error('Supabase API error:', response.status, errorText)
+        throw new Error(`Supabase API error: ${response.status} - ${errorText}`)
       }
 
       const data = await response.json()
+      console.log('Supabase data:', data)
       
       if (!data || data.length === 0) {
+        console.warn('No air quality data in database')
         return NextResponse.json({
           success: false,
           message: 'No air quality data available'
@@ -95,13 +103,15 @@ export async function GET() {
           lon: reading.lon || 0,
           source: reading.provider || 'Unknown',
           timestamp: reading.collected_at
-        }
+        },
+        source: 'supabase-rest-api'
       })
     } catch (fallbackError) {
-      console.error('Supabase REST API fallback also failed:', fallbackError)
+      console.error('Supabase REST API fallback failed:', fallbackError)
       return NextResponse.json({
         success: false,
-        message: 'Database connection error'
+        message: fallbackError instanceof Error ? fallbackError.message : 'Database connection error',
+        error: fallbackError instanceof Error ? fallbackError.stack : String(fallbackError)
       }, { status: 500 })
     }
   }
