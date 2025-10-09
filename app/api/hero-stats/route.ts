@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server'
 import { query } from '@/lib/db'
-import { createClient } from '@supabase/supabase-js'
 import { heroStatsCache } from '@/lib/stats-cache'
 
 export const runtime = 'nodejs'
@@ -40,43 +39,50 @@ export async function GET() {
         latestTx = latestTxResult.rows[0]?.timestamp || null
 
       } catch (dbErr) {
-        // Fallback: Supabase HTTP
-        console.warn('Direct DB query failed, trying Supabase fallback:', dbErr)
+        // Fallback: Use Supabase REST API directly with fetch
+        console.warn('Direct DB query failed, trying Supabase REST API:', dbErr)
         const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
         const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-        if (!supabaseUrl || !supabaseKey) throw new Error('Supabase env missing')
-
-        const supabase = createClient(supabaseUrl, supabaseKey, {
-          auth: { persistSession: false, autoRefreshToken: false },
-        })
-
-        // Run Supabase queries in parallel too
-        const [aq, txCnt, latest] = await Promise.all([
-          supabase
-            .from('air_quality_readings')
-            .select('aqi, collected_at')
-            .not('aqi', 'is', null)
-            .order('collected_at', { ascending: false })
-            .limit(1),
-          
-          supabase.from('tx_log').select('*', { count: 'exact', head: true }),
-          
-          supabase
-            .from('tx_log')
-            .select('onchain_at, collected_at, status')
-            .in('status', ['pending', 'confirmed'])
-            .order('collected_at', { ascending: false })
-            .limit(1)
-        ])
-
-        if (!aq.error && aq.data?.[0]) {
-          airQuality = { aqi: aq.data[0].aqi ?? null, collected_at: aq.data[0].collected_at ?? null }
+        
+        if (!supabaseUrl || !supabaseKey) {
+          console.error('Supabase env missing:', { supabaseUrl: !!supabaseUrl, supabaseKey: !!supabaseKey })
+          throw new Error('Supabase configuration missing')
         }
-        if (!txCnt.error && typeof txCnt.count === 'number') {
-          txCount = txCnt.count
+
+        const headers = {
+          'apikey': supabaseKey,
+          'Authorization': `Bearer ${supabaseKey}`,
+          'Content-Type': 'application/json'
         }
-        if (!latest.error && latest.data?.[0]) {
-          latestTx = latest.data[0].onchain_at || latest.data[0].collected_at || null
+
+        try {
+          // Run Supabase REST API queries in parallel
+          const [aqRes, txCntRes, latestRes] = await Promise.all([
+            fetch(`${supabaseUrl}/rest/v1/air_quality_readings?select=aqi,collected_at&aqi=not.is.null&order=collected_at.desc&limit=1`, { headers }),
+            fetch(`${supabaseUrl}/rest/v1/tx_log?select=count`, { headers: { ...headers, 'Prefer': 'count=exact' }, method: 'HEAD' }),
+            fetch(`${supabaseUrl}/rest/v1/tx_log?select=onchain_at,collected_at&status=in.(pending,confirmed)&order=collected_at.desc&limit=1`, { headers })
+          ])
+
+          if (aqRes.ok) {
+            const aqData = await aqRes.json()
+            if (aqData?.[0]) {
+              airQuality = { aqi: aqData[0].aqi ?? null, collected_at: aqData[0].collected_at ?? null }
+            }
+          }
+          
+          if (txCntRes.ok) {
+            const count = txCntRes.headers.get('content-range')?.split('/')[1]
+            txCount = count ? parseInt(count) : 0
+          }
+          
+          if (latestRes.ok) {
+            const latestData = await latestRes.json()
+            if (latestData?.[0]) {
+              latestTx = latestData[0].onchain_at || latestData[0].collected_at || null
+            }
+          }
+        } catch (apiErr) {
+          console.error('Supabase REST API fallback also failed:', apiErr)
         }
       }
 

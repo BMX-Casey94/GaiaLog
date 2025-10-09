@@ -68,39 +68,73 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({ success: true, network, readings })
   } catch (error) {
-    console.error('Recent readings API error, using fallback data:', error)
+    console.error('Recent readings API error, trying Supabase REST API:', error)
     
-    // FALLBACK: Return mock data to make dashboard work
-    const fallbackReadings = [
-      {
-        txid: 'fallback_tx_1',
-        type: 'air_quality',
-        timestamp: new Date().toISOString(),
-        status: 'confirmed',
-        data: { provider: 'WAQI' }
-      },
-      {
-        txid: 'fallback_tx_2', 
-        type: 'seismic',
-        timestamp: new Date(Date.now() - 3600000).toISOString(),
-        status: 'confirmed',
-        data: { provider: 'USGS' }
-      },
-      {
-        txid: 'fallback_tx_3',
-        type: 'water_levels', 
-        timestamp: new Date(Date.now() - 7200000).toISOString(),
-        status: 'confirmed',
-        data: { provider: 'NOAA' }
+    // Fallback: Use Supabase REST API
+    try {
+      const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+      const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+      
+      if (!supabaseUrl || !supabaseKey) {
+        throw new Error('Supabase configuration missing')
       }
-    ]
-    
-    return NextResponse.json({ 
-      success: true, 
-      network, 
-      readings: fallbackReadings,
-      fallback: true,
-      message: 'Using fallback data due to database timeout. Run optimization SQL when Supabase is accessible.'
-    })
+
+      const headers = {
+        'apikey': supabaseKey,
+        'Authorization': `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json'
+      }
+
+      // Fetch recent transactions from each type
+      const response = await fetch(
+        `${supabaseUrl}/rest/v1/tx_log?select=txid,type,provider,collected_at,onchain_at,status&status=in.(pending,confirmed)&txid=not.is.null&type=in.(air_quality,water_levels,seismic_activity,advanced_metrics)&order=collected_at.desc&limit=100`,
+        { headers }
+      )
+
+      if (!response.ok) {
+        throw new Error(`Supabase API error: ${response.status}`)
+      }
+
+      const txData = await response.json()
+      
+      // Get distinct latest transaction per type
+      const seenTypes = new Set<string>()
+      const readings = txData
+        .filter((tx: TxLogRecord) => {
+          if (!tx.txid || tx.txid === 'failed' || tx.txid === '') return false
+          if (tx.txid.startsWith('local_') || tx.txid.startsWith('error_')) return false
+          if (!isValidTxId(tx.txid)) return false
+          if (seenTypes.has(tx.type)) return false
+          seenTypes.add(tx.type)
+          return true
+        })
+        .slice(0, 4)
+        .map((tx: TxLogRecord) => ({
+          txid: tx.txid,
+          type: tx.type,
+          timestamp: tx.onchain_at || tx.collected_at,
+          status: tx.status,
+          data: {
+            provider: tx.provider,
+          },
+        }))
+
+      return NextResponse.json({ 
+        success: true, 
+        network, 
+        readings,
+        fallback: true
+      })
+    } catch (fallbackError) {
+      console.error('Supabase REST API fallback also failed:', fallbackError)
+      
+      // Final fallback: Return empty array
+      return NextResponse.json({ 
+        success: true, 
+        network, 
+        readings: [],
+        error: 'Unable to connect to database'
+      })
+    }
   }
 }
