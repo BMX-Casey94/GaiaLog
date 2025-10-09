@@ -65,33 +65,29 @@ export function AirQualityPanel() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
 
-  // Fetch fresh air quality data using the same endpoint as Live Dashboard
+  // Fetch air quality data from database (kept fresh by local workers)
   const fetchAirQualityData = async () => {
     try {
-      const response = await fetch('/api/data/collect', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      })
+      const response = await fetch('/api/air-quality/latest')
+      
       if (response.ok) {
         const result = await response.json()
-        const airQualityData = result.data?.airQuality
         
-        if (airQualityData) {
+        if (result.success && result.data) {
+          const airQualityData = result.data
           const mapped: AirQualityData = {
             aqi: airQualityData?.aqi ?? 0,
             pm25: airQualityData?.pm25 ?? 0,
             pm10: airQualityData?.pm10 ?? 0,
-            no2: airQualityData?.no2 ?? 0,
-            o3: airQualityData?.o3 ?? 0,
-            co: airQualityData?.co ?? 0,
-            so2: airQualityData?.so2 ?? 0,
-            temperature: typeof airQualityData?.temperature === 'number' ? airQualityData.temperature : 0,
-            humidity: typeof airQualityData?.humidity === 'number' ? airQualityData.humidity : 0,
-            pressure: typeof airQualityData?.pressure === 'number' ? airQualityData.pressure : 0,
-            windSpeed: typeof airQualityData?.windSpeed === 'number' ? airQualityData.windSpeed : 0,
-            windDirection: typeof airQualityData?.windDirection === 'number' ? airQualityData.windDirection : 0,
+            no2: 0, // Not provided by current API
+            o3: 0,
+            co: 0,
+            so2: 0,
+            temperature: 0,
+            humidity: 0,
+            pressure: 0,
+            windSpeed: 0,
+            windDirection: 0,
             location: airQualityData?.location || 'Unknown',
             timestamp: airQualityData?.timestamp ? Date.parse(airQualityData.timestamp) : Date.now(),
             source: airQualityData?.source || 'WAQI',
@@ -108,15 +104,14 @@ export function AirQualityPanel() {
           })
           setLastUpdate(new Date())
         } else {
-          console.warn('No air quality data in fresh collection response')
+          console.warn('No air quality data available from database')
           setAirQualityData(null)
         }
       } else {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
     } catch (error) {
-      console.error('Error fetching fresh air quality data:', error)
-      // Don't fall back to simulated data - show no data instead
+      console.error('Error fetching air quality data from database:', error)
       setAirQualityData(null)
     }
   }

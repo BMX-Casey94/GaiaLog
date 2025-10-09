@@ -129,22 +129,27 @@ export function LiveDashboard() {
     setLoading(true)
     setError(null)
     try {
-      const response = await fetch('/api/data/collect', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      })
-      if (!response.ok) throw new Error('Failed to fetch data')
-      const result = await response.json()
+      // Fetch from database (kept fresh by local workers)
+      const [airQualityRes, waterLevelsRes, seismicRes] = await Promise.all([
+        fetch('/api/air-quality/latest'),
+        fetch('/api/water-levels?limit=1'),
+        fetch('/api/seismic?limit=1')
+      ])
+      
+      const airQuality = await airQualityRes.json()
+      const waterLevels = await waterLevelsRes.json()
+      const seismic = await seismicRes.json()
       
       const processedData = {
-        ...result.data,
+        airQuality: airQuality.success ? airQuality.data : null,
+        waterLevels: waterLevels.success && waterLevels.data?.length > 0 ? waterLevels.data[0] : null,
+        seismic: seismic.success && seismic.data?.length > 0 ? seismic.data[0] : null,
+        advancedMetrics: null, // Not displayed in Live Alerts
         lastUpdated: new Date().toLocaleTimeString()
       }
       
       setData(processedData)
-      setAlerts(processDataIntoAlerts(result.data))
+      setAlerts(processDataIntoAlerts(processedData))
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error')
     } finally {
