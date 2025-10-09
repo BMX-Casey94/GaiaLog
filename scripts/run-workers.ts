@@ -55,20 +55,20 @@ async function main() {
       console.log(`📈 Queue items=${stats.totalItems} +${sample.queued} proc+${sample.processed} fail+${sample.failed} retryScheduled=${retryScheduled} workersRunning=${running} broadcastedLast10s=${broadcasted} ${gateStr}${hint}`)
     }, 10000)
 
-    // Optional DB ingestion throughput (debug mode recommended)
-    let lastTxCount = 0
-    setInterval(async () => {
-      try {
-        const { query } = await import('../lib/db')
-        const r = await query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM tx_log`)
-        const total = Number(r.rows?.[0]?.c || '0')
-        const delta = total - lastTxCount
-        lastTxCount = total
-        if (process.env.BSV_LOG_LEVEL === 'debug') {
+    // Optional DB ingestion throughput (debug only; COUNT(*) can be expensive on large tables)
+    if (process.env.BSV_LOG_LEVEL === 'debug') {
+      let lastTxCount = 0
+      setInterval(async () => {
+        try {
+          const { query } = await import('../lib/db')
+          const r = await query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM tx_log`)
+          const total = Number(r.rows?.[0]?.c || '0')
+          const delta = total - lastTxCount
+          lastTxCount = total
           console.log(`🗄️ tx_log total=${total} (+${delta}/min)`) 
-        }
-      } catch {}
-    }, 60000)
+        } catch {}
+      }, 60000)
+    }
 
     // Write cross-process worker status every 5s for Next.js API to read
     const statusDir = os.tmpdir()

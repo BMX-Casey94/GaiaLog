@@ -21,10 +21,14 @@ export async function GET() {
                  WHERE aqi IS NOT NULL
                  ORDER BY collected_at DESC
                  LIMIT 1`),
-          
-          // Use PostgreSQL's reltuples estimate (fast) with periodic ANALYZE (30s interval)
-          // Much faster than COUNT(*) on 1.7M+ rows, updates via scheduled ANALYZE
-          query(`SELECT reltuples::bigint AS count FROM pg_class WHERE relname = 'tx_log'`),
+          // Use PostgreSQL's table stats for fast approximate counts. Prefer n_live_tup when available
+          // (updated by autovacuum/analyze), fallback to reltuples estimate from pg_class.
+          query(`
+            SELECT COALESCE(ps.n_live_tup::bigint, pc.reltuples::bigint) AS count
+            FROM pg_class pc
+            LEFT JOIN pg_stat_all_tables ps ON ps.relname = pc.relname
+            WHERE pc.relname = 'tx_log'
+          `),
           
           query(`SELECT COALESCE(onchain_at, collected_at) as timestamp
                  FROM tx_log
