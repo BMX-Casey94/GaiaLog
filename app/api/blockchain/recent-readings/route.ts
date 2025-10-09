@@ -87,36 +87,35 @@ export async function GET(req: NextRequest) {
         'Prefer': 'return=representation'
       }
 
-      const fetchUrl = `${supabaseUrl}/rest/v1/tx_log?select=txid,type,provider,collected_at,onchain_at,status&status=in.(pending,confirmed)&txid=not.is.null&type=in.(air_quality,water_levels,seismic_activity,advanced_metrics)&order=collected_at.desc&limit=100`
-      console.log('Fetching recent transactions from Supabase REST API')
+      // Fetch latest transaction for each type separately to ensure we get all 4 types
+      // (fetching top 100 might only get advanced_metrics if it broadcasts frequently)
+      console.log('Fetching recent transactions from Supabase REST API (one per type)')
       
-      // Fetch recent transactions from each type
-      const response = await fetch(fetchUrl, { headers })
+      const types = ['air_quality', 'water_levels', 'seismic_activity', 'advanced_metrics']
+      const readings = await Promise.all(
+        types.map(async (type) => {
+          const url = `${supabaseUrl}/rest/v1/tx_log?select=txid,type,provider,collected_at,onchain_at,status&status=in.(pending,confirmed)&txid=not.is.null&type=eq.${type}&order=collected_at.desc&limit=1`
+          const res = await fetch(url, { headers })
+          if (res.ok) {
+            const data = await res.json()
+            return data[0] || null
+          }
+          return null
+        })
+      )
+      
+      const txData = readings.filter((tx): tx is TxLogRecord => tx !== null)
+      console.log('Got transaction data from Supabase:', txData.length, 'transactions (one per type)')
 
-      console.log('Supabase REST API response status:', response.status)
-      
-      if (!response.ok) {
-        const errorText = await response.text()
-        console.error('Supabase API error:', response.status, errorText)
-        throw new Error(`Supabase API error: ${response.status}`)
-      }
-
-      const txData = await response.json()
-      console.log('Got transaction data from Supabase:', txData.length, 'transactions')
-      
-      // Get distinct latest transaction per type
-      const seenTypes = new Set<string>()
-      const readings = txData
-        .filter((tx: TxLogRecord) => {
+      // Filter and transform
+      const finalReadings = txData
+        .filter((tx) => {
           if (!tx.txid || tx.txid === 'failed' || tx.txid === '') return false
           if (tx.txid.startsWith('local_') || tx.txid.startsWith('error_')) return false
           if (!isValidTxId(tx.txid)) return false
-          if (seenTypes.has(tx.type)) return false
-          seenTypes.add(tx.type)
           return true
         })
-        .slice(0, 4)
-        .map((tx: TxLogRecord) => ({
+        .map((tx) => ({
           txid: tx.txid,
           type: tx.type,
           timestamp: tx.onchain_at || tx.collected_at,
@@ -129,7 +128,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ 
         success: true, 
         network, 
-        readings,
+        readings: finalReadings,
         fallback: true
       })
     } catch (fallbackError) {

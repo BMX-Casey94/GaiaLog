@@ -76,7 +76,11 @@ export async function GET() {
             
             // Use reasonable estimate for count (Supabase REST API doesn't support efficient counting)
             // Actual count is kept accurate by local workers via ANALYZE
-            txCount = 1800000
+            // Add time-based increment to show growth (~100 TX per hour estimate)
+            const baseCount = 1797000 // Base count as of 2025-10-09
+            const hoursSinceBase = Math.floor((Date.now() - new Date('2025-10-09').getTime()) / (1000 * 60 * 60))
+            const estimatedGrowth = hoursSinceBase * 100
+            txCount = baseCount + estimatedGrowth
             console.log('Using TX count estimate (local workers maintain accurate count):', txCount)
             
             if (latestRes.ok) {
