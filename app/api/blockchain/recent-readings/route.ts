@@ -68,7 +68,7 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({ success: true, network, readings })
   } catch (error) {
-    console.error('Recent readings API error, trying Supabase REST API:', error)
+    console.log('PostgreSQL connection failed (expected on Vercel), using Supabase REST API')
     
     // Fallback: Use Supabase REST API
     try {
@@ -76,26 +76,33 @@ export async function GET(req: NextRequest) {
       const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
       
       if (!supabaseUrl || !supabaseKey) {
+        console.error('Supabase config missing:', { hasUrl: !!supabaseUrl, hasKey: !!supabaseKey })
         throw new Error('Supabase configuration missing')
       }
 
       const headers = {
         'apikey': supabaseKey,
         'Authorization': `Bearer ${supabaseKey}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation'
       }
 
+      const fetchUrl = `${supabaseUrl}/rest/v1/tx_log?select=txid,type,provider,collected_at,onchain_at,status&status=in.(pending,confirmed)&txid=not.is.null&type=in.(air_quality,water_levels,seismic_activity,advanced_metrics)&order=collected_at.desc&limit=100`
+      console.log('Fetching recent transactions from Supabase REST API')
+      
       // Fetch recent transactions from each type
-      const response = await fetch(
-        `${supabaseUrl}/rest/v1/tx_log?select=txid,type,provider,collected_at,onchain_at,status&status=in.(pending,confirmed)&txid=not.is.null&type=in.(air_quality,water_levels,seismic_activity,advanced_metrics)&order=collected_at.desc&limit=100`,
-        { headers }
-      )
+      const response = await fetch(fetchUrl, { headers })
 
+      console.log('Supabase REST API response status:', response.status)
+      
       if (!response.ok) {
+        const errorText = await response.text()
+        console.error('Supabase API error:', response.status, errorText)
         throw new Error(`Supabase API error: ${response.status}`)
       }
 
       const txData = await response.json()
+      console.log('Got transaction data from Supabase:', txData.length, 'transactions')
       
       // Get distinct latest transaction per type
       const seenTypes = new Set<string>()
