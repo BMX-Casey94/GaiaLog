@@ -142,8 +142,18 @@ export function LiveDashboard() {
       
       const processedData = {
         airQuality: airQuality.success ? airQuality.data : null,
-        waterLevels: waterLevels.success && waterLevels.data?.length > 0 ? waterLevels.data[0] : null,
-        seismic: seismic.success && seismic.data?.length > 0 ? seismic.data[0] : null,
+        waterLevels: waterLevels.stations && waterLevels.stations.length > 0 ? {
+          ...waterLevels.stations[0],
+          river_level: waterLevels.stations[0].level,
+          location: waterLevels.stations[0].name,
+          timestamp: waterLevels.timestamp,
+          source: waterLevels.source
+        } : null,
+        seismic: seismic.recent_events && seismic.recent_events.length > 0 ? {
+          ...seismic.recent_events[0],
+          timestamp: seismic.timestamp,
+          source: seismic.source
+        } : null,
         advancedMetrics: null, // Not displayed in Live Alerts
         lastUpdated: new Date().toLocaleTimeString()
       }
