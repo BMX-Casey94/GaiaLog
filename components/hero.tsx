@@ -30,9 +30,9 @@ export function Hero() {
       try {
         // Fetch from hero-stats API which reads from database
         // Database is kept fresh by local workers
-        // Add 10s timeout to prevent hanging
+        // Add 30s timeout (Vercel cold start + cache regeneration can be slow)
         const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 10000)
+        const timeoutId = setTimeout(() => controller.abort(), 30000)
         
         const response = await fetch('/api/hero-stats', {
           signal: controller.signal
@@ -53,7 +53,7 @@ export function Hero() {
         }
       } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') {
-          console.error('Hero stats fetch timed out after 10s')
+          console.error('Hero stats fetch timed out after 30s')
         } else {
           console.error('Error fetching hero stats:', error)
         }
