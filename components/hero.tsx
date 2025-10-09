@@ -30,15 +30,33 @@ export function Hero() {
       try {
         // Fetch from hero-stats API which reads from database
         // Database is kept fresh by local workers
-        const response = await fetch('/api/hero-stats')
+        // Add 10s timeout to prevent hanging
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 10000)
+        
+        const response = await fetch('/api/hero-stats', {
+          signal: controller.signal
+        })
+        clearTimeout(timeoutId)
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`)
+        }
+        
         const result = await response.json()
         
         if (result.success) {
           setStats(result.data)
           setIsStale(result.stale || false)
+        } else {
+          console.warn('Hero stats API returned success=false:', result)
         }
       } catch (error) {
-        console.error('Error fetching hero stats:', error)
+        if (error instanceof Error && error.name === 'AbortError') {
+          console.error('Hero stats fetch timed out after 10s')
+        } else {
+          console.error('Error fetching hero stats:', error)
+        }
         // Keep showing last known data on error instead of clearing
       } finally {
         setLoading(false)
