@@ -33,7 +33,7 @@ export async function GET(req: NextRequest) {
           onchain_at,
           status
          FROM tx_log
-         WHERE status = 'confirmed'
+         WHERE status IN ('pending', 'confirmed')
            AND txid IS NOT NULL
            AND LENGTH(txid) = 64
            AND type IN ('air_quality', 'water_levels', 'seismic_activity', 'advanced_metrics')
