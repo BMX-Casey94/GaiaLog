@@ -130,15 +130,17 @@ export function LiveDashboard() {
     setError(null)
     try {
       // Fetch from database (kept fresh by local workers)
-      const [airQualityRes, waterLevelsRes, seismicRes] = await Promise.all([
+      const [airQualityRes, waterLevelsRes, seismicRes, advancedRes] = await Promise.all([
         fetch('/api/air-quality/latest'),
         fetch('/api/water-levels?limit=1'),
-        fetch('/api/seismic?limit=1')
+        fetch('/api/seismic?limit=1'),
+        fetch('/api/advanced-metrics?limit=1')
       ])
       
       const airQuality = await airQualityRes.json()
       const waterLevels = await waterLevelsRes.json()
       const seismic = await seismicRes.json()
+      const advanced = await advancedRes.json()
       
       const processedData = {
         airQuality: airQuality.success ? airQuality.data : null,
@@ -154,7 +156,11 @@ export function LiveDashboard() {
           timestamp: seismic.timestamp,
           source: seismic.source
         } : null,
-        advancedMetrics: null, // Not displayed in Live Alerts
+        advancedMetrics: advanced.metrics ? {
+          ...advanced.metrics,
+          timestamp: advanced.timestamp,
+          source: advanced.source
+        } : null,
         lastUpdated: new Date().toLocaleTimeString()
       }
       
