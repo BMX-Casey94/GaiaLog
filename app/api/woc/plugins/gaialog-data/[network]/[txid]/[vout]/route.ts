@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { validateGaiaLog, parsePushes } from '@/lib/opreturn-validator'
 import { promises as fs } from 'fs'
 import path from 'path'
-import { renderHtml, renderErrorHtml } from '../../route'
+import { renderHtml, renderErrorHtml } from '../../../route'
 
 export const runtime = 'nodejs'
 
