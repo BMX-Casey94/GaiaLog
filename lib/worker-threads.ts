@@ -116,109 +116,117 @@ export abstract class BaseWorker {
           if (item.type === 'air-quality') {
             const envelope = { type: 'air_quality', aq: { ...item.measurement, location: item.location, timestamp: new Date(item.timestamp).toISOString(), source: item.source } }
             unifiedHash = calculateSourceHash(envelope)
-            // Skip if already on-chain
-            try {
-              if (await hasAirQualityTxId(unifiedHash)) {
-                if (bsvConfig.logging.level === 'debug') {
-                  console.log(`⏭️  Skipping air-quality - already on-chain (${unifiedHash.slice(0, 12)}...)`)
+            if (process.env.GAIALOG_NO_DB !== 'true') {
+              // Skip if already on-chain
+              try {
+                if (await hasAirQualityTxId(unifiedHash)) {
+                  if (bsvConfig.logging.level === 'debug') {
+                    console.log(`⏭️  Skipping air-quality - already on-chain (${unifiedHash.slice(0, 12)}...)`)
+                  }
+                  continue
                 }
-                continue
-              }
-            } catch {}
-            // WAQI sometimes returns '-' for pollutants; coerce to nulls
-            const { toNumberOrNull } = await import('./utils')
-            await insertAirQuality({
-              provider: item.source,
-              station_code: (item as any)?.station_id != null ? String((item as any).station_id) : null,
-              city: item.location,
-              lat: (item as any)?.coordinates?.lat ?? null,
-              lon: (item as any)?.coordinates?.lon ?? null,
-              aqi: toNumberOrNull(item.measurement?.aqi),
-              pm25: toNumberOrNull(item.measurement?.pm25),
-              pm10: toNumberOrNull(item.measurement?.pm10),
-              co: toNumberOrNull(item.measurement?.co),
-              no2: toNumberOrNull(item.measurement?.no2),
-              o3: toNumberOrNull(item.measurement?.o3),
-              so2: toNumberOrNull((item.measurement as any)?.so2),
-              temperature_c: toNumberOrNull((item.measurement as any)?.temperature ?? (item.measurement as any)?.temperature_c),
-              humidity_pct: toNumberOrNull((item.measurement as any)?.humidity ?? (item.measurement as any)?.humidity_pct),
-              pressure_mb: toNumberOrNull((item.measurement as any)?.pressure ?? (item.measurement as any)?.pressure_mb),
-              wind_kph: toNumberOrNull((item.measurement as any)?.windSpeed ?? (item.measurement as any)?.wind_kph),
-              wind_deg: toNumberOrNull((item.measurement as any)?.windDirection ?? (item.measurement as any)?.wind_deg),
-              source: item.source,
-              source_hash: unifiedHash,
-              collected_at: collectedAt,
-            })
+              } catch {}
+              // WAQI sometimes returns '-' for pollutants; coerce to nulls
+              const { toNumberOrNull } = await import('./utils')
+              await insertAirQuality({
+                provider: item.source,
+                station_code: (item as any)?.station_id != null ? String((item as any).station_id) : null,
+                city: item.location,
+                lat: (item as any)?.coordinates?.lat ?? null,
+                lon: (item as any)?.coordinates?.lon ?? null,
+                aqi: toNumberOrNull(item.measurement?.aqi),
+                pm25: toNumberOrNull(item.measurement?.pm25),
+                pm10: toNumberOrNull(item.measurement?.pm10),
+                co: toNumberOrNull(item.measurement?.co),
+                no2: toNumberOrNull(item.measurement?.no2),
+                o3: toNumberOrNull(item.measurement?.o3),
+                so2: toNumberOrNull((item.measurement as any)?.so2),
+                temperature_c: toNumberOrNull((item.measurement as any)?.temperature ?? (item.measurement as any)?.temperature_c),
+                humidity_pct: toNumberOrNull((item.measurement as any)?.humidity ?? (item.measurement as any)?.humidity_pct),
+                pressure_mb: toNumberOrNull((item.measurement as any)?.pressure ?? (item.measurement as any)?.pressure_mb),
+                wind_kph: toNumberOrNull((item.measurement as any)?.windSpeed ?? (item.measurement as any)?.wind_kph),
+                wind_deg: toNumberOrNull((item.measurement as any)?.windDirection ?? (item.measurement as any)?.wind_deg),
+                source: item.source,
+                source_hash: unifiedHash,
+                collected_at: collectedAt,
+              })
+            }
           } else if (item.type === 'water-level') {
             const envelope = { type: 'water_levels', w: { ...item.measurement, location: item.location, timestamp: new Date(item.timestamp).toISOString(), source: item.source } }
             unifiedHash = calculateSourceHash(envelope)
-            // Skip if already on-chain
-            try {
-              if (await hasWaterLevelTxId(unifiedHash)) {
-                if (bsvConfig.logging.level === 'debug') {
-                  console.log(`⏭️  Skipping water-level - already on-chain (${unifiedHash.slice(0, 12)}...)`)
+            if (process.env.GAIALOG_NO_DB !== 'true') {
+              // Skip if already on-chain
+              try {
+                if (await hasWaterLevelTxId(unifiedHash)) {
+                  if (bsvConfig.logging.level === 'debug') {
+                    console.log(`⏭️  Skipping water-level - already on-chain (${unifiedHash.slice(0, 12)}...)`)
+                  }
+                  continue
                 }
-                continue
-              }
-            } catch {}
-            await insertWaterLevel({
-              provider: item.source,
-              station_code: String((item as any)?.stationId ?? (item.measurement as any)?.station_id ?? '' ) || null,
-              location: item.location ?? null,
-              lat: (item as any)?.coordinates?.lat ?? null,
-              lon: (item as any)?.coordinates?.lon ?? null,
-              level_m: (item.measurement as any)?.sea_level ?? null,
-              tide_height_m: (item.measurement as any)?.tide_height ?? null,
-              wave_height_m: (item.measurement as any)?.wave_height_m ?? null,
-              salinity_psu: (item.measurement as any)?.salinity_psu ?? null,
-              dissolved_oxygen_mg_l: (item.measurement as any)?.dissolved_oxygen_mg_l ?? null,
-              turbidity_ntu: (item.measurement as any)?.turbidity_ntu ?? null,
-              current_speed_ms: (item.measurement as any)?.current_speed_ms ?? null,
-              current_direction_deg: (item.measurement as any)?.current_direction_deg ?? null,
-              wind_kph: (item.measurement as any)?.wind_kph ?? null,
-              wind_deg: (item.measurement as any)?.wind_deg ?? null,
-              source: item.source,
-              source_hash: unifiedHash,
-              collected_at: collectedAt,
-            })
+              } catch {}
+              await insertWaterLevel({
+                provider: item.source,
+                station_code: String((item as any)?.stationId ?? (item.measurement as any)?.station_id ?? '' ) || null,
+                location: item.location ?? null,
+                lat: (item as any)?.coordinates?.lat ?? null,
+                lon: (item as any)?.coordinates?.lon ?? null,
+                level_m: (item.measurement as any)?.sea_level ?? null,
+                tide_height_m: (item.measurement as any)?.tide_height ?? null,
+                wave_height_m: (item.measurement as any)?.wave_height_m ?? null,
+                salinity_psu: (item.measurement as any)?.salinity_psu ?? null,
+                dissolved_oxygen_mg_l: (item.measurement as any)?.dissolved_oxygen_mg_l ?? null,
+                turbidity_ntu: (item.measurement as any)?.turbidity_ntu ?? null,
+                current_speed_ms: (item.measurement as any)?.current_speed_ms ?? null,
+                current_direction_deg: (item.measurement as any)?.current_direction_deg ?? null,
+                wind_kph: (item.measurement as any)?.wind_kph ?? null,
+                wind_deg: (item.measurement as any)?.wind_deg ?? null,
+                source: item.source,
+                source_hash: unifiedHash,
+                collected_at: collectedAt,
+              })
+            }
           } else if (item.type === 'seismic') {
             const envelope = { type: 'seismic', s: { magnitude: (item.measurement as any)?.magnitude, depth: (item.measurement as any)?.depth, location: item.location, coordinates: { lat: (item.measurement as any)?.latitude, lon: (item.measurement as any)?.longitude }, timestamp: new Date(item.timestamp).toISOString(), source: item.source, event_id: item.eventId } }
             unifiedHash = calculateSourceHash(envelope)
-            // Skip if this event_id or hash is already on-chain/persisted
-            try {
-              const alreadyByHash = await hasSeismicTxId(unifiedHash)
-              const alreadyByEvent = item.eventId ? await hasSeismicEventTxId(item.eventId) : false
-              if (alreadyByHash || alreadyByEvent) {
-                if (bsvConfig.logging.level === 'debug') {
-                  console.log(`⏭️  Skipping seismic ${item.eventId || 'unknown'} - already on-chain`)
+            if (process.env.GAIALOG_NO_DB !== 'true') {
+              // Skip if this event_id or hash is already on-chain/persisted
+              try {
+                const alreadyByHash = await hasSeismicTxId(unifiedHash)
+                const alreadyByEvent = item.eventId ? await hasSeismicEventTxId(item.eventId) : false
+                if (alreadyByHash || alreadyByEvent) {
+                  if (bsvConfig.logging.level === 'debug') {
+                    console.log(`⏭️  Skipping seismic ${item.eventId || 'unknown'} - already on-chain`)
+                  }
+                  continue
                 }
-                continue
-              }
-            } catch {}
-            await insertSeismic({
-              provider: item.source,
-              event_id: item.eventId ?? null,
-              location: item.location,
-              magnitude: (item.measurement as any)?.magnitude ?? null,
-              depth_km: (item.measurement as any)?.depth ?? null,
-              lat: (item.measurement as any)?.latitude ?? null,
-              lon: (item.measurement as any)?.longitude ?? null,
-              source_hash: unifiedHash,
-              collected_at: collectedAt,
-            })
+              } catch {}
+              await insertSeismic({
+                provider: item.source,
+                event_id: item.eventId ?? null,
+                location: item.location,
+                magnitude: (item.measurement as any)?.magnitude ?? null,
+                depth_km: (item.measurement as any)?.depth ?? null,
+                lat: (item.measurement as any)?.latitude ?? null,
+                lon: (item.measurement as any)?.longitude ?? null,
+                source_hash: unifiedHash,
+                collected_at: collectedAt,
+              })
+            }
           } else if (item.type === 'advanced') {
             // Already persisted in AdvancedMetricsWorker with calculateSourceHash; mirror that envelope
             const envelope = { type: 'advanced', a: { ...item.measurement, location: item.location, timestamp: new Date(item.timestamp).toISOString(), source: item.source } }
             unifiedHash = calculateSourceHash(envelope)
-            // Skip if already on-chain
-            try {
-              if (await hasAdvancedTxId(unifiedHash)) {
-                if (bsvConfig.logging.level === 'debug') {
-                  console.log(`⏭️  Skipping advanced-metrics - already on-chain (${unifiedHash.slice(0, 12)}...)`)
+            if (process.env.GAIALOG_NO_DB !== 'true') {
+              // Skip if already on-chain
+              try {
+                if (await hasAdvancedTxId(unifiedHash)) {
+                  if (bsvConfig.logging.level === 'debug') {
+                    console.log(`⏭️  Skipping advanced-metrics - already on-chain (${unifiedHash.slice(0, 12)}...)`)
+                  }
+                  continue
                 }
-                continue
-              }
-            } catch {}
+              } catch {}
+            }
           } else {
             unifiedHash = this.generateSourceHash(item)
           }
@@ -260,7 +268,7 @@ export abstract class BaseWorker {
             })
             
             if (bsvConfig.logging.level !== 'error') {
-              console.log(`✅ ${this.workerId}: Direct broadcast ${item.type} - ${txid.substring(0, 12)}...`)
+              console.log(`✅ ${this.workerId}: Direct broadcast ${item.type} - ${txid}`)
             }
             this.stats.totalTransactions++
           } catch (e) {
@@ -326,7 +334,11 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
     const data: EnvironmentalData[] = []
     try {
       // Ensure WAQI station index is being discovered and persisted
-      try { const { ensureWaqiStationIndex } = await import('./data-collector'); await ensureWaqiStationIndex(5) } catch (e) {
+      try {
+        const { ensureWaqiStationIndex } = await import('./data-collector')
+        // Use default (env-driven) tiles per cycle instead of hardcoded 5
+        await ensureWaqiStationIndex()
+      } catch (e) {
         console.log(`⚠️ WAQI: Station index discovery failed:`, (e as Error).message)
       }
       // Iterate WAQI stations by allowed countries using persisted registry
@@ -419,7 +431,23 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
         console.log(`⚠️ WAQI: Skipping API calls (stations=${stations.length}, hasApiKey=${!!process.env.WAQI_API_KEY})`)
       }
 
+      // If DB isn’t in use or returned no stations, try DB-less collection via in-memory index
       let aqItems = items
+      if (aqItems.length === 0 && process.env.WAQI_API_KEY) {
+        try {
+          const { collectWAQIStationsBatch, ensureWaqiStationIndex } = await import('./data-collector')
+          await ensureWaqiStationIndex()
+          const limit = Number(process.env.WAQI_STATION_PAGE_SIZE || 150)
+          const batch = await collectWAQIStationsBatch(limit)
+          if (batch.length > 0) {
+            console.log(`🌐 WAQI: Collected ${batch.length} stations via in-memory index (DB-less mode)`)
+            aqItems = batch as any
+          }
+        } catch (e) {
+          console.log(`⚠️ WAQI: DB-less collection failed:`, (e as Error).message)
+        }
+      }
+
       if (aqItems.length === 0) {
         console.log(`⚠️ WAQI: No stations found, using fallback (WeatherAPI/TOP_100_CITIES)`)
         // Fallback to WeatherAPI using OWM station names by allowed countries
@@ -427,7 +455,7 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
         const waCountries = Array.isArray(waAllow) && waAllow.length > 0 ? waAllow : undefined
         const cityKey = 'owm_cities'
         const cityOffset = await readCursor('weatherapi', waCountries && waCountries.length === 1 ? waCountries[0] : null, cityKey)
-        const cityPageSize = 100
+        const cityPageSize = Number(process.env.WAQI_FALLBACK_CITY_PAGE_SIZE || 100)
         const owmCities = await getOwmStationsPage({ countries: waCountries, offset: cityOffset, limit: cityPageSize })
         const nextCityOffset = owmCities.length ? cityOffset + owmCities.length : 0
         await writeCursor('weatherapi', waCountries && waCountries.length === 1 ? waCountries[0] : null, cityKey, nextCityOffset)
@@ -482,15 +510,28 @@ export class NOAAWorker extends BaseWorker {
       // One-off verification: run 50-station sample once after startup, then revert to 150
       const flagKey = '__NOAA_ONEOFF_DONE__'
       const done = (global as any)[flagKey] === true
-      const limit = done ? 150 : 50
+      // If NOAA_STATION_BATCH_SIZE is set, use it; otherwise keep the one-off behaviour
+      const configured = Number(process.env.NOAA_STATION_BATCH_SIZE)
+      const limit = Number.isFinite(configured) && configured > 0 ? configured : (done ? 150 : 50)
       const batch = await collectWaterLevelDataBatch(limit)
       if (!done) (global as any)[flagKey] = true
       for (const item of batch) {
-        const measurement = {
+        const measurement: any = {
           river_level: item.river_level,
           sea_level: item.sea_level,
           station_id: item.station_id,
         }
+        // Include all optional NOAA metrics if available
+        if (item.water_temperature_c != null) measurement.water_temperature_c = item.water_temperature_c
+        if (item.salinity_psu != null) measurement.salinity_psu = item.salinity_psu
+        if (item.dissolved_oxygen_mg_l != null) measurement.dissolved_oxygen_mg_l = item.dissolved_oxygen_mg_l
+        if (item.turbidity_ntu != null) measurement.turbidity_ntu = item.turbidity_ntu
+        if (item.tide_height != null) measurement.tide_height = item.tide_height
+        if (item.wind_speed_kph != null) measurement.wind_speed_kph = item.wind_speed_kph
+        if (item.wind_direction_deg != null) measurement.wind_direction_deg = item.wind_direction_deg
+        if (item.current_speed_ms != null) measurement.current_speed_ms = item.current_speed_ms
+        if (item.current_direction_deg != null) measurement.current_direction_deg = item.current_direction_deg
+        if (item.wave_height_m != null) measurement.wave_height_m = item.wave_height_m
         data.push({
           type: 'water-level',
           timestamp: Date.parse(item.timestamp) || Date.now(),
@@ -581,39 +622,63 @@ export class AdvancedMetricsWorker extends BaseWorker {
       const nextOffset = stations.length ? offset + stations.length : 0
       await writeCursor('weatherapi', countries && countries.length === 1 ? countries[0] : null, key, nextOffset)
       // Prefer precise lat,lon queries to avoid WeatherAPI 400s from ambiguous names
-      const rawQueries = stations.length
+      let rawQueries = stations.length
         ? stations.map(s => (typeof (s as any).lat === 'number' && typeof (s as any).lon === 'number')
             ? `${(s as any).lat},${(s as any).lon}`
             : ((s as any).name || (s as any).station_code))
-        : ['51.5074,-0.1278']
+        : []
+      // DB-less fallback: use WAQI in-memory station index (lat,lon) when stations table is empty or DB disabled
+      if (rawQueries.length === 0) {
+        try {
+          const { ensureWaqiStationIndex } = await import('./data-collector')
+          const { cacheStore } = await import('./stores')
+          await ensureWaqiStationIndex()
+          const waqi = (await cacheStore.get<any[]>('waqi:stationIndex')) || []
+          if (Array.isArray(waqi) && waqi.length > 0) {
+            rawQueries = waqi.slice(0, pageSize).map(s => `${s.lat},${s.lon}`)
+            try { console.log(`📍 Advanced: Using ${rawQueries.length} WAQI index locations`) } catch {}
+          }
+        } catch {}
+      }
+      // Final fallback: TOP_100_CITIES up to pageSize
+      if (rawQueries.length === 0) {
+        rawQueries = TOP_100_CITIES.slice(0, pageSize)
+        try { console.log(`📍 Advanced: Using ${rawQueries.length} TOP_100_CITIES locations`) } catch {}
+      }
       const cities = rawQueries.filter(q => typeof q === 'string' && q.trim().length >= 2)
 
-      for (const city of cities) {
-        const data = await this.fetchAdvancedForCity(city!)
-        if (data) {
-          // Persist to DB
-          try {
-            await insertAdvanced({
-              provider: data.source,
-              city: data.location,
-              lat: data.coordinates?.lat ?? null,
-              lon: data.coordinates?.lon ?? null,
-              uv_index: data.uv_index,
-              soil_moisture_pct: Math.round((data.soil_moisture ?? 0) * 100),
-              wildfire_risk: data.wildfire_risk,
-              environmental_score: Math.round((data.environmental_quality_score ?? 0) * 100),
-              temperature_c: data.temperature_c ?? null,
-              humidity_pct: data.humidity_pct ?? null,
-              pressure_mb: data.pressure_mb ?? null,
-              wind_kph: data.wind_kph ?? null,
-              wind_deg: data.wind_deg ?? null,
-              source_hash: Buffer.from(JSON.stringify({ type: 'advanced', data })).toString('base64').slice(0, 64),
-              collected_at: new Date(data.timestamp),
-            })
-          } catch (e) {
-            console.error('insertAdvanced error:', e)
+      // Fetch with configurable concurrency to reduce wall-clock time
+      const concurrency = Math.max(1, Number(process.env.ADVANCED_CONCURRENCY || 8))
+      for (let i = 0; i < cities.length; i += concurrency) {
+        const slice = cities.slice(i, i + concurrency)
+        const results = await Promise.all(slice.map(async (city) => {
+          const data = await this.fetchAdvancedForCity(city!)
+          if (!data) return null
+          // Persist to DB only if enabled
+          if (process.env.GAIALOG_NO_DB !== 'true') {
+            try {
+              await insertAdvanced({
+                provider: data.source,
+                city: data.location,
+                lat: data.coordinates?.lat ?? null,
+                lon: data.coordinates?.lon ?? null,
+                uv_index: data.uv_index,
+                soil_moisture_pct: Math.round((data.soil_moisture ?? 0) * 100),
+                wildfire_risk: data.wildfire_risk,
+                environmental_score: Math.round((data.environmental_quality_score ?? 0) * 100),
+                temperature_c: data.temperature_c ?? null,
+                humidity_pct: data.humidity_pct ?? null,
+                pressure_mb: data.pressure_mb ?? null,
+                wind_kph: data.wind_kph ?? null,
+                wind_deg: data.wind_deg ?? null,
+                source_hash: Buffer.from(JSON.stringify({ type: 'advanced', data })).toString('base64').slice(0, 64),
+                collected_at: new Date(data.timestamp),
+              })
+            } catch (e) {
+              console.error('insertAdvanced error:', e)
+            }
           }
-          items.push({
+          return {
             type: 'advanced',
             timestamp: Date.parse(data.timestamp) || Date.now(),
             location: data.location,
@@ -630,8 +695,9 @@ export class AdvancedMetricsWorker extends BaseWorker {
             },
             source: data.source,
             priority: 'normal',
-          })
-        }
+          } as EnvironmentalData
+        }))
+        for (const r of results) if (r) items.push(r)
       }
     } catch (e) {
       console.error('Error fetching Advanced metrics:', e)

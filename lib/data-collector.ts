@@ -927,7 +927,7 @@ export async function collectWaterLevelDataBatch(limit: number = 25): Promise<Wa
   const out: WaterLevelData[] = []
   const stations = await fetchJsonWithRetry<any>(
     'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels',
-    { retries: 2, etagKey: 'noaa:stations:waterlevels' }
+    { retries: 2, etagKey: 'noaa:stations:waterlevels', providerId: 'noaa' }
   )
   const list = (stations as any)?.__notModified ? [] : (stations?.stations || [])
   const total = list.length
@@ -947,26 +947,70 @@ export async function collectWaterLevelDataBatch(limit: number = 25): Promise<Wa
           if (!isCountryAllowed('noaa' as any, cc)) { i++; continue }
         }
       } catch {}
-      const water = await fetchJsonWithRetry<any>(
-        `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?begin_date=${new Date().toISOString().slice(0,10)}&end_date=${new Date().toISOString().slice(0,10)}&station=${s.id}&product=water_level&datum=MLLW&time_zone=gmt&units=metric&format=json`,
-        { retries: 2 }
-      )
-      const latest = water?.data?.[water.data.length - 1]
-      if (latest) {
-        const item: WaterLevelData = {
-          river_level: parseFloat(latest.v) || 0,
-          sea_level: parseFloat(latest.v) || 0,
-          location: s.name,
-          timestamp: (latest.t ? new Date(latest.t).toISOString() : new Date().toISOString()),
-          source: 'NOAA Tides & Currents',
-          station_id: s.id,
-          coordinates: (typeof s?.lat === 'number' && (typeof (s as any)?.lon === 'number' || typeof (s as any)?.lng === 'number'))
-            ? { lat: Number(s.lat), lon: Number((s as any).lon ?? (s as any).lng) }
-            : undefined,
-        }
-        const key = `noaa:water:${item.station_id}:${item.timestamp}`
-        if (await dedupeStore.add(key)) out.push(item)
+      const stationId = s.id
+      const stationLatN = Number((s as any).lat)
+      const stationLonN = Number((s as any).lng ?? (s as any).lon)
+      const stationLat: number | undefined = Number.isFinite(stationLatN) ? stationLatN : undefined
+      const stationLon: number | undefined = Number.isFinite(stationLonN) ? stationLonN : undefined
+
+      const begin = new Date().toISOString().slice(0, 10)
+      const end = begin
+      const base = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?station=${stationId}&time_zone=gmt&units=metric&format=json`
+
+      // Fetch core water level plus optional products in parallel
+      const [waterData, tempData, windData, tidePred, salinityData, doData, turbidityData, currentsData] = await Promise.all([
+        fetchJsonWithRetry<any>(`${base}&product=water_level&datum=MLLW&begin_date=${begin}&end_date=${end}`, { retries: 2, providerId: 'noaa' }).catch(() => null),
+        fetchJsonWithRetry<any>(`${base}&product=water_temperature&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
+        fetchJsonWithRetry<any>(`${base}&product=wind&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
+        fetchJsonWithRetry<any>(`${base}&product=predictions&interval=h&datum=MLLW&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
+        fetchJsonWithRetry<any>(`${base}&product=salinity&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
+        fetchJsonWithRetry<any>(`${base}&product=dissolved_oxygen&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
+        fetchJsonWithRetry<any>(`${base}&product=turbidity&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
+        fetchJsonWithRetry<any>(`${base}&product=currents&bin=1&begin_date=${begin}&end_date=${end}`, { retries: 1 }).catch(() => null),
+      ])
+
+      const latest = (arr?: any[]) => (Array.isArray(arr) && arr.length > 0 ? arr[arr.length - 1] : null)
+
+      const wl = latest(waterData?.data)
+      if (!wl) { i++; continue }
+
+      const water_level_val = parseFloat(wl.v) || 0
+
+      // Optional extractions
+      const wt = latest(tempData?.data)
+      const wind = latest(windData?.data)
+      const pred = latest(tidePred?.predictions)
+      const sal = latest(salinityData?.data)
+      const disox = latest(doData?.data)
+      const turb = latest(turbidityData?.data)
+
+      const item: WaterLevelData = {
+        river_level: water_level_val,
+        sea_level: water_level_val,
+        location: s.name,
+        timestamp: (wl.t ? new Date(wl.t).toISOString() : new Date().toISOString()),
+        source: 'NOAA Tides & Currents',
+        station_id: stationId,
+        coordinates: (stationLat != null && stationLon != null) ? { lat: stationLat, lon: stationLon } : undefined,
+        tide_height: pred ? parseFloat(pred.v) : undefined,
+        water_temperature_c: wt ? parseFloat(wt.v) : undefined,
+        salinity_psu: sal ? parseFloat(sal.v) : undefined,
+        dissolved_oxygen_mg_l: disox ? parseFloat(disox.v) : undefined,
+        turbidity_ntu: turb ? parseFloat(turb.v) : undefined,
+        wind_speed_kph: wind && wind.s ? Math.round((parseFloat(wind.s) || 0) * 3.6) : undefined,
+        wind_direction_deg: wind && wind.d ? parseFloat(wind.d) : undefined,
+        current_speed_ms: currentsData?.data?.length ? parseFloat(currentsData.data[currentsData.data.length - 1]?.s) || undefined : undefined,
+        current_direction_deg: currentsData?.data?.length ? parseFloat(currentsData.data[currentsData.data.length - 1]?.d) || undefined : undefined,
       }
+
+      // Enrich with NDBC wave height if coordinates available (async, don't block)
+      if (stationLat != null && stationLon != null) {
+        // Wave height fetch is optional and can be slow, so we'll skip it in batch mode for performance
+        // Individual fetches via fetchNOAAWaterData will still include it
+      }
+
+      const key = `noaa:water:${item.station_id}:${item.timestamp}`
+      if (await dedupeStore.add(key)) out.push(item)
       await new Promise(r => setTimeout(r, 250))
     } catch {
       // skip station on failure

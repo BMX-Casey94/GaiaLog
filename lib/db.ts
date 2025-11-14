@@ -18,10 +18,21 @@ const connectionConfig = {
 }
 
 const shouldUseSSL = isSupabase
+const DB_DISABLED = process.env.GAIALOG_NO_DB === 'true'
+let dbWarned = false
 
+// Keep the pool initialized so we can re-enable later without code churn.
 export const dbPool = new Pool(connectionConfig)
 
 export async function query<T = any>(text: string, params?: any[]): Promise<{ rows: T[] }> {
+  // Temporary DB disable switch - non-destructive. Returns empty rows.
+  if (DB_DISABLED) {
+    if (!dbWarned) {
+      console.warn('🗄️ Database disabled via GAIALOG_NO_DB=true. All queries return empty rows.')
+      dbWarned = true
+    }
+    return { rows: [] as any }
+  }
   const client = await dbPool.connect()
   try {
     const res = await client.query<T>(text, params)
@@ -32,6 +43,7 @@ export async function query<T = any>(text: string, params?: any[]): Promise<{ ro
 }
 
 export async function ensureConnected(): Promise<void> {
+  if (DB_DISABLED) return
   await query('SELECT 1')
 }
 

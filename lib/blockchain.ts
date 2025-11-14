@@ -390,19 +390,46 @@ export class BlockchainService {
         satoshis: selectedUtxo.value,
       }]
 
-      // Create standard OP_FALSE OP_RETURN <data>
-      const dataBuffer = Buffer.from(opReturnData, 'utf8')
-      const opReturnScript = new (bsv as any).Script()
-        .add((bsv as any).Opcode.OP_FALSE)
-        .add((bsv as any).Opcode.OP_RETURN)
-        .add(dataBuffer)
+      // Build payload bytes (optionally gzip) and optional extra pushes
+      const includeHashPush = process.env.BSV_OPRETURN_INCLUDE_HASH_PUSH === 'true'
+      const useGzip = process.env.BSV_OPRETURN_GZIP === 'true'
+      const useTrueReturn = process.env.BSV_OPRETURN_TRUE_RETURN === 'true'
+      const { buildOpFalseOpReturnWithTag } = await import('./opreturn')
+      const extras: (Buffer | string)[] = []
+      let payloadBytes = Buffer.from(opReturnData, 'utf8')
+      try {
+        if (useGzip) {
+          const { gzipSync } = await import('zlib')
+          payloadBytes = gzipSync(payloadBytes)
+        }
+      } catch {}
+      // Compute SHA-256 over the embedded bytes (compressed if enabled)
+      try {
+        const { createHash } = await import('crypto')
+        const h = createHash('sha256').update(payloadBytes).digest('hex')
+        if (includeHashPush) {
+          extras.push(Buffer.from(h, 'hex'))
+        }
+      } catch {}
+      if (useGzip) {
+        extras.push('encoding=gzip')
+      }
+      // Create OP_RETURN with Tag + Version + payload (+ optional extras)
+      const scriptHex = buildOpFalseOpReturnWithTag({
+        tag: 'GaiaLog',
+        version: 'v1',
+        payload: payloadBytes,
+        extra: extras,
+        useTrueReturn,
+      })
+      const opReturnScript = (bsv as any).Script.fromHex(scriptHex)
 
       // Create transaction using library helpers for fee/change handling
       const transaction = new (bsv as any).Transaction()
         .from(bitcoreUtxos)
         .addOutput(new bsv.Transaction.Output({
           script: opReturnScript,
-          satoshis: 0,
+          satoshis: useTrueReturn ? 1 : 0,
         }))
         .change(address)
         .feePerKb(FEE_RATE_SAT_PER_BYTE * 1000)
@@ -431,18 +458,20 @@ export class BlockchainService {
       this.transactionLog.push(transactionLog)
       // Persist to tx_log (pending on broadcast, will be confirmed later)
       try {
-        await upsertTxLog({
-          txid,
-          type: data.stream,
-          provider: (data as any)?.payload?.source || 'unknown',
-          collected_at: new Date(data.timestamp),
-          status: 'pending',
-          onchain_at: new Date(),
-          fee_sats: null,
-          wallet_index: walletIndexForLog,
-          retries: 0,
-          error: null,
-        })
+        if (process.env.GAIALOG_NO_DB !== 'true') {
+          await upsertTxLog({
+            txid,
+            type: data.stream,
+            provider: (data as any)?.payload?.source || 'unknown',
+            collected_at: new Date(data.timestamp),
+            status: 'pending',
+            onchain_at: new Date(),
+            fee_sats: null,
+            wallet_index: walletIndexForLog,
+            retries: 0,
+            error: null,
+          })
+        }
       } catch (e) {
         // Non-fatal
       }
@@ -488,18 +517,20 @@ export class BlockchainService {
         }
         this.transactionLog.push(failedLog)
         try {
-          await upsertTxLog({
-            txid: 'failed',
-            type: data.stream,
-            provider: (data as any)?.payload?.source || 'unknown',
-            collected_at: new Date(data.timestamp),
-            status: 'failed',
-            onchain_at: null,
-            fee_sats: null,
-            wallet_index: null,
-            retries: 0,
-            error: failedLog.error || 'Unknown error',
-          })
+          if (process.env.GAIALOG_NO_DB !== 'true') {
+            await upsertTxLog({
+              txid: 'failed',
+              type: data.stream,
+              provider: (data as any)?.payload?.source || 'unknown',
+              collected_at: new Date(data.timestamp),
+              status: 'failed',
+              onchain_at: null,
+              fee_sats: null,
+              wallet_index: null,
+              retries: 0,
+              error: failedLog.error || 'Unknown error',
+            })
+          }
         } catch {}
       }
       

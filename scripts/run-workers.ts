@@ -56,7 +56,7 @@ async function main() {
     }, 10000)
 
     // Optional DB ingestion throughput (debug only; COUNT(*) can be expensive on large tables)
-    if (process.env.BSV_LOG_LEVEL === 'debug') {
+    if (process.env.BSV_LOG_LEVEL === 'debug' && process.env.GAIALOG_NO_DB !== 'true') {
       let lastTxCount = 0
       setInterval(async () => {
         try {
@@ -92,14 +92,16 @@ async function main() {
     }, 5000)
 
     // Update tx_log statistics every 30 seconds for near real-time count updates
-    setInterval(async () => {
-      try {
-        const { updateTxLogStats } = await import('../lib/tx-stats-updater')
-        await updateTxLogStats()
-      } catch (err) {
-        console.error('Stats update failed:', err)
-      }
-    }, 30000) // 30 seconds
+    if (process.env.GAIALOG_NO_DB !== 'true') {
+      setInterval(async () => {
+        try {
+          const { updateTxLogStats } = await import('../lib/tx-stats-updater')
+          await updateTxLogStats()
+        } catch (err) {
+          console.error('Stats update failed:', err)
+        }
+      }, 30000) // 30 seconds
+    }
 
     process.on('SIGINT', () => {
       console.log('\n🛑 Shutting down GaiaLog worker service...')

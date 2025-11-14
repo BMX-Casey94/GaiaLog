@@ -130,13 +130,16 @@ export class BSVTransactionService {
     const protocolJson = JSON.stringify(protocolData)
     const protocolBuffer = Buffer.from(protocolJson, 'utf8')
     
-    // Create OP_RETURN script for BRC-100 data
-    // OP_RETURN (0x6a) + length + data
-    const opReturnScript = Buffer.concat([
-      Buffer.from([0x6a]), // OP_RETURN
-      Buffer.from([protocolBuffer.length]), // Length
-      protocolBuffer // BRC-100 data
-    ])
+    // Create OP_RETURN script using GaiaLog envelope tag ("GaiaLog", "v1")
+    const { buildOpFalseOpReturnWithTag } = await import('./opreturn')
+    const scriptHex = buildOpFalseOpReturnWithTag({
+      tag: 'GaiaLog',
+      version: 'v1',
+      payload: protocolBuffer,
+      extra: [],
+      useTrueReturn: false,
+    })
+    const opReturnScript = Buffer.from(scriptHex, 'hex')
     
     // For now, create a placeholder transaction structure
     // In a real implementation, we would:

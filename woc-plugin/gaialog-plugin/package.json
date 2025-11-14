@@ -1,0 +1,27 @@
+{
+  "name": "@gaialog/woc-plugin",
+  "version": "1.0.0",
+  "private": false,
+  "description": "GaiaLog Data Decoder — WhatsOnChain plugin (standalone bundle)",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "pack-zip": "npm run build && tar -a -c -f gaialog-plugin-win.zip dist README.md package.json"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.1",
+    "typescript": "^5.4.5"
+  }
+}
+
+

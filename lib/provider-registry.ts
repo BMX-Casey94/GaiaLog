@@ -63,7 +63,14 @@ export const providerConfigs: Record<ProviderId, ProviderConfig> = {
     id: 'weatherapi',
     purpose: 'Primary breadth for air/weather metrics',
     cadence: { intervalMs: 30 * 60 * 1000, minIntervalMs: 15 * 60 * 1000, maxIntervalMs: 60 * 60 * 1000 },
-    budgets: { perSecond: n(process.env.WEATHERAPI_RPS, 5) },
+    budgets: (() => {
+      const perSecond = n(process.env.WEATHERAPI_RPS, 5)
+      const perDayEnv = process.env.WEATHERAPI_PER_DAY
+      if (perDayEnv != null && perDayEnv !== '') {
+        return { perSecond, perDay: n(perDayEnv, 0) }
+      }
+      return { perSecond }
+    })(),
     throttle: { perSecond: n(process.env.WEATHERAPI_RPS, 5) },
     breaker: DEFAULT_BREAKER,
   },

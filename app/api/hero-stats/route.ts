@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { query } from '@/lib/db'
 import { heroStatsCache } from '@/lib/stats-cache'
+import { blockchainService } from '@/lib/blockchain'
 
 export const runtime = 'nodejs'
 
@@ -43,60 +44,62 @@ export async function GET() {
         latestTx = latestTxResult.rows[0]?.timestamp || null
 
       } catch (dbErr) {
-        // Fallback: Use Supabase REST API directly with fetch
-        console.log('PostgreSQL connection failed (expected on Vercel), using Supabase REST API')
-        const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-        const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-        
-        if (!supabaseUrl || !supabaseKey) {
-          console.error('Supabase env missing:', { supabaseUrl: !!supabaseUrl, supabaseKey: !!supabaseKey })
-          // Return defaults instead of throwing
-          airQuality = { aqi: null, collected_at: null }
-          txCount = 0
-          latestTx = null
-        } else {
-          const headers = {
-            'apikey': supabaseKey,
-            'Authorization': `Bearer ${supabaseKey}`,
-            'Content-Type': 'application/json'
-          }
-
-          try {
-            // Run Supabase REST API queries in parallel
-            // Use estimated count for tx_log for performance (exact count is slow on 1.8M rows)
-            const [aqRes, latestRes] = await Promise.all([
-              fetch(`${supabaseUrl}/rest/v1/air_quality_readings?select=aqi,collected_at&order=collected_at.desc&limit=1`, { headers }),
-              fetch(`${supabaseUrl}/rest/v1/tx_log?select=onchain_at,collected_at&status=in.(pending,confirmed)&onchain_at=not.is.null&order=onchain_at.desc&limit=1`, { headers })
-            ])
-
-            console.log('Supabase REST API responses:', { aq: aqRes.status, latest: latestRes.status })
-
-            if (aqRes.ok) {
-              const aqData = await aqRes.json()
-              if (aqData?.[0]) {
-                airQuality = { aqi: aqData[0].aqi ?? null, collected_at: aqData[0].collected_at ?? null }
+        // Fallback: Read directly from blockchain (WOC)
+        try {
+          const net = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
+          const addr = blockchainService.getAddress()
+          if (addr) {
+            const base = `https://api.whatsonchain.com/v1/bsv/${net}/address/${addr}`
+            let listRes = await fetch(`${base}/txs`)
+            if (listRes.status === 404) listRes = await fetch(`${base}/history`)
+            if (listRes.ok) {
+              const txsRaw: any = await listRes.json()
+              const txs: { tx_hash: string; height: number }[] = Array.isArray(txsRaw)
+                ? (txsRaw[0]?.tx_hash ? txsRaw : (typeof txsRaw[0] === 'string' ? txsRaw.map((id: string) => ({ tx_hash: id, height: 0 })) : []))
+                : []
+              // Approximate count: number of transactions sent by our writer address (bounded to recent list)
+              txCount = Array.isArray(txs) ? txs.length : 0
+              const candidates = txs.slice(0, 25)
+              for (const t of candidates) {
+                const txRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${net}/tx/${t.tx_hash}`)
+                if (!txRes.ok) continue
+              const j = await txRes.json()
+              const vout = Array.isArray(j?.vout) ? j.vout : []
+              const opret = vout.find((o: any) => typeof o?.scriptPubKey?.asm === 'string' && o.scriptPubKey.asm.includes('OP_RETURN'))
+              if (!opret) continue
+              const parts = String(opret.scriptPubKey.asm).split(' ')
+              const iret = parts.indexOf('OP_RETURN')
+              if (iret < 0) continue
+              const pushes = parts.slice(iret + 1)
+              if (pushes.length < 3) continue
+              const tagHex = pushes[0]
+              const dataHex = pushes[2]
+              const tag = Buffer.from(tagHex, 'hex').toString('utf8')
+              if (tag !== 'GaiaLog') continue
+              // Optional gzip flag
+              const extras = pushes.slice(3)
+              const encodingHex = Buffer.from('encoding=gzip', 'utf8').toString('hex')
+              const isGzip = extras.includes(encodingHex)
+                try {
+                const raw = Buffer.from(dataHex, 'hex')
+                const bytes = isGzip ? (await import('zlib')).gunzipSync(raw) : raw
+                const txt = bytes.toString('utf8')
+                  const parsed = JSON.parse(txt)
+                  if (!latestTx && parsed?.timestamp) latestTx = parsed.timestamp
+                  if (parsed?.data_type === 'air_quality' && airQuality.aqi == null) {
+                    const payload = parsed?.payload || {}
+                    airQuality = {
+                      aqi: payload.air_quality_index ?? null,
+                      collected_at: parsed.timestamp ?? null
+                    }
+                  }
+                  if (airQuality.aqi != null && latestTx) break
+                } catch {}
               }
             }
-            
-            // Use reasonable estimate for count (Supabase REST API doesn't support efficient counting)
-            // Actual count is kept accurate by local workers via ANALYZE
-            // Add time-based increment to show growth (~100 TX per hour estimate)
-            const baseCount = 1797000 // Base count as of 2025-10-09
-            const hoursSinceBase = Math.floor((Date.now() - new Date('2025-10-09').getTime()) / (1000 * 60 * 60))
-            const estimatedGrowth = hoursSinceBase * 100
-            txCount = baseCount + estimatedGrowth
-            console.log('Using TX count estimate (local workers maintain accurate count):', txCount)
-            
-            if (latestRes.ok) {
-              const latestData = await latestRes.json()
-              if (latestData?.[0]) {
-                latestTx = latestData[0].onchain_at || latestData[0].collected_at || null
-              }
-            }
-          } catch (apiErr) {
-            console.error('Supabase REST API fallback failed:', apiErr)
-            // Continue with defaults
           }
+        } catch (chainErr) {
+          // Continue with defaults
         }
       }
 
