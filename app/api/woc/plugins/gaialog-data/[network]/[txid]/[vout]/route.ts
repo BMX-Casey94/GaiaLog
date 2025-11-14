@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { validateGaiaLog, parsePushes } from '@/lib/opreturn-validator'
 import { promises as fs } from 'fs'
 import path from 'path'
-import { renderHtml, renderErrorHtml } from '../../../route'
+import { renderHtml, renderErrorHtml, detectKnownNonGaia } from '../../../route'
 
 export const runtime = 'nodejs'
 
@@ -105,6 +105,14 @@ export async function GET(
 		setCache(key, html)
 		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
 	} catch (e: any) {
+		let detectedMessage: string | null = null
+		try {
+			// Try fetch the script again to inspect and map to custom error messages
+			const hexForDetect = await fetchTxAndFindScriptHex(params.network, params.txid, Number(params.vout))
+			const detected = detectKnownNonGaia(hexForDetect)
+			if (detected) detectedMessage = detected.message
+		} catch {}
+
 		const logoUrl = await (async () => {
 			const candidates = [
 				path.join(process.cwd(), 'public', 'gaialog-logo.png'),
@@ -126,7 +134,7 @@ export async function GET(
 		const html = renderErrorHtml({
 			txid: params.txid,
 			network: params.network,
-			message: "Unfortunately, this is not a GaiaLog transaction,|and is not compatible for decoding via this Plugin.",
+			message: detectedMessage || "Unfortunately, this is not a GaiaLog transaction,|and is not compatible for decoding via this Plugin.",
 			logoUrl,
 		})
 		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' }, status: 200 })

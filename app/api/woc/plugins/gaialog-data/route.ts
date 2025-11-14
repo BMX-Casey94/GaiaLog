@@ -569,7 +569,7 @@ async function fetchTxAndFindScriptHex(network: string, txid: string, vout?: num
 	throw new Error('No GaiaLog OP_RETURN output found')
 }
 
-function detectKnownNonGaia(scriptHex: string): { name: string; message: string } | null {
+export function detectKnownNonGaia(scriptHex: string): { name: string; message: string } | null {
 	try {
 		let blob = ''
 		try {
