@@ -203,13 +203,13 @@ export function renderHtml(opts: {
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<title>GaiaLog Decode</title>
 		<style>
-			.gl-root{--bg:#1d003b;--fg:#ffffff;--muted:#ffffffcc;--card:rgba(255,255,255,0.08);--card-bd:rgba(255,255,255,0.12);
+			.gl-root{--bg:#170035;--fg:#ffffff;--muted:#ffffffcc;--card:rgba(255,255,255,0.08);--card-bd:rgba(255,255,255,0.12);
 				font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;
 				color:var(--fg);
-				max-width:860px;margin:0 auto;border-radius:14px;padding:16px;
+				max-width:860px;margin:24px auto;border-radius:14px;padding:16px;
 				background:
-					radial-gradient(1200px 600px at -10% -20%, rgba(0,168,107,0.20), transparent 45%),
-					linear-gradient(135deg, #1d003b 0%, #050815 55%, #1d003b 100%);
+					radial-gradient(1200px 600px at -10% -20%, rgba(0,168,107,0.18), transparent 45%),
+					linear-gradient(135deg, #170035 0%, #060313 55%, #170035 100%);
 				box-shadow:0 10px 30px rgba(0,0,0,0.45);
 				position:relative;
 				overflow:hidden;
@@ -267,7 +267,7 @@ export function renderHtml(opts: {
 			.gl-details[open] summary:after{content:"Collapse ▲"}
 		</style>
 	</head>
-	<body style="margin:0;background:#0b0f2a">
+	<body style="margin:0;padding-top:110px;padding-bottom:120px;background:linear-gradient(135deg, #170035 0%, #060313 60%, #170035 100%)">
 		<div class="gl-root">
 			<div class="gl-particles">
 				<div class="gl-particle"></div><div class="gl-particle"></div><div class="gl-particle"></div><div class="gl-particle"></div>
@@ -303,11 +303,11 @@ export function renderHomeHtml(opts: {
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<title>GaiaLog Decoder</title>
 		<style>
-			.gl-root{--bg:#1d003b;--fg:#ffffff;--muted:#ffffffcc;--card:rgba(255,255,255,0.08);--card-bd:rgba(255,255,255,0.12);
+			.gl-root{--bg:#170035;--fg:#ffffff;--muted:#ffffffcc;--card:rgba(255,255,255,0.08);--card-bd:rgba(255,255,255,0.12);
 				font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;
-				color:var(--fg);max-width:860px;margin:0 auto;border-radius:14px;padding:16px;
-				background:radial-gradient(1200px 600px at -10% -20%, rgba(0,168,107,0.20), transparent 45%),
-					linear-gradient(135deg, #1d003b 0%, #050815 55%, #1d003b 100%);
+				color:var(--fg);max-width:860px;margin:24px auto;border-radius:14px;padding:16px;
+				background:radial-gradient(1200px 600px at -10% -20%, rgba(0,168,107,0.18), transparent 45%),
+					linear-gradient(135deg, #170035 0%, #060313 55%, #170035 100%);
 				box-shadow:0 10px 30px rgba(0,0,0,0.45);position:relative;overflow:hidden;}
 			.gl-particles{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:1}
 			.gl-particle{position:absolute;border-radius:50%;background:radial-gradient(circle, rgba(255,255,255,0.8) 0%, rgba(255,255,255,0.5) 30%, transparent 70%);box-shadow:0 0 6px rgba(255,255,255,0.4),0 0 10px rgba(255,255,255,0.2);opacity:.35;animation:float 20s infinite ease-in-out}
@@ -361,7 +361,7 @@ export function renderHomeHtml(opts: {
 			.gl-address-value{font-size:11px;font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.95;font-weight:500}
 		</style>
 	</head>
-	<body style="margin:0;background:#0b0f2a">
+	<body style="margin:0;padding-top:110px;padding-bottom:120px;background:linear-gradient(135deg, #170035 0%, #060313 60%, #170035 100%)">
 		<div class="gl-root">
 			<div class="gl-particles">
 				<div class="gl-particle"></div><div class="gl-particle"></div><div class="gl-particle"></div><div class="gl-particle"></div>
@@ -465,13 +465,13 @@ export function renderErrorHtml(opts: {
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<title>GaiaLog Decode</title>
 		<style>
-			.gl-root{--bg:#1d003b;--fg:#ffffff;--muted:#ffffffcc;--card:rgba(255,255,255,0.08);--card-bd:rgba(255,255,255,0.12);
+			.gl-root{--bg:#170035;--fg:#ffffff;--muted:#ffffffcc;--card:rgba(255,255,255,0.08);--card-bd:rgba(255,255,255,0.12);
 				font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;
 				color:var(--fg);
-				max-width:860px;margin:0 auto;border-radius:14px;padding:16px;
+				max-width:860px;margin:24px auto;border-radius:14px;padding:16px;
 				background:
-					radial-gradient(1200px 600px at -10% -20%, rgba(0,168,107,0.20), transparent 45%),
-					linear-gradient(135deg, #1d003b 0%, #050815 55%, #1d003b 100%);
+					radial-gradient(1200px 600px at -10% -20%, rgba(0,168,107,0.18), transparent 45%),
+					linear-gradient(135deg, #170035 0%, #060313 55%, #170035 100%);
 				box-shadow:0 10px 30px rgba(0,0,0,0.45);
 				position:relative;
 				overflow:hidden;
@@ -511,7 +511,7 @@ export function renderErrorHtml(opts: {
 			.gl-card-title{font-weight:700;margin-bottom:8px;opacity:.95}
 		</style>
 	</head>
-	<body style="margin:0;background:#0b0f2a">
+	<body style="margin:0;padding-top:110px;padding-bottom:120px;background:linear-gradient(135deg, #170035 0%, #060313 60%, #170035 100%)">
 		<div class="gl-root">
 			<div class="gl-particles">
 				<div class="gl-particle"></div><div class="gl-particle"></div><div class="gl-particle"></div><div class="gl-particle"></div>
