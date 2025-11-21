@@ -697,46 +697,50 @@ export class BlockchainService {
   }
 
   private async broadcastTransaction(serializedTx: string): Promise<string> {
+    const errors: string[] = []
+    let lastArcText: string | undefined
+
+    // Method 1: TAAL ARC (primary)
     try {
-      // Prefer ARC when configured
       const arcKey = process.env.BSV_ARC_API_KEY
       const arcEndpoint = process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc'
       if (arcKey) {
-        try {
-          const arcRes = await fetch(`${arcEndpoint.replace(/\/$/, '')}/v1/tx`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${arcKey}`,
-            },
-            body: JSON.stringify({ rawTx: serializedTx })
-          })
-          const arcText = await arcRes.text()
-          if (arcRes.ok) {
-            try {
-              const parsed = JSON.parse(arcText)
-              if (parsed && typeof parsed.txid === 'string') {
-                // Optional secondary mirror to WOC, disabled by default
-                if (MIRROR_TO_WOC) {
-                  try {
-                    const now = Date.now()
-                    this.wocMirrorTimestamps = this.wocMirrorTimestamps.filter(t => now - t < 1000)
-                    if (this.wocMirrorTimestamps.length < WOC_MIRROR_MAX_RPS) {
-                      this.wocMirrorTimestamps.push(now)
-                      const wocNet = WOC_NETWORK
-                      fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ txhex: serializedTx })
-                      }).catch(() => {})
-                    }
-                  } catch {}
-                }
-                return parsed.txid
+        const arcRes = await fetch(`${arcEndpoint.replace(/\/$/, '')}/v1/tx`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${arcKey}`,
+          },
+          body: JSON.stringify({ rawTx: serializedTx })
+        })
+        lastArcText = await arcRes.text().catch(() => '')
+        if (arcRes.ok) {
+          // Try JSON { txid }
+          try {
+            const parsed = JSON.parse(lastArcText || '{}')
+            if (parsed && typeof parsed.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(parsed.txid)) {
+              // Optional mirror to WOC
+              if (MIRROR_TO_WOC) {
+                try {
+                  const now = Date.now()
+                  this.wocMirrorTimestamps = this.wocMirrorTimestamps.filter(t => now - t < 1000)
+                  if (this.wocMirrorTimestamps.length < WOC_MIRROR_MAX_RPS) {
+                    this.wocMirrorTimestamps.push(now)
+                    const wocNet = WOC_NETWORK
+                    fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ txhex: serializedTx })
+                    }).catch(() => {})
+                  }
+                } catch {}
               }
-            } catch {}
-            const txid = arcText.replace(/"/g, '').trim()
-            // Optional WOC mirror for string txid response as well
+              return parsed.txid
+            }
+          } catch {}
+          // Some ARC deployments return plain string txid
+          const txid = (lastArcText || '').replace(/"/g, '').trim()
+          if (/^[0-9a-fA-F]{64}$/.test(txid)) {
             if (MIRROR_TO_WOC) {
               try {
                 const now = Date.now()
@@ -754,18 +758,73 @@ export class BlockchainService {
             }
             return txid
           }
-          console.warn('ARC broadcast failed, falling back to GorillaPool:', arcText)
-        } catch (e) {
-          console.warn('ARC broadcast error, falling back to GorillaPool:', e)
+        } else {
+          errors.push(`ARC failed (${arcRes.status}): ${lastArcText || arcRes.statusText}`)
+        }
+      } else {
+        errors.push('ARC not configured (BSV_ARC_API_KEY missing)')
+      }
+    } catch (e) {
+      errors.push(`ARC error: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    // Method 2: GorillaPool mAPI (fallback)
+    try {
+      const gpEndpoint = (process.env.BSV_GORILLAPOOL_MAPI_ENDPOINT || 'https://mapi.gorillapool.io').replace(/\/$/, '')
+      const gpRes = await fetch(`${gpEndpoint}/mapi/tx`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rawTx: serializedTx })
+      })
+      const gpText = await gpRes.text().catch(() => '')
+      if (gpRes.ok) {
+        try {
+          const gpData = JSON.parse(gpText || '{}')
+          if (gpData?.payload) {
+            const payload = JSON.parse(gpData.payload)
+            if (payload?.returnResult === 'success' && typeof payload.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(payload.txid)) {
+              return payload.txid
+            }
+            if (payload?.returnResult === 'failure') {
+              errors.push(`GorillaPool rejected: ${payload?.resultDescription || 'Unknown reason'}`)
+            }
+          }
+        } catch {
+          // If response isn't standard envelope, try raw string txid
+          const txid = (gpText || '').replace(/"/g, '').trim()
+          if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+        }
+      } else {
+        errors.push(`GorillaPool failed (${gpRes.status})`)
+      }
+    } catch (e) {
+      errors.push(`GorillaPool error: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    // Method 3: WhatOnChain (last resort)
+    try {
+      // Avoid double-broadcasting if we already mirrored
+      if (!MIRROR_TO_WOC) {
+        const wocNet = WOC_NETWORK
+        const wocRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ txhex: serializedTx })
+        })
+        const wocText = await wocRes.text().catch(() => '')
+        if (wocRes.ok) {
+          const txid = (wocText || '').replace(/"/g, '').trim()
+          if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+        } else {
+          errors.push(`WhatOnChain failed (${wocRes.status})`)
         }
       }
-
-      // No fallback - let the transaction fail and be re-queued
-      throw new Error(`ARC broadcast failed: ${arcText}`)
-    } catch (error) {
-      console.error('Error broadcasting transaction:', error)
-      throw error
+    } catch (e) {
+      errors.push(`WhatOnChain error: ${e instanceof Error ? e.message : String(e)}`)
     }
+
+    // If we reach here, all methods failed
+    throw new Error(`All broadcast methods failed:\n${errors.join('\n')}`)
   }
 
   private async scheduleConfirmationCheck(txid: string, streamType: string): Promise<void> {

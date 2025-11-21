@@ -45,10 +45,61 @@ async function broadcastViaArc(rawHex: string): Promise<string> {
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ARC_KEY}` },
     body: JSON.stringify({ rawTx: rawHex })
   })
-  const text = await res.text()
+  const text = await res.text().catch(() => '')
   if (!res.ok) throw new Error(`ARC ${res.status} ${text}`)
-  try { const p = JSON.parse(text); if (p?.txid) return p.txid } catch {}
-  return text.replace(/"/g, '').trim()
+  try { const p = JSON.parse(text || '{}'); if (p?.txid && /^[0-9a-fA-F]{64}$/.test(p.txid)) return p.txid } catch {}
+  const txid = (text || '').replace(/"/g, '').trim()
+  if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+  throw new Error(`ARC returned invalid txid: ${text}`)
+}
+
+async function broadcastViaGorillaPool(rawHex: string): Promise<string> {
+  const endpoint = (process.env.BSV_GORILLAPOOL_MAPI_ENDPOINT || 'https://mapi.gorillapool.io').replace(/\/$/, '')
+  const res = await fetch(`${endpoint}/mapi/tx`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rawTx: rawHex })
+  })
+  const text = await res.text().catch(() => '')
+  if (!res.ok) throw new Error(`GorillaPool ${res.status}`)
+  // Try signed envelope
+  try {
+    const data = JSON.parse(text || '{}')
+    if (data?.payload) {
+      const payload = JSON.parse(data.payload)
+      if (payload?.returnResult === 'success' && typeof payload.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(payload.txid)) {
+        return payload.txid
+      }
+      if (payload?.returnResult === 'failure') {
+        throw new Error(`GorillaPool rejected: ${payload?.resultDescription || 'Unknown'}`)
+      }
+    }
+  } catch {}
+  const txid = (text || '').replace(/"/g, '').trim()
+  if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+  throw new Error(`GorillaPool returned invalid response: ${text}`)
+}
+
+async function broadcastViaWoc(rawHex: string): Promise<string> {
+  const wocNet = NET
+  const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ txhex: rawHex })
+  })
+  const text = await res.text().catch(() => '')
+  if (!res.ok) throw new Error(`WOC ${res.status}`)
+  const txid = (text || '').replace(/"/g, '').trim()
+  if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+  throw new Error(`WOC returned invalid txid: ${text}`)
+}
+
+async function broadcastWithFallbacks(rawHex: string): Promise<string> {
+  const errors: string[] = []
+  try { return await broadcastViaArc(rawHex) } catch (e) { errors.push(e instanceof Error ? e.message : String(e)) }
+  try { return await broadcastViaGorillaPool(rawHex) } catch (e) { errors.push(e instanceof Error ? e.message : String(e)) }
+  try { return await broadcastViaWoc(rawHex) } catch (e) { errors.push(e instanceof Error ? e.message : String(e)) }
+  throw new Error(`All broadcast methods failed:\n${errors.join('\n')}`)
 }
 
 function p2pkhScriptHexFromWif(wif: string): string {
@@ -118,7 +169,7 @@ async function topUpWallet(wif: string): Promise<{ txid: string, address: string
   const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
   tx.sign(signingKey)
   const raw = tx.serialize()
-  const txid = await broadcastViaArc(raw)
+  const txid = await broadcastWithFallbacks(raw)
   // Set cooldown lock to prevent multiple unconfirmed splits per wallet
   pendingSplitUntilByAddress.set(address, Date.now() + SPLIT_COOLDOWN_MS)
   return { txid, address }
