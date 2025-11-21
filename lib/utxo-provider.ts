@@ -59,6 +59,8 @@ export async function getUnspentForAddress(address: string): Promise<any[]> {
   // Optional custom template for ARC or other indexers: supports {address} and {net}
   const customTemplate = process.env.BSV_UTXO_ENDPOINT_TEMPLATE || process.env.BSV_ARC_UTXO_URL_TEMPLATE || ''
   const customHeadersJson = process.env.BSV_UTXO_HEADERS_JSON || ''
+  let lastError: Error | null = null
+  
   try {
     if (provider === 'custom' || (provider === 'arc' && customTemplate)) {
       const headers: HeadersMap = (() => {
@@ -71,23 +73,43 @@ export async function getUnspentForAddress(address: string): Promise<any[]> {
       const url = replaceTemplate(customTemplate, address)
       const res = await fetchWithRetry(url, headers)
       const data = await res.json().catch(() => [])
-      return Array.isArray(data) ? normaliseUtxoShape(data) : []
+      const normalized = Array.isArray(data) ? normaliseUtxoShape(data) : []
+      if (normalized.length > 0 || bsvConfig.logging.level === 'debug') {
+        console.log(`[UTXO Provider] ${provider} returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}...`)
+      }
+      return normalized
     }
 
     // Default: WhatsOnChain
     const url = `https://api.whatsonchain.com/v1/bsv/${NET}/address/${address}/unspent`
     const res = await fetchWithRetry(url, buildHeaders())
     const data = await res.json().catch(() => [])
-    return Array.isArray(data) ? normaliseUtxoShape(data) : []
+    const normalized = Array.isArray(data) ? normaliseUtxoShape(data) : []
+    
+    // Log if we got empty results (might indicate an issue)
+    if (normalized.length === 0) {
+      console.log(`[UTXO Provider] WhatsOnChain returned 0 UTXOs for ${address.substring(0, 10)}... (status: ${res.status})`)
+    } else if (bsvConfig.logging.level === 'debug') {
+      console.log(`[UTXO Provider] WhatsOnChain returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}...`)
+    }
+    
+    return normalized
   } catch (e) {
+    lastError = e instanceof Error ? e : new Error(String(e))
     // On provider failure, attempt a single fallback to WOC unless we already used WOC
     if (provider !== 'woc') {
       try {
         const url = `https://api.whatsonchain.com/v1/bsv/${NET}/address/${address}/unspent`
         const res = await fetchWithRetry(url, buildHeaders())
         const data = await res.json().catch(() => [])
-        return Array.isArray(data) ? normaliseUtxoShape(data) : []
-      } catch {}
+        const normalized = Array.isArray(data) ? normaliseUtxoShape(data) : []
+        console.log(`[UTXO Provider] Fallback to WOC returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}...`)
+        return normalized
+      } catch (fallbackError) {
+        console.error(`[UTXO Provider] Both ${provider} and WOC fallback failed for ${address.substring(0, 10)}...:`, fallbackError)
+      }
+    } else {
+      console.error(`[UTXO Provider] Failed to fetch UTXOs for ${address.substring(0, 10)}...:`, lastError.message)
     }
     return []
   }

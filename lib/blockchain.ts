@@ -255,6 +255,34 @@ export class BlockchainService {
       console.error(`   Wallet ${idx + 1} (${d.address.substring(0, 10)}...): ${d.spendableCount} spendable UTXOs, balance: ${balanceStr}${d.error ? `, error: ${d.error}` : ''}`)
     })
     
+    // If wallets have balances but no UTXOs, force refresh and try once more
+    const hasBalances = diagnostics.some(d => d.totalBalance !== undefined && d.totalBalance > 0)
+    if (hasBalances && ENABLE_UTXO_POOL) {
+      console.log('🔄 Wallets have balances but no UTXOs detected. Force refreshing caches...')
+      try {
+        await this.forceRefreshAllUtxoCaches()
+        
+        // Try again after refresh
+        for (let i = 0; i < list.length; i++) {
+          const pick = (this.rrIndex + i) % list.length
+          const wif = list[pick]
+          try {
+            const sdkKey = SDKPrivateKey.fromWif(wif)
+            const addr = sdkKey.toPublicKey().toAddress().toString()
+            const spendable = await this.getSpendableUtxos(addr, wif)
+            
+            if (spendable.length > 0) {
+              this.rrIndex = (pick + 1) % list.length
+              console.log(`✅ Found ${spendable.length} UTXO(s) after refresh for ${addr.substring(0, 10)}...`)
+              return { wif, index: pick, address: addr, utxos: spendable }
+            }
+          } catch {}
+        }
+      } catch (refreshError) {
+        console.error('Failed to force refresh UTXO caches:', refreshError)
+      }
+    }
+    
     return null
   }
 
@@ -596,11 +624,15 @@ export class BlockchainService {
       cache!.utxos = Array.isArray(fetched) ? fetched : []
       cache!.fetchedAt = Date.now()
       cache!.usedKeys.clear()
-      try {
-        if (bsvConfig.logging.level === 'debug') {
-          console.log(`🔁 UTXO cache refreshed: ${cache!.utxos.length} entries for ${address}`)
-        }
-      } catch {}
+      
+      // Debug logging for UTXO refresh
+      console.log(`🔁 UTXO cache refreshed for ${address.substring(0, 10)}...: ${cache!.utxos.length} raw UTXO(s) fetched`)
+      if (cache!.utxos.length > 0 && bsvConfig.logging.level === 'debug') {
+        cache!.utxos.slice(0, 3).forEach((u: any, idx: number) => {
+          console.log(`   UTXO ${idx + 1}: value=${u.value || u.satoshis || 'unknown'}, conf=${u.confirmations || 0}, height=${u.height || 'unknown'}, tx=${(u.tx_hash || u.txId || '').substring(0, 16)}...`)
+        })
+      }
+      
       cache!.inFlight = null
     })()
     await cache.inFlight
@@ -623,7 +655,11 @@ export class BlockchainService {
       const temp = new BSVWallet(useWif)
       const raw = await temp.getUTXOs()
       return Array.isArray(raw)
-        ? raw.filter((u: any) => ((u.confirmations || 0) >= MIN_SPEND_CONF) || (u.height && u.height > 0))
+        ? raw.filter((u: any) => {
+            const conf = (u.confirmations || 0) >= MIN_SPEND_CONF
+            const byHeight = typeof u.height === 'number' ? (u.height > 0 || (u.height === 0 && MIN_SPEND_CONF <= 1)) : true
+            return conf || byHeight
+          })
         : []
     }
     const now = Date.now()
@@ -634,7 +670,11 @@ export class BlockchainService {
     }
     // Only refresh on TTL if available confirmed UTXOs is low
     const availableNow = (cache?.utxos || [])
-      .filter((u: any) => ((u.confirmations || 0) >= MIN_SPEND_CONF) || (typeof u.height === 'number' ? u.height > 0 : true))
+      .filter((u: any) => {
+        const conf = (u.confirmations || 0) >= MIN_SPEND_CONF
+        const byHeight = typeof u.height === 'number' ? (u.height > 0 || (u.height === 0 && MIN_SPEND_CONF <= 1)) : true
+        return conf || byHeight
+      })
       .filter((u: any) => !cache!.usedKeys.has(`${u.tx_hash}:${u.tx_pos}`))
     if (now - cache.fetchedAt > UTXO_POOL_TTL_MS && availableNow.length < REFRESH_THRESHOLD) {
       // Refresh using an explicit WIF that matches this address
@@ -654,7 +694,11 @@ export class BlockchainService {
     }
     const used = cache.usedKeys
     const available = cache.utxos
-      .filter((u: any) => ((u.confirmations || 0) >= MIN_SPEND_CONF) || (u.height && u.height > 0))
+      .filter((u: any) => {
+        const conf = (u.confirmations || 0) >= MIN_SPEND_CONF
+        const byHeight = typeof u.height === 'number' ? (u.height > 0 || (u.height === 0 && MIN_SPEND_CONF <= 1)) : true
+        return conf || byHeight
+      })
       .filter((u: any) => !used.has(`${u.tx_hash}:${u.tx_pos}`))
     if (available.length === 0) {
       // Try a forced refresh once
@@ -673,7 +717,7 @@ export class BlockchainService {
       return refreshed.utxos
         .filter((u: any) => {
           const conf = (u.confirmations || 0) >= MIN_SPEND_CONF
-          const byHeight = typeof u.height === 'number' ? u.height > 0 : true
+          const byHeight = typeof u.height === 'number' ? (u.height > 0 || (u.height === 0 && MIN_SPEND_CONF <= 1)) : true
           return conf || byHeight
         })
         .filter((u: any) => !refreshed.usedKeys.has(`${u.tx_hash}:${u.tx_pos}`))
@@ -694,6 +738,69 @@ export class BlockchainService {
     for (const cache of this.utxoCacheByAddress.values()) {
       for (const k of keys) cache.usedKeys.delete(k)
     }
+  }
+
+  /**
+   * Force refresh all UTXO caches for all configured wallets
+   * Useful when UTXOs are not being detected despite having balances
+   */
+  async forceRefreshAllUtxoCaches(): Promise<void> {
+    const list = this.wifsForSend && this.wifsForSend.length > 0
+      ? this.wifsForSend
+      : (BSV_PRIVATE_KEY ? [BSV_PRIVATE_KEY] : (BSV_FALLBACK_WIF ? [BSV_FALLBACK_WIF] : []))
+    
+    console.log(`🔄 Force refreshing UTXO caches for ${list.length} wallet(s)...`)
+    
+    for (const wif of list) {
+      try {
+        const sdkKey = SDKPrivateKey.fromWif(wif)
+        const addr = sdkKey.toPublicKey().toAddress().toString()
+        
+        // Clear existing cache to force fresh fetch
+        if (ENABLE_UTXO_POOL) {
+          const cache = this.utxoCacheByAddress.get(addr)
+          if (cache) {
+            cache.fetchedAt = 0 // Force refresh by making cache stale
+            cache.utxos = [] // Clear existing UTXOs
+            cache.usedKeys.clear() // Clear used keys
+            cache.inFlight = null // Cancel any in-flight refresh
+          }
+        }
+        
+        // Force refresh
+        await this.refreshUtxoCache(addr, wif)
+        
+        // Get raw count from cache
+        const cache = this.utxoCacheByAddress.get(addr)
+        const rawCount = cache?.utxos?.length || 0
+        
+        // Verify we got UTXOs after filtering
+        const spendable = await this.getSpendableUtxos(addr, wif)
+        console.log(`   ${addr.substring(0, 10)}...: ${rawCount} raw UTXO(s), ${spendable.length} spendable (min_conf=${MIN_SPEND_CONF})`)
+        
+        // If we have raw UTXOs but no spendable, log why
+        if (rawCount > 0 && spendable.length === 0) {
+          const sample = cache?.utxos?.[0]
+          if (sample) {
+            const conf = sample.confirmations || 0
+            const height = sample.height
+            console.log(`   ⚠️  UTXOs filtered out: sample has ${conf} confirmations, height=${height}, min_required=${MIN_SPEND_CONF}`)
+          }
+        }
+      } catch (e) {
+        const addr = (() => {
+          try {
+            const sdkKey = SDKPrivateKey.fromWif(wif)
+            return sdkKey.toPublicKey().toAddress().toString()
+          } catch {
+            return 'unknown'
+          }
+        })()
+        console.error(`   Failed to refresh ${addr.substring(0, 10)}...: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+    
+    console.log('✅ UTXO cache refresh complete')
   }
 
   private async broadcastTransaction(serializedTx: string): Promise<string> {
