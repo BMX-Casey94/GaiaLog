@@ -24,6 +24,11 @@ This document contains the configured BSV wallet addresses used by GaiaLog for t
 - **Address:** `1Jm2t7cmarKskV65UsigAr7tveS5WhPdJS`
 - **Purpose:** Tertiary broadcasting wallet (round-robin)
 
+### Wallets as List
+13S6zUA88PtDNy9DKHZuh3QQmy4d4eN4Se
+127HLeWpr66JU3SDmQJ9dmjBo6RgNsRU1w
+1Jm2t7cmarKskV65UsigAr7tveS5WhPdJS
+
 ---
 
 ## Usage

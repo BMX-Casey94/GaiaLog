@@ -18,6 +18,12 @@ const SPLIT_FEE_RATE = Number(process.env.BSV_UTXO_SPLIT_FEE_RATE_SAT_PER_BYTE |
 const DUST_LIMIT = 546
 const SPLIT_COOLDOWN_MS = Number(process.env.BSV_UTXO_SPLIT_COOLDOWN_MS || 10 * 60 * 1000)
 
+// Validate SPLIT_OUTPUT_SATS is above dust limit
+if (SPLIT_OUTPUT_SATS < DUST_LIMIT) {
+  console.error(`⚠️  WARNING: BSV_UTXO_SPLIT_OUTPUT_SATS (${SPLIT_OUTPUT_SATS}) is below dust limit (${DUST_LIMIT} sats). This will cause transaction failures.`)
+  console.error(`   Recommended minimum: ${DUST_LIMIT + 100} sats (dust limit + buffer for fees)`)
+}
+
 // Track per-wallet pending split to avoid multiple unconfirmed splits
 const pendingSplitUntilByAddress: Map<string, number> = new Map()
 
@@ -92,6 +98,13 @@ async function topUpWallet(wif: string): Promise<{ txid: string, address: string
   const estBytes = 300 + need * 40
   const fee = Math.ceil(estBytes * SPLIT_FEE_RATE)
   const required = totalOut + fee + DUST_LIMIT
+  
+  // Additional validation: ensure each split output is above dust limit
+  if (SPLIT_OUTPUT_SATS < DUST_LIMIT) {
+    console.error(`❌ Cannot split: BSV_UTXO_SPLIT_OUTPUT_SATS (${SPLIT_OUTPUT_SATS}) is below dust limit (${DUST_LIMIT} sats)`)
+    return null
+  }
+  
   if (inputSource.value < required) return null
 
   const scriptHex = (bsv.Script as any).fromAddress

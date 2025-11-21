@@ -72,14 +72,19 @@ export function getBSVNetwork(): 'main' | 'test' {
 
 export function getBSVExplorerUrl(txid: string, network?: 'main' | 'test'): string {
   const net = network || getBSVNetwork()
-  const baseUrl = net === 'main' ? 'https://whatsonchain.com' : 'https://whatsonchain.com'
-  return `${baseUrl}/tx/${txid}`
+  // Use explicit network path to avoid incorrect context (404s)
+  const baseUrl = 'https://whatsonchain.com'
+  return net === 'main'
+    ? `${baseUrl}/tx/${txid}`
+    : `${baseUrl}/test/tx/${txid}`
 }
 
 export function getBSVAddressUrl(address: string, network?: 'main' | 'test'): string {
   const net = network || getBSVNetwork()
-  const baseUrl = net === 'main' ? 'https://whatsonchain.com' : 'https://whatsonchain.com'
-  return `${baseUrl}/address/${address}`
+  const baseUrl = 'https://whatsonchain.com'
+  return net === 'main'
+    ? `${baseUrl}/address/${address}`
+    : `${baseUrl}/test/address/${address}`
 }
 
 export function isValidTxId(txid: string): boolean {

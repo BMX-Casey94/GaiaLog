@@ -44,62 +44,44 @@ export async function GET() {
         latestTx = latestTxResult.rows[0]?.timestamp || null
 
       } catch (dbErr) {
-        // Fallback: Read directly from blockchain (WOC)
+        // Fast fallback: use WoC helpers with strict timeout and minimal calls
         try {
           const net = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
-          const addr = blockchainService.getAddress()
-          if (addr) {
-            const base = `https://api.whatsonchain.com/v1/bsv/${net}/address/${addr}`
-            let listRes = await fetch(`${base}/txs`)
-            if (listRes.status === 404) listRes = await fetch(`${base}/history`)
-            if (listRes.ok) {
-              const txsRaw: any = await listRes.json()
-              const txs: { tx_hash: string; height: number }[] = Array.isArray(txsRaw)
-                ? (txsRaw[0]?.tx_hash ? txsRaw : (typeof txsRaw[0] === 'string' ? txsRaw.map((id: string) => ({ tx_hash: id, height: 0 })) : []))
-                : []
-              // Approximate count: number of transactions sent by our writer address (bounded to recent list)
-              txCount = Array.isArray(txs) ? txs.length : 0
-              const candidates = txs.slice(0, 25)
-              for (const t of candidates) {
-                const txRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${net}/tx/${t.tx_hash}`)
-                if (!txRes.ok) continue
-              const j = await txRes.json()
-              const vout = Array.isArray(j?.vout) ? j.vout : []
-              const opret = vout.find((o: any) => typeof o?.scriptPubKey?.asm === 'string' && o.scriptPubKey.asm.includes('OP_RETURN'))
-              if (!opret) continue
-              const parts = String(opret.scriptPubKey.asm).split(' ')
-              const iret = parts.indexOf('OP_RETURN')
-              if (iret < 0) continue
-              const pushes = parts.slice(iret + 1)
-              if (pushes.length < 3) continue
-              const tagHex = pushes[0]
-              const dataHex = pushes[2]
-              const tag = Buffer.from(tagHex, 'hex').toString('utf8')
-              if (tag !== 'GaiaLog') continue
-              // Optional gzip flag
-              const extras = pushes.slice(3)
-              const encodingHex = Buffer.from('encoding=gzip', 'utf8').toString('hex')
-              const isGzip = extras.includes(encodingHex)
-                try {
-                const raw = Buffer.from(dataHex, 'hex')
-                const bytes = isGzip ? (await import('zlib')).gunzipSync(raw) : raw
-                const txt = bytes.toString('utf8')
-                  const parsed = JSON.parse(txt)
-                  if (!latestTx && parsed?.timestamp) latestTx = parsed.timestamp
-                  if (parsed?.data_type === 'air_quality' && airQuality.aqi == null) {
-                    const payload = parsed?.payload || {}
-                    airQuality = {
-                      aqi: payload.air_quality_index ?? null,
-                      collected_at: parsed.timestamp ?? null
-                    }
-                  }
-                  if (airQuality.aqi != null && latestTx) break
-                } catch {}
+          const { findLatestByType, getAllWalletAddresses, fetchWalletTransactions } = await import('@/lib/woc-fetcher')
+          
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('fallback_timeout')), 7000)
+          )
+          
+          const work = (async () => {
+            const addresses = getAllWalletAddresses()
+            const addr = addresses[0]
+            
+            // Get latest air quality (quickly) and a small recent tx sample count
+            const [latestAir, txs] = await Promise.all([
+              findLatestByType(net, 'air_quality', 10),
+              addr ? fetchWalletTransactions(net, addr, 10) : Promise.resolve([] as { tx_hash: string; height: number }[])
+            ])
+            
+            if (latestAir?.payload) {
+              const payload: any = latestAir.payload || {}
+              airQuality = {
+                aqi: payload.air_quality_index ?? null,
+                collected_at: latestAir.timestamp ? new Date(latestAir.timestamp).toISOString() : null
+              }
+              if (!latestTx && latestAir.timestamp) {
+                latestTx = new Date(latestAir.timestamp).toISOString()
               }
             }
-          }
-        } catch (chainErr) {
-          // Continue with defaults
+            
+            txCount = Array.isArray(txs) ? txs.length : 0
+          })()
+          
+          await Promise.race([work, timeoutPromise]).catch(() => {
+            // On timeout, keep defaults and return quickly
+          })
+        } catch {
+          // Keep defaults on any error
         }
       }
 

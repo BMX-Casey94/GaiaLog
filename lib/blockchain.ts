@@ -200,6 +200,9 @@ export class BlockchainService {
       ? this.wifsForSend
       : (BSV_PRIVATE_KEY ? [BSV_PRIVATE_KEY] : (BSV_FALLBACK_WIF ? [BSV_FALLBACK_WIF] : []))
     if (list.length === 0) return null
+    
+    const diagnostics: Array<{ address: string; spendableCount: number; totalBalance?: number; error?: string }> = []
+    
     for (let i = 0; i < list.length; i++) {
       const pick = (this.rrIndex + i) % list.length
       const wif = list[pick]
@@ -207,13 +210,51 @@ export class BlockchainService {
         const sdkKey = SDKPrivateKey.fromWif(wif)
         const addr = sdkKey.toPublicKey().toAddress().toString()
         const spendable = await this.getSpendableUtxos(addr, wif)
+        
+        // Try to get balance for diagnostics
+        let balance: number | undefined
+        try {
+          const tempWallet = new BSVWallet(wif)
+          balance = await tempWallet.getBalance()
+        } catch {}
+        
+        diagnostics.push({
+          address: addr,
+          spendableCount: spendable.length,
+          totalBalance: balance
+        })
+        
         if (spendable.length > 0) {
           // Advance rrIndex to the position after the one we used
           this.rrIndex = (pick + 1) % list.length
           return { wif, index: pick, address: addr, utxos: spendable }
         }
-      } catch {}
+      } catch (e) {
+        const addr = (() => {
+          try {
+            const sdkKey = SDKPrivateKey.fromWif(wif)
+            return sdkKey.toPublicKey().toAddress().toString()
+          } catch {
+            return 'unknown'
+          }
+        })()
+        diagnostics.push({
+          address: addr,
+          spendableCount: 0,
+          error: e instanceof Error ? e.message : String(e)
+        })
+      }
     }
+    
+    // Log diagnostics when no UTXOs found
+    console.error('❌ No spendable UTXOs found across wallets. Diagnostics:')
+    diagnostics.forEach((d, idx) => {
+      const balanceStr = d.totalBalance !== undefined 
+        ? `${(d.totalBalance * 100000000).toFixed(0)} sats (${d.totalBalance.toFixed(6)} BSV)`
+        : 'unknown'
+      console.error(`   Wallet ${idx + 1} (${d.address.substring(0, 10)}...): ${d.spendableCount} spendable UTXOs, balance: ${balanceStr}${d.error ? `, error: ${d.error}` : ''}`)
+    })
+    
     return null
   }
 

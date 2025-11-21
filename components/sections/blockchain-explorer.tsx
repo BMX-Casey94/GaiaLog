@@ -52,7 +52,12 @@ export function BlockchainExplorer() {
       const result = await response.json()
       
       if (result.success && result.readings) {
-        setNetwork(result.network || 'test')
+        // Normalise network value to 'main' | 'test'
+        const netStr =
+          result.network === 'mainnet' ? 'main'
+          : result.network === 'testnet' ? 'test'
+          : (result.network || 'test')
+        setNetwork(netStr)
         
         // Transform the readings into display format
         // API returns max 4 entries (one latest transaction per data type)
@@ -129,12 +134,8 @@ export function BlockchainExplorer() {
     }
   }
 
-  const getWhatsonChainUrl = (txid: string): string => {
-    const baseUrl = network === 'main' 
-      ? 'https://whatsonchain.com' 
-      : 'https://whatsonchain.com'
-    return `${baseUrl}/tx/${txid}`
-  }
+  const getWhatsonChainUrl = (txid: string): string =>
+    getBSVExplorerUrl(txid, network as 'main' | 'test')
 
   return (
     <section id="blockchain" className="py-20 px-4 sm:px-6 lg:px-8 relative">
@@ -149,22 +150,12 @@ export function BlockchainExplorer() {
             </p>
           </div>
 
-          {loading ? (
-            <div className="text-center py-12">
-              <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-purple-500"></div>
-              <p className="text-slate-400 mt-4">Loading blockchain transactions...</p>
-            </div>
-          ) : transactions.length === 0 ? (
-            <div className="text-center py-12">
-              <Hash className="h-12 w-12 text-slate-600 mx-auto mb-4" />
-              <p className="text-slate-400">No blockchain transactions found yet.</p>
-              <p className="text-slate-500 text-sm mt-2">Environmental data will appear here once recorded on the BSV blockchain.</p>
-            </div>
-          ) : (
-            <>
-              <div className="space-y-4 mb-8">
-                {transactions.map((tx) => (
-                  <GlowCard key={tx.id} glowColor="purple" customSize>
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+              {['Air Quality', 'Water Levels', 'Seismic Activity', 'Advanced Metrics'].map((label) => {
+                const tx = transactions.find((t) => t.type === label)
+                return (
+                  <GlowCard key={label} glowColor="purple" customSize>
                     <div className="flex items-center justify-between">
                       <div className="flex items-center space-x-4">
                         <div className="w-10 h-10 bg-slate-950/60 rounded-full flex items-center justify-center">
@@ -172,54 +163,62 @@ export function BlockchainExplorer() {
                         </div>
                         <div>
                           <div className="flex items-center space-x-2 mb-1">
-                            <span className="font-medium text-white">{tx.type}</span>
-                            <Badge 
-                              variant="secondary" 
-                              className={tx.status === 'pending' 
-                                ? "bg-yellow-900/50 text-yellow-400 rounded-sm" 
-                                : "bg-green-900/50 text-green-400 rounded-sm"}
-                            >
-                              {tx.status}
-                            </Badge>
+                            <span className="font-medium text-white">{label}</span>
+                            {tx && (
+                              <Badge 
+                                variant="secondary" 
+                                className={tx.status === 'pending' 
+                                  ? "bg-yellow-900/50 text-yellow-400 rounded-sm" 
+                                  : "bg-green-900/50 text-green-400 rounded-sm"}
+                              >
+                                {tx.status}
+                              </Badge>
+                            )}
                           </div>
-                          <div className="text-sm text-slate-400 mb-1">{tx.data}</div>
-                          <div className="flex items-center space-x-2 text-xs text-slate-500">
-                            <Clock className="h-3 w-3" />
-                            <span>{tx.timestamp}</span>
-                            <span>•</span>
-                            <span className="font-mono">
-                              {tx.id.slice(0, 8)}...{tx.id.slice(-8)}
-                            </span>
+                          <div className="text-sm text-slate-400 mb-1">
+                            {loading ? 'Loading...' : (tx ? tx.data : 'No recent transactions found yet.')}
                           </div>
+                          {tx ? (
+                            <div className="flex items-center space-x-2 text-xs text-slate-500">
+                              <Clock className="h-3 w-3" />
+                              <span>{tx.timestamp}</span>
+                              <span>•</span>
+                              <span className="font-mono">
+                                {tx.id.slice(0, 8)}...{tx.id.slice(-8)}
+                              </span>
+                            </div>
+                          ) : null}
                         </div>
                       </div>
-                      <Button 
-                        variant="ghost" 
-                        size="sm" 
-                        className="text-purple-300 hover:text-purple-200"
-                        onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
-                      >
-                        <span className="sm:hidden inline-flex items-center">TX<ExternalLink className="ml-1 h-3 w-3" /></span>
-                        <span className="hidden sm:inline">View BSV TX</span>
-                        <ExternalLink className="ml-2 h-3 w-3 hidden sm:inline" />
-                      </Button>
+                      {tx ? (
+                        <Button 
+                          variant="ghost" 
+                          size="sm" 
+                          className="text-purple-300 hover:text-purple-200"
+                          onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
+                        >
+                          <span className="sm:hidden inline-flex items-center">TX<ExternalLink className="ml-1 h-3 w-3" /></span>
+                          <span className="hidden sm:inline">View BSV TX</span>
+                          <ExternalLink className="ml-2 h-3 w-3 hidden sm:inline" />
+                        </Button>
+                      ) : null}
                     </div>
                   </GlowCard>
-                ))}
-              </div>
-
-              <div className="text-center">
-                <Button 
-                  variant="outline" 
-                  className="border-slate-600 text-slate-300 hover:bg-slate-800 bg-transparent"
-                  onClick={() => setShowWalletModal(true)}
-                >
-                  View Transaction History
-                  <ExternalLink className="ml-2 h-4 w-4" />
-                </Button>
-              </div>
-            </>
-          )}
+                )
+              })}
+            </div>
+            
+            <div className="text-center">
+              <Button 
+                variant="outline" 
+                className="border-slate-600 text-slate-300 hover:bg-slate-800 bg-transparent"
+                onClick={() => setShowWalletModal(true)}
+              >
+                View Transaction History
+                <ExternalLink className="ml-2 h-4 w-4" />
+              </Button>
+            </div>
+          </>
         </div>
       </div>
 
@@ -238,10 +237,7 @@ export function BlockchainExplorer() {
               <button
                 key={index}
                 onClick={() => {
-                  const baseUrl = network === 'main' 
-                    ? 'https://whatsonchain.com' 
-                    : 'https://whatsonchain.com'
-                  window.open(`${baseUrl}/address/${wallet.address}`, '_blank')
+                  window.open(getBSVAddressUrl(wallet.address, network as 'main' | 'test'), '_blank')
                   setShowWalletModal(false)
                 }}
                 className="w-full flex items-center justify-between p-4 bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700 hover:border-purple-500/50 rounded-lg transition-all group"

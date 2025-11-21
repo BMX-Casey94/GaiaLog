@@ -29,9 +29,21 @@ export function LiveDashboard() {
   const [alerts, setAlerts] = useState<AlertData[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Remember the last severe alert (high/critical) so the card doesn't go empty
+  const [stickyByType, setStickyByType] = useState<Record<AlertData['type'], AlertData | null>>({
+    air: null,
+    water: null,
+    seismic: null,
+    environmental: null,
+  })
 
   const processDataIntoAlerts = (data: any): AlertData[] => {
     const alerts: AlertData[] = []
+    const toFixed = (n: any, digits = 1): string => {
+      const num = Number(n)
+      if (!isFinite(num)) return ''
+      return num.toFixed(digits)
+    }
     
     // Process Air Quality - Only show moderate or worse
     if (data.airQuality) {
@@ -50,7 +62,7 @@ export function LiveDashboard() {
           location: data.airQuality.location,
           timestamp: data.airQuality.timestamp,
           source: data.airQuality.source,
-          details: `AQI: ${aqi} • PM2.5: ${data.airQuality.pm25} μg/m³`
+          details: `AQI: ${aqi} • PM2.5: ${toFixed(data.airQuality.pm25, 1)} μg/m³`
         })
       }
     }
@@ -73,7 +85,7 @@ export function LiveDashboard() {
           location: data.waterLevels.location,
           timestamp: data.waterLevels.timestamp,
           source: data.waterLevels.source,
-          details: `Level: ${level}m`
+          details: `Level: ${toFixed(level, 2)}m`
         })
       }
     }
@@ -95,14 +107,19 @@ export function LiveDashboard() {
           location: data.seismic.location,
           timestamp: data.seismic.timestamp,
           source: data.seismic.source,
-          details: `Magnitude: ${magnitude}M • Depth: ${data.seismic.depth ? `${data.seismic.depth} (km)` : 'Unknown (km)'}`
+          details: `Magnitude: ${toFixed(magnitude, 1)}M • Depth: ${
+            data.seismic.depth ? `${toFixed(data.seismic.depth, 1)} (km)` : 'Unknown (km)'
+          }`
         })
       }
     }
     
     // Process Environmental Quality - Only show moderate or worse
     if (data.advancedMetrics) {
-      const score = data.advancedMetrics.environmental_quality_score
+      const rawScore = data.advancedMetrics.environmental_quality_score
+      // Normalize score: if 0–1, scale to 0–100
+      const normalizedScore = typeof rawScore === 'number' && rawScore <= 1 ? rawScore * 100 : rawScore
+      const score = normalizedScore
       let severity: 'low' | 'moderate' | 'high' | 'critical' = 'low'
       if (score < 30) severity = 'critical'
       else if (score < 50) severity = 'high'
@@ -117,7 +134,7 @@ export function LiveDashboard() {
           location: data.advancedMetrics.location,
           timestamp: data.advancedMetrics.timestamp,
           source: data.advancedMetrics.source,
-          details: `Score: ${score}/100 • UV: ${data.advancedMetrics.uv_index}`
+          details: `Score: ${toFixed(score, 1)}/100 • UV: ${toFixed(data.advancedMetrics.uv_index, 1)}`
         })
       }
     }
@@ -129,43 +146,64 @@ export function LiveDashboard() {
     setLoading(true)
     setError(null)
     try {
-      // Fetch from database (kept fresh by local workers)
+      // Fetch from WoC (no database, rotates across 3 wallets)
       const [airQualityRes, waterLevelsRes, seismicRes, advancedRes] = await Promise.all([
-        fetch('/api/air-quality/latest'),
-        fetch('/api/water-levels?limit=1'),
-        fetch('/api/seismic?limit=1'),
-        fetch('/api/advanced-metrics?limit=1')
+        fetch('/api/air-quality/latest', { cache: 'no-store' }),
+        fetch('/api/water-levels/latest', { cache: 'no-store' }),
+        fetch('/api/seismic/latest', { cache: 'no-store' }),
+        fetch('/api/advanced-metrics/latest', { cache: 'no-store' })
       ])
       
-      const airQuality = await airQualityRes.json()
-      const waterLevels = await waterLevelsRes.json()
-      const seismic = await seismicRes.json()
-      const advanced = await advancedRes.json()
+      // Handle responses: 404 is expected when no data exists yet (not an error)
+      const airQuality = airQualityRes.ok ? await airQualityRes.json() : { success: false }
+      const waterLevels = waterLevelsRes.ok ? await waterLevelsRes.json() : { success: false }
+      const seismic = seismicRes.ok ? await seismicRes.json() : { success: false }
+      const advanced = advancedRes.ok ? await advancedRes.json() : { success: false }
       
       const processedData = {
         airQuality: airQuality.success ? airQuality.data : null,
-        waterLevels: waterLevels.stations && waterLevels.stations.length > 0 ? {
-          ...waterLevels.stations[0],
-          river_level: waterLevels.stations[0].level,
-          location: waterLevels.stations[0].name,
-          timestamp: waterLevels.timestamp,
-          source: waterLevels.source
+        waterLevels: waterLevels.success ? {
+          ...waterLevels.data,
+          river_level: waterLevels.data.river_level ?? waterLevels.data.level ?? 0,
+          location: waterLevels.data.location,
+          timestamp: waterLevels.data.timestamp,
+          source: waterLevels.data.source
         } : null,
-        seismic: seismic.recent_events && seismic.recent_events.length > 0 ? {
-          ...seismic.recent_events[0],
-          timestamp: seismic.timestamp,
-          source: seismic.source
+        seismic: seismic.success ? {
+          ...seismic.data,
+          depth: seismic.data.depth_miles ?? seismic.data.depth,
+          timestamp: seismic.data.timestamp,
+          source: seismic.data.source
         } : null,
-        advancedMetrics: advanced.metrics ? {
-          ...advanced.metrics,
-          timestamp: advanced.timestamp,
-          source: advanced.source
-        } : null,
-        lastUpdated: new Date().toLocaleTimeString()
+        advancedMetrics: advanced.success ? (() => {
+          const rawScore = advanced.data.environmental_quality_score
+          const normalized = typeof rawScore === 'number' && rawScore <= 1 ? rawScore * 100 : rawScore
+          return {
+            ...advanced.data,
+            // Normalise for display so users don't see 0.71/100 style values
+            environmental_quality_score: normalized,
+            scoreDisplay: typeof normalized === 'number' ? normalized : null,
+            uvDisplay: typeof advanced.data.uv_index === 'number' ? advanced.data.uv_index : Number(advanced.data.uv_index) || null,
+            timestamp: advanced.data.timestamp,
+            source: advanced.data.source
+          }
+        })() : null,
+        lastUpdated: new Date().toLocaleTimeString('en-GB')
       }
       
       setData(processedData)
-      setAlerts(processDataIntoAlerts(processedData))
+      const newAlerts = processDataIntoAlerts(processedData)
+      setAlerts(newAlerts)
+      // Update sticky memory for only high/critical alerts
+      setStickyByType(prev => {
+        const next = { ...prev }
+        for (const a of newAlerts) {
+          if (a.severity === 'high' || a.severity === 'critical') {
+            next[a.type] = a
+          }
+        }
+        return next
+      })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error')
     } finally {
@@ -175,8 +213,8 @@ export function LiveDashboard() {
 
   useEffect(() => {
     fetchData()
-    // Refresh every 5 minutes
-    const interval = setInterval(fetchData, 5 * 60 * 1000)
+    // Refresh every 25 seconds (respects WoC 3 RPS limit)
+    const interval = setInterval(fetchData, 25000)
     return () => clearInterval(interval)
   }, [])
   return (
@@ -199,8 +237,11 @@ export function LiveDashboard() {
                 <Database className="h-5 w-5" />
                 <span className="font-semibold">Air Quality Alerts</span>
               </div>
-              {alerts.filter(a => a.type === 'air').length > 0 ? (
-                alerts.filter(a => a.type === 'air').map((alert, index) => (
+              {(() => {
+                const current = alerts.filter(a => a.type === 'air')
+                const toShow = current.length > 0 ? current : (stickyByType.air ? [stickyByType.air] : [])
+                return toShow.length > 0 ? (
+                  toShow.map((alert, index) => (
                   <div key={index} className="mb-3 text-center">
                     <div className="flex items-center justify-center space-x-2 mb-2">
                       {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
@@ -224,10 +265,10 @@ export function LiveDashboard() {
                       🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}
                     </div>
                   </div>
-                ))
-              ) : (
+                  ))
+                ) : (
                 <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">✓ GOOD</div>
+                  <div className="text-lg font-bold mb-1">Great! No alerts</div>
                   <div className="text-sm text-slate-400 mb-3">No air quality alerts</div>
                   {data?.airQuality && (
                     <>
@@ -244,7 +285,8 @@ export function LiveDashboard() {
                     </>
                   )}
                 </div>
-              )}
+                )
+              })()}
               <div className="flex justify-center mt-2">
                 <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
@@ -257,8 +299,11 @@ export function LiveDashboard() {
                 <Droplets className="h-5 w-5" />
                 <span className="font-semibold">Water Level Alerts</span>
               </div>
-              {alerts.filter(a => a.type === 'water').length > 0 ? (
-                alerts.filter(a => a.type === 'water').map((alert, index) => (
+              {(() => {
+                const current = alerts.filter(a => a.type === 'water')
+                const toShow = current.length > 0 ? current : (stickyByType.water ? [stickyByType.water] : [])
+                return toShow.length > 0 ? (
+                  toShow.map((alert, index) => (
                   <div key={index} className="mb-3 text-center">
                     <div className="flex items-center justify-center space-x-2 mb-2">
                       {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
@@ -282,10 +327,10 @@ export function LiveDashboard() {
                       🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}
                     </div>
                   </div>
-                ))
-              ) : (
+                  ))
+                ) : (
                 <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">✓ GOOD</div>
+                  <div className="text-lg font-bold mb-1">Great! No alerts</div>
                   <div className="text-sm text-slate-400 mb-3">No water level alerts</div>
                   {data?.waterLevels && (
                     <>
@@ -302,7 +347,8 @@ export function LiveDashboard() {
                     </>
                   )}
                 </div>
-              )}
+                )
+              })()}
               <div className="flex justify-center mt-2">
                 <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
@@ -315,8 +361,11 @@ export function LiveDashboard() {
                 <Activity className="h-5 w-5" />
                 <span className="font-semibold">Seismic Alerts</span>
               </div>
-              {alerts.filter(a => a.type === 'seismic').length > 0 ? (
-                alerts.filter(a => a.type === 'seismic').map((alert, index) => (
+              {(() => {
+                const current = alerts.filter(a => a.type === 'seismic')
+                const toShow = current.length > 0 ? current : (stickyByType.seismic ? [stickyByType.seismic] : [])
+                return toShow.length > 0 ? (
+                  toShow.map((alert, index) => (
                   <div key={index} className="mb-3 text-center">
                     <div className="flex items-center justify-center space-x-2 mb-2">
                       {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
@@ -340,10 +389,10 @@ export function LiveDashboard() {
                       🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}
                     </div>
                   </div>
-                ))
-              ) : (
+                  ))
+                ) : (
                 <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">✓ GOOD</div>
+                  <div className="text-lg font-bold mb-1">Great! No alerts</div>
                   <div className="text-sm text-slate-400 mb-3">No seismic alerts</div>
                   {data?.seismic && (
                     <>
@@ -360,7 +409,8 @@ export function LiveDashboard() {
                     </>
                   )}
                 </div>
-              )}
+                )
+              })()}
               <div className="flex justify-center mt-2">
                 <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
@@ -373,8 +423,11 @@ export function LiveDashboard() {
                 <Thermometer className="h-5 w-5" />
                 <span className="font-semibold">Environmental Alerts</span>
               </div>
-              {alerts.filter(a => a.type === 'environmental').length > 0 ? (
-                alerts.filter(a => a.type === 'environmental').map((alert, index) => (
+              {(() => {
+                const current = alerts.filter(a => a.type === 'environmental')
+                const toShow = current.length > 0 ? current : (stickyByType.environmental ? [stickyByType.environmental] : [])
+                return toShow.length > 0 ? (
+                  toShow.map((alert, index) => (
                   <div key={index} className="mb-3 text-center">
                     <div className="flex items-center justify-center space-x-2 mb-2">
                       {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
@@ -398,15 +451,15 @@ export function LiveDashboard() {
                       🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}
                     </div>
                   </div>
-                ))
-              ) : (
+                  ))
+                ) : (
                 <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">✓ GOOD</div>
+                  <div className="text-lg font-bold mb-1">Great! No alerts</div>
                   <div className="text-sm text-slate-400 mb-3">No environmental alerts</div>
                   {data?.advancedMetrics && (
                     <>
                       <div className="text-sm text-slate-400 mb-2">
-                        Score: {data.advancedMetrics.environmental_quality_score}/100 • UV: {data.advancedMetrics.uv_index}
+                        Score: {typeof data.advancedMetrics.scoreDisplay === 'number' ? data.advancedMetrics.scoreDisplay.toFixed(1) : data.advancedMetrics.environmental_quality_score}/100 • UV: {typeof data.advancedMetrics.uvDisplay === 'number' ? data.advancedMetrics.uvDisplay.toFixed(1) : data.advancedMetrics.uv_index}
                       </div>
                       <div className="text-xs text-slate-500 mb-1">
                         📍 {data.advancedMetrics.location}
@@ -418,7 +471,8 @@ export function LiveDashboard() {
                     </>
                   )}
                 </div>
-              )}
+                )
+              })()}
               <div className="flex justify-center mt-2">
                 <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
