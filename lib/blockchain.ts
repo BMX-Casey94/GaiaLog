@@ -31,6 +31,8 @@ const GORILLAPOOL_MAPI_ENDPOINT = (process.env.BSV_GORILLAPOOL_MAPI_ENDPOINT || 
 const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.001)
 const DUST_LIMIT = 546
 const MIRROR_TO_WOC = process.env.BSV_MIRROR_TO_WOC === 'true'
+const MIRROR_TO_ARC = process.env.BSV_MIRROR_TO_ARC === 'true'
+const WOC_FIRST = process.env.BSV_WOC_FIRST === 'true'
 const WOC_MIRROR_MAX_RPS = 3
 // Optional low-fee WoC lane (limited throughput)
 const WOC_LOW_FEE_ENABLED = process.env.BSV_WOC_LOW_FEE_ENABLED === 'true'
@@ -577,17 +579,32 @@ export class BlockchainService {
           this.markUtxosUsed(reservedKeys)
         }
         let txid: string
-        const canUseLowFee = WOC_LOW_FEE_ENABLED && this.canTakeWocTxRawSlot()
         try {
-          if (canUseLowFee) {
-            const lowFeeHex = buildSerialized(Math.max(WOC_LOW_FEE_FACTOR, 0.01))
-            txid = await this.broadcastViaWocOnly(lowFeeHex)
+          if (WOC_FIRST || WOC_LOW_FEE_ENABLED) {
+            // Throttled WoC-first path: wait for slot, then prefer WoC with low-fee factor when enabled
+            await this.waitForWocSlot()
+            const feeFactor = WOC_LOW_FEE_ENABLED ? Math.max(WOC_LOW_FEE_FACTOR, 0.01) : 1
+            const woCHex = buildSerialized(feeFactor)
+            try {
+              txid = await this.broadcastViaWocOnly(woCHex)
+            } catch {
+              // Retry WoC once more after a brief wait, then fall back
+              await this.waitForWocSlot()
+              const woCHex2 = buildSerialized(feeFactor)
+              try {
+                txid = await this.broadcastViaWocOnly(woCHex2)
+              } catch {
+                const normalHex = buildSerialized(1)
+                txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
+              }
+            }
           } else {
+            // Legacy behavior when not using WoC-first or low-fee lane
             const normalHex = buildSerialized(1)
             txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
           }
         } catch (_e) {
-          // Fallback to normal broadcast path on any failure
+          // Final fallback to normal path if anything else blew up
           const normalHex = buildSerialized(1)
           txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
         }
@@ -698,6 +715,18 @@ export class BlockchainService {
   }
 
   /**
+   * Wait until a WoC tx/raw slot is available, reserving it when acquired.
+   * Uses the same internal slot accounting as mirrors/low-fee path.
+   */
+  private async waitForWocSlot(): Promise<void> {
+    // Busy-wait in short sleeps until a slot is available
+    while (true) {
+      if (this.canTakeWocTxRawSlot()) return
+      await new Promise(r => setTimeout(r, 15))
+    }
+  }
+
+  /**
    * Direct WoC broadcast (tx/raw). Caller must acquire slot first via canTakeWocTxRawSlot.
    */
   private async broadcastViaWocOnly(serializedTx: string): Promise<string> {
@@ -715,7 +744,7 @@ export class BlockchainService {
         try {
           const arcKey = process.env.BSV_ARC_API_KEY
           const arcEndpoint = (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc').replace(/\/$/, '')
-          if (arcKey) {
+          if (arcKey && MIRROR_TO_ARC) {
             fetch(`${arcEndpoint}/v1/tx`, {
               method: 'POST',
               headers: {
@@ -936,6 +965,28 @@ export class BlockchainService {
     const errors: string[] = []
     let lastArcText: string | undefined
 
+    // Optional Method 0: WhatOnChain first (cost-optimised, throttled)
+    if (WOC_FIRST) {
+      try {
+        await this.waitForWocSlot()
+        const wocNet = WOC_NETWORK
+        const wocRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ txhex: serializedTx })
+        })
+        const wocText = await wocRes.text().catch(() => '')
+        if (wocRes.ok) {
+          const txid = (wocText || '').replace(/"/g, '').trim()
+          if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+        } else {
+          errors.push(`WhatOnChain failed (${wocRes.status})`)
+        }
+      } catch (e) {
+        errors.push(`WhatOnChain error: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+
     // Method 1: TAAL ARC (primary)
     try {
       const arcKey = process.env.BSV_ARC_API_KEY
@@ -1024,7 +1075,7 @@ export class BlockchainService {
               try {
                 const arcKey = process.env.BSV_ARC_API_KEY
                 const arcEndpoint = (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc').replace(/\/$/, '')
-                if (arcKey) {
+                if (arcKey && MIRROR_TO_ARC) {
                   fetch(`${arcEndpoint}/v1/tx`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${arcKey}` },
@@ -1046,7 +1097,7 @@ export class BlockchainService {
             try {
               const arcKey = process.env.BSV_ARC_API_KEY
               const arcEndpoint = (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc').replace(/\/$/, '')
-              if (arcKey) {
+              if (arcKey && MIRROR_TO_ARC) {
                 fetch(`${arcEndpoint}/v1/tx`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${arcKey}` },
@@ -1176,9 +1227,11 @@ export class BlockchainService {
 
       const selected: any[] = []
       let totalInput = 0
-      const feePerKb = FEE_RATE_SAT_PER_BYTE * 1000
+      // Apply WoC low-fee factor when enabled so even direct sends use cheap fees
+      const feeFactor = WOC_LOW_FEE_ENABLED ? Math.max(WOC_LOW_FEE_FACTOR, 0.01) : 1
+      const feePerKb = FEE_RATE_SAT_PER_BYTE * 1000 * feeFactor
       const baseOverhead = 200 // bytes rough baseline
-      const estimatedFee = Math.ceil((baseOverhead) * FEE_RATE_SAT_PER_BYTE)
+      const estimatedFee = Math.ceil((baseOverhead) * FEE_RATE_SAT_PER_BYTE * feeFactor)
       const target = amountSats + estimatedFee + DUST_LIMIT
       for (const u of sorted) {
         selected.push({
