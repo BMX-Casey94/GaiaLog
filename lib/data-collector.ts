@@ -733,7 +733,6 @@ export class DataCollector {
           source: 'WAQI',
           location: data.location,
           timestamp: data.timestamp,
-          source_hash: sourceHash,
           aqi: data.aqi,
           pm25: data.pm25,
           pm10: data.pm10,
@@ -1021,11 +1020,14 @@ export async function collectWaterLevelDataBatch(limit: number = 25): Promise<Wa
   return out
 }
 
-export async function collectSeismicDataBatch(hours: number = 6, minMag: number = 2.5): Promise<SeismicData[]> {
+export async function collectSeismicDataBatch(hours: number = 6, minMag: number = 2.5, maxResults?: number): Promise<SeismicData[]> {
   const endTime = new Date().toISOString()
   const startTime = new Date(Date.now() - hours * 3600 * 1000).toISOString()
   // Note: USGS FDSN event API does not use API keys; do not append
-  const url = `https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime=${startTime}&endtime=${endTime}&minmagnitude=${minMag}&orderby=time`
+  let url = `https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime=${startTime}&endtime=${endTime}&minmagnitude=${minMag}&orderby=time`
+  if (typeof maxResults === 'number' && maxResults > 0) {
+    url += `&limit=${maxResults}`
+  }
   const data = await fetchJsonWithRetry<any>(url, { retries: 2 })
   const features = data?.features || []
   const out: SeismicData[] = []

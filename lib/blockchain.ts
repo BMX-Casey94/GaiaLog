@@ -391,6 +391,9 @@ export class BlockchainService {
             delete (copy as any).attribution
             delete (copy as any).notice
             delete (copy as any).source
+            // Remove database-related references to reduce payload size
+            delete (copy as any).source_hash
+            delete (copy as any).db_source_hash
           }
           return copy
         } catch {
@@ -432,11 +435,9 @@ export class BlockchainService {
         const { sha256CanonicalHex, stringifyCanonical } = await import('./utils')
         const canon = stringifyCanonical(payloadWithAscii)
         const digest = await sha256CanonicalHex(payloadWithAscii)
-        const providedDbHash = (data as any)?.payload?.source_hash
         payloadWithHashes = {
           ...((JSON.parse(canon) as any) || payloadWithAscii),
-          payload_sha256: digest,
-          ...(providedDbHash ? { db_source_hash: providedDbHash } : {}),
+          payload_sha256: digest
         }
       } catch {}
 
@@ -553,6 +554,20 @@ export class BlockchainService {
         return tx.serialize()
       }
 
+      // Build prevouts for ARC Extended Format (order must match inputs)
+      const p2pkhScriptDefault = this.p2pkhLockingScriptHexFromWif(wif)
+      const prevoutsForArc = Array.isArray(bitcoreUtxos) ? bitcoreUtxos.map((u: any) => {
+        const sats = Number(u?.satoshis ?? u?.value ?? 0)
+        let scriptHex = ''
+        try {
+          const sc: any = u?.script
+          if (typeof sc === 'string') scriptHex = sc
+          else if (sc && typeof sc.toHex === 'function') scriptHex = sc.toHex()
+        } catch {}
+        if (!scriptHex) scriptHex = p2pkhScriptDefault
+        return { lockingScript: scriptHex, satoshis: sats }
+      }) : []
+
       // Broadcast transaction (prefer WoC low-fee lane when enabled and capacity available)
       // Prevent double-use of the same cached UTXOs across rapid sends
       let reservedKeys: string[] = []
@@ -569,12 +584,12 @@ export class BlockchainService {
             txid = await this.broadcastViaWocOnly(lowFeeHex)
           } else {
             const normalHex = buildSerialized(1)
-            txid = await this.broadcastTransaction(normalHex)
+            txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
           }
         } catch (_e) {
           // Fallback to normal broadcast path on any failure
           const normalHex = buildSerialized(1)
-          txid = await this.broadcastTransaction(normalHex)
+          txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
         }
 
         // Log transaction
@@ -695,7 +710,24 @@ export class BlockchainService {
     const wocText = await wocRes.text().catch(() => '')
     if (wocRes.ok) {
       const txid = (wocText || '').replace(/"/g, '').trim()
-      if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+      if (/^[0-9a-fA-F]{64}$/.test(txid)) {
+        // Mirror WoC success to ARC asynchronously to keep mempools in sync
+        try {
+          const arcKey = process.env.BSV_ARC_API_KEY
+          const arcEndpoint = (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc').replace(/\/$/, '')
+          if (arcKey) {
+            fetch(`${arcEndpoint}/v1/tx`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${arcKey}`,
+              },
+              body: JSON.stringify({ rawTx: serializedTx })
+            }).catch(() => {})
+          }
+        } catch {}
+        return txid
+      }
       throw new Error(`WOC returned invalid txid: ${wocText}`)
     }
     throw new Error(`WOC failed (${wocRes.status})`)
@@ -897,7 +929,10 @@ export class BlockchainService {
     console.log('✅ UTXO cache refresh complete')
   }
 
-  private async broadcastTransaction(serializedTx: string): Promise<string> {
+  private async broadcastTransaction(
+    serializedTx: string,
+    prevouts?: Array<{ lockingScript: string; satoshis: number }>
+  ): Promise<string> {
     const errors: string[] = []
     let lastArcText: string | undefined
 
@@ -906,13 +941,24 @@ export class BlockchainService {
       const arcKey = process.env.BSV_ARC_API_KEY
       const arcEndpoint = process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc'
       if (arcKey) {
+        // Prefer sending ARC Extended Format when prevouts are available
+        const arcBody: any = { rawTx: serializedTx }
+        try {
+          const useExtended = prevouts && prevouts.length > 0 && (process.env.BSV_ARC_EXTENDED_FORMAT !== 'false')
+          if (useExtended) {
+            arcBody.inputs = prevouts.map(p => ({
+              lockingScript: p.lockingScript,
+              satoshis: Math.max(0, Number(p.satoshis) || 0),
+            }))
+          }
+        } catch {}
         const arcRes = await fetch(`${arcEndpoint.replace(/\/$/, '')}/v1/tx`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${arcKey}`,
           },
-          body: JSON.stringify({ rawTx: serializedTx })
+          body: JSON.stringify(arcBody)
         })
         lastArcText = await arcRes.text().catch(() => '')
         if (arcRes.ok) {
@@ -974,6 +1020,18 @@ export class BlockchainService {
           if (gpData?.payload) {
             const payload = JSON.parse(gpData.payload)
             if (payload?.returnResult === 'success' && typeof payload.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(payload.txid)) {
+              // Mirror GorillaPool success to ARC asynchronously to keep mempools in sync
+              try {
+                const arcKey = process.env.BSV_ARC_API_KEY
+                const arcEndpoint = (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc').replace(/\/$/, '')
+                if (arcKey) {
+                  fetch(`${arcEndpoint}/v1/tx`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${arcKey}` },
+                    body: JSON.stringify({ rawTx: serializedTx })
+                  }).catch(() => {})
+                }
+              } catch {}
               return payload.txid
             }
             if (payload?.returnResult === 'failure') {
@@ -983,7 +1041,21 @@ export class BlockchainService {
         } catch {
           // If response isn't standard envelope, try raw string txid
           const txid = (gpText || '').replace(/"/g, '').trim()
-          if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+          if (/^[0-9a-fA-F]{64}$/.test(txid)) {
+            // Mirror GorillaPool success to ARC asynchronously
+            try {
+              const arcKey = process.env.BSV_ARC_API_KEY
+              const arcEndpoint = (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc').replace(/\/$/, '')
+              if (arcKey) {
+                fetch(`${arcEndpoint}/v1/tx`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${arcKey}` },
+                  body: JSON.stringify({ rawTx: serializedTx })
+                }).catch(() => {})
+              }
+            } catch {}
+            return txid
+          }
         }
       } else {
         errors.push(`GorillaPool failed (${gpRes.status})`)
@@ -1133,7 +1205,19 @@ export class BlockchainService {
       tx.sign(signingKey)
 
       // Broadcast
-      const txid = await this.broadcastTransaction(tx.serialize())
+      const p2pkhScriptDefault = this.p2pkhLockingScriptHexFromWif((this.wallet as any)['wif'])
+      const prevoutsForArc = Array.isArray(selected) ? selected.map((u: any) => {
+        const sats = Number(u?.satoshis ?? u?.value ?? 0)
+        let scriptHex = ''
+        try {
+          const sc: any = u?.script
+          if (typeof sc === 'string') scriptHex = sc
+          else if (sc && typeof sc.toHex === 'function') scriptHex = sc.toHex()
+        } catch {}
+        if (!scriptHex) scriptHex = p2pkhScriptDefault
+        return { lockingScript: scriptHex, satoshis: sats }
+      }) : []
+      const txid = await this.broadcastTransaction(tx.serialize(), prevoutsForArc)
       return txid
     } catch (error) {
       console.error('sendToAddress error:', error)

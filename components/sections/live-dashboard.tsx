@@ -295,24 +295,24 @@ export function LiveDashboard() {
                     </div>
                   </div>
                   ))
+                ) : data?.airQuality ? (
+                <div className="text-green-400 text-center">
+                  <div className="text-lg font-bold mb-1">Good</div>
+                  <div className="text-sm text-slate-400 mb-3">Air quality is safe</div>
+                  <div className="text-sm text-slate-400 mb-2">
+                    AQI: {data.airQuality.aqi} • PM2.5: {data.airQuality.pm25} μg/m³
+                  </div>
+                  <div className="text-xs text-slate-500 mb-1">
+                    📍 {data.airQuality.location}
+                  </div>
+                  <div className="text-xs text-slate-600 mb-1">
+                    🕒 {new Date(data.airQuality.timestamp).toLocaleString('en-GB')}
+                  </div>
+                </div>
                 ) : (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400 mb-3">No air quality alerts</div>
-                  {data?.airQuality && (
-                    <>
-                      <div className="text-sm text-slate-400 mb-2">
-                        AQI: {data.airQuality.aqi} • PM2.5: {data.airQuality.pm25} μg/m³
-                      </div>
-                      <div className="text-xs text-slate-500 mb-1">
-                        📍 {data.airQuality.location}
-                      </div>
-                      <div className="text-xs text-slate-600 mb-1">
-                        🕒 {new Date(data.airQuality.timestamp).toLocaleString('en-GB')}
-                      </div>
-
-                    </>
-                  )}
+                  <div className="text-sm text-slate-400 mb-3">No air quality data available</div>
                 </div>
                 )
               })()}
@@ -357,24 +357,24 @@ export function LiveDashboard() {
                     </div>
                   </div>
                   ))
+                ) : data?.waterLevels ? (
+                <div className="text-green-400 text-center">
+                  <div className="text-lg font-bold mb-1">Good</div>
+                  <div className="text-sm text-slate-400 mb-3">Water levels are safe</div>
+                  <div className="text-sm text-slate-400 mb-2">
+                    Level: {data.waterLevels.river_level}m
+                  </div>
+                  <div className="text-xs text-slate-500 mb-1">
+                    📍 {data.waterLevels.location}
+                  </div>
+                  <div className="text-xs text-slate-600 mb-1">
+                    🕒 {new Date(data.waterLevels.timestamp).toLocaleString('en-GB')}
+                  </div>
+                </div>
                 ) : (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400 mb-3">No water level alerts</div>
-                  {data?.waterLevels && (
-                    <>
-                      <div className="text-sm text-slate-400 mb-2">
-                        Level: {data.waterLevels.river_level}m
-                      </div>
-                      <div className="text-xs text-slate-500 mb-1">
-                        📍 {data.waterLevels.location}
-                      </div>
-                      <div className="text-xs text-slate-600 mb-1">
-                        🕒 {new Date(data.waterLevels.timestamp).toLocaleString('en-GB')}
-                      </div>
-
-                    </>
-                  )}
+                  <div className="text-sm text-slate-400 mb-3">No water level data available</div>
                 </div>
                 )
               })()}
@@ -419,24 +419,24 @@ export function LiveDashboard() {
                     </div>
                   </div>
                   ))
+                ) : data?.seismic ? (
+                <div className="text-green-400 text-center">
+                  <div className="text-lg font-bold mb-1">Good</div>
+                  <div className="text-sm text-slate-400 mb-3">Seismic activity is normal</div>
+                  <div className="text-sm text-slate-400 mb-2">
+                    Magnitude: {data.seismic.magnitude}M • Depth: {data.seismic.depth ? `${data.seismic.depth} (km)` : 'Unknown (km)'}
+                  </div>
+                  <div className="text-xs text-slate-500 mb-1">
+                    📍 {data.seismic.location}
+                  </div>
+                  <div className="text-xs text-slate-600 mb-1">
+                    🕒 {new Date(data.seismic.timestamp).toLocaleString('en-GB')}
+                  </div>
+                </div>
                 ) : (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400 mb-3">No seismic alerts</div>
-                  {data?.seismic && (
-                    <>
-                      <div className="text-sm text-slate-400 mb-2">
-                        Magnitude: {data.seismic.magnitude}M • Depth: {data.seismic.depth ? `${data.seismic.depth} (km)` : 'Unknown (km)'}
-                      </div>
-                      <div className="text-xs text-slate-500 mb-1">
-                        📍 {data.seismic.location}
-                      </div>
-                      <div className="text-xs text-slate-600 mb-1">
-                        🕒 {new Date(data.seismic.timestamp).toLocaleString('en-GB')}
-                      </div>
-
-                    </>
-                  )}
+                  <div className="text-sm text-slate-400 mb-3">No seismic data available</div>
                 </div>
                 )
               })()}
@@ -481,24 +481,24 @@ export function LiveDashboard() {
                     </div>
                   </div>
                   ))
+                ) : data?.advancedMetrics ? (
+                <div className="text-green-400 text-center">
+                  <div className="text-lg font-bold mb-1">Good</div>
+                  <div className="text-sm text-slate-400 mb-3">Environmental conditions are safe</div>
+                  <div className="text-sm text-slate-400 mb-2">
+                    Score: {typeof data.advancedMetrics.scoreDisplay === 'number' ? data.advancedMetrics.scoreDisplay.toFixed(1) : data.advancedMetrics.environmental_quality_score}/100 • UV: {typeof data.advancedMetrics.uvDisplay === 'number' ? data.advancedMetrics.uvDisplay.toFixed(1) : data.advancedMetrics.uv_index}
+                  </div>
+                  <div className="text-xs text-slate-500 mb-1">
+                    📍 {data.advancedMetrics.location}
+                  </div>
+                  <div className="text-xs text-slate-600 mb-1">
+                    🕒 {new Date(data.advancedMetrics.timestamp).toLocaleString('en-GB')}
+                  </div>
+                </div>
                 ) : (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400 mb-3">No environmental alerts</div>
-                  {data?.advancedMetrics && (
-                    <>
-                      <div className="text-sm text-slate-400 mb-2">
-                        Score: {typeof data.advancedMetrics.scoreDisplay === 'number' ? data.advancedMetrics.scoreDisplay.toFixed(1) : data.advancedMetrics.environmental_quality_score}/100 • UV: {typeof data.advancedMetrics.uvDisplay === 'number' ? data.advancedMetrics.uvDisplay.toFixed(1) : data.advancedMetrics.uv_index}
-                      </div>
-                      <div className="text-xs text-slate-500 mb-1">
-                        📍 {data.advancedMetrics.location}
-                      </div>
-                      <div className="text-xs text-slate-600 mb-1">
-                        🕒 {new Date(data.advancedMetrics.timestamp).toLocaleString('en-GB')}
-                      </div>
-
-                    </>
-                  )}
+                  <div className="text-sm text-slate-400 mb-3">No environmental data available</div>
                 </div>
                 )
               })()}

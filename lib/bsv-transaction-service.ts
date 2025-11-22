@@ -121,8 +121,7 @@ export class BSVTransactionService {
         type: data.type,
         timestamp: data.timestamp,
         location: data.location,
-        measurement: data.measurement,
-        source_hash: data.source_hash
+        measurement: data.measurement
       }
     }
     

@@ -341,36 +341,42 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
       } catch (e) {
         console.log(`⚠️ WAQI: Station index discovery failed:`, (e as Error).message)
       }
-      // Iterate WAQI stations by allowed countries using persisted registry
+      // If DB is disabled, skip DB querying entirely and use DB-less path
+      const dbDisabled = process.env.GAIALOG_NO_DB === 'true'
+      // Iterate WAQI stations by allowed countries using persisted registry (DB), when enabled
       const allow = (providerConfigs as any)?.waqi?.countries?.allow || []
       const countries = Array.isArray(allow) && allow.length > 0 ? allow : undefined
       const key = 'stations'
       let offset = 0
       let stations: any[] = []
-      try {
-        offset = await readCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key)
-        const pageSize = Number(process.env.WAQI_STATION_PAGE_SIZE || 150)
-        console.log(`📡 WAQI: Querying stations (provider=waqi, countries=${countries || 'ALL'}, offset=${offset}, limit=${pageSize})`)
-        stations = await getStationsByProviderPage({ provider: 'waqi', countries, offset, limit: pageSize })
-        console.log(`✅ WAQI: Found ${stations.length} stations from database`)
-        
-        // Auto-reset cursor if we've gone past the end
-        let nextOffset: number
-        if (stations.length === 0 && offset > 0) {
-          console.log(`🔄 WAQI: Reached end of stations (offset=${offset}), resetting cursor to 0`)
-          nextOffset = 0
-        } else if (stations.length < pageSize && stations.length > 0) {
-          // Partial page means we're near the end, wrap around
-          console.log(`🔄 WAQI: Partial page (${stations.length}/${pageSize}), wrapping cursor to 0`)
-          nextOffset = 0
-        } else {
-          nextOffset = offset + stations.length
+      if (!dbDisabled) {
+        try {
+          offset = await readCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key)
+          const pageSize = Number(process.env.WAQI_STATION_PAGE_SIZE || 150)
+          console.log(`📡 WAQI: Querying stations (provider=waqi, countries=${countries || 'ALL'}, offset=${offset}, limit=${pageSize})`)
+          stations = await getStationsByProviderPage({ provider: 'waqi', countries, offset, limit: pageSize })
+          console.log(`✅ WAQI: Found ${stations.length} stations from database`)
+          
+          // Auto-reset cursor if we've gone past the end
+          let nextOffset: number
+          if (stations.length === 0 && offset > 0) {
+            console.log(`🔄 WAQI: Reached end of stations (offset=${offset}), resetting cursor to 0`)
+            nextOffset = 0
+          } else if (stations.length < pageSize && stations.length > 0) {
+            // Partial page means we're near the end, wrap around
+            console.log(`🔄 WAQI: Partial page (${stations.length}/${pageSize}), wrapping cursor to 0`)
+            nextOffset = 0
+          } else {
+            nextOffset = offset + stations.length
+          }
+          
+          await writeCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key, nextOffset)
+        } catch (e) {
+          console.error(`❌ WAQI: Error fetching stations from database:`, e)
+          stations = []
         }
-        
-        await writeCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key, nextOffset)
-      } catch (e) {
-        console.error(`❌ WAQI: Error fetching stations from database:`, e)
-        stations = []
+      } else {
+        console.log('🗄️ WAQI: Database disabled (GAIALOG_NO_DB=true); using DB-less station index')
       }
 
       const items: any[] = []
@@ -568,7 +574,14 @@ export class USGSWorker extends BaseWorker {
   protected async collectData(): Promise<EnvironmentalData[]> {
     const data: EnvironmentalData[] = []
     try {
-      const batch = await collectSeismicDataBatch(6, 2.5)
+      // Read collection window and magnitude threshold from environment, with sensible defaults
+      const envHours = Number(process.env.USGS_TIME_WINDOW_HOURS)
+      const hours = Number.isFinite(envHours) && envHours > 0 ? envHours : 24
+      const envMinMag = Number(process.env.USGS_MIN_MAGNITUDE)
+      const minMag = Number.isFinite(envMinMag) && envMinMag >= 0 ? envMinMag : 2.0
+      const envMax = Number(process.env.USGS_MAX_RESULTS)
+      const maxResults = Number.isFinite(envMax) && envMax > 0 ? envMax : undefined
+      const batch = await collectSeismicDataBatch(hours, minMag, maxResults)
       for (const item of batch) {
         const measurement = {
           magnitude: item.magnitude,
