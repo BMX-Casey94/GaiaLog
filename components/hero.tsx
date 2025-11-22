@@ -86,8 +86,8 @@ export function Hero() {
     }
 
     fetchStats()
-    // Refresh every 15 seconds
-    const interval = setInterval(fetchStats, 15000)
+    // Refresh every 45 seconds to align with backend caching/rotation
+    const interval = setInterval(fetchStats, 45000)
     return () => clearInterval(interval)
   }, [])
 

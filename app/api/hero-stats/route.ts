@@ -46,6 +46,16 @@ export async function GET() {
       } catch (dbErr) {
         // Fast fallback: use WoC helpers with strict timeout and minimal calls
         try {
+          if (process.env.GAIALOG_DISABLE_WOC_READS === 'true') {
+            // Skip WoC reads entirely when disabled
+            return {
+              airQuality,
+              blockchain: {
+                totalTransactions: txCount,
+                lastTransaction: latestTx,
+              }
+            }
+          }
           const net = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
           const { findLatestByType, getAllWalletAddresses, fetchWalletTransactions } = await import('@/lib/woc-fetcher')
           

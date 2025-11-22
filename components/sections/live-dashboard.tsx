@@ -48,10 +48,39 @@ export function LiveDashboard() {
     // Process Air Quality - Only show moderate or worse
     if (data.airQuality) {
       const aqi = data.airQuality.aqi
+      const pm25 = Number(data.airQuality.pm25)
       let severity: 'low' | 'moderate' | 'high' | 'critical' = 'low'
-      if (aqi > 150) severity = 'critical'
-      else if (aqi > 100) severity = 'high'
-      else if (aqi > 50) severity = 'moderate'
+      
+      // Support both AQI scales:
+      // - 0–500 (US EPA/WAQI)
+      // - 1–5 (OpenWeather style: 1=Good, 5=Very Poor)
+      if (Number.isFinite(aqi)) {
+        if (aqi >= 0 && aqi <= 5) {
+          // 1–5 scale
+          if (aqi >= 5) severity = 'critical'
+          else if (aqi >= 4) severity = 'high'
+          else if (aqi >= 3) severity = 'moderate'
+        } else {
+          // 0–500 scale
+          if (aqi > 150) severity = 'critical'
+          else if (aqi > 100) severity = 'high'
+          else if (aqi > 50) severity = 'moderate'
+        }
+      }
+      
+      // Escalate based on PM2.5 if it's worse than AQI classification.
+      // Thresholds approximate EPA 24h guidance (µg/m³).
+      if (Number.isFinite(pm25)) {
+        const pmSeverity: 'low' | 'moderate' | 'high' | 'critical' =
+          pm25 > 55.4 ? 'critical'
+          : pm25 > 35.4 ? 'high'
+          : pm25 > 12 ? 'moderate'
+          : 'low'
+        const rank = { low: 0, moderate: 1, high: 2, critical: 3 } as const
+        if (rank[pmSeverity] > rank[severity]) {
+          severity = pmSeverity
+        }
+      }
       
       // Only add to alerts if it's moderate or worse
       if (severity !== 'low') {
@@ -213,8 +242,8 @@ export function LiveDashboard() {
 
   useEffect(() => {
     fetchData()
-    // Refresh every 25 seconds (respects WoC 3 RPS limit)
-    const interval = setInterval(fetchData, 25000)
+    // Refresh every 45 seconds to align with API cache TTL
+    const interval = setInterval(fetchData, 45000)
     return () => clearInterval(interval)
   }, [])
   return (

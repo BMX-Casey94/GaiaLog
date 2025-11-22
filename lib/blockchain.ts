@@ -32,6 +32,10 @@ const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.001)
 const DUST_LIMIT = 546
 const MIRROR_TO_WOC = process.env.BSV_MIRROR_TO_WOC === 'true'
 const WOC_MIRROR_MAX_RPS = 3
+// Optional low-fee WoC lane (limited throughput)
+const WOC_LOW_FEE_ENABLED = process.env.BSV_WOC_LOW_FEE_ENABLED === 'true'
+const WOC_LOW_FEE_FACTOR = Number(process.env.BSV_WOC_LOW_FEE_FACTOR || 0.1) // 10x reduction by default
+const WOC_LOW_FEE_TPS = Number(process.env.BSV_WOC_LOW_FEE_TPS || 2) // 2 TPS cap by default
 const MIN_SPEND_CONF = Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS || 1)
 const REFRESH_THRESHOLD = Number(process.env.BSV_UTXO_REFRESH_THRESHOLD || 10)
 
@@ -49,6 +53,9 @@ export class BSVWallet {
   private wif: string
   private address: string
   private network: string
+  // Simple in-memory balance cache (per address)
+  private static balanceCacheByAddress: Map<string, { value: number; ts: number }> = new Map()
+  private static readonly BALANCE_TTL_MS: number = Number(process.env.BSV_BALANCE_TTL_MS || 300000) // 5 minutes
 
   constructor(wif?: string) {
     const useWif = wif || BSV_PRIVATE_KEY || BSV_FALLBACK_WIF
@@ -83,11 +90,39 @@ export class BSVWallet {
 
   async getBalance(): Promise<number> {
     try {
+      // Return cached value if still fresh
+      const cached = BSVWallet.balanceCacheByAddress.get(this.address)
+      const now = Date.now()
+      if (cached && (now - cached.ts) < BSVWallet.BALANCE_TTL_MS) {
+        return cached.value
+      }
+
+      const headers: Record<string, string> = {}
+      if (WHATSONCHAIN_API_KEY) {
+        if (WHATSONCHAIN_API_KEY.startsWith('mainnet_') || WHATSONCHAIN_API_KEY.startsWith('testnet_')) {
+          headers['Authorization'] = WHATSONCHAIN_API_KEY
+        } else {
+          headers['woc-api-key'] = WHATSONCHAIN_API_KEY
+        }
+      }
+
+      // Add explicit timeout
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 10000)
       const response = await fetch(
-        `https://api.whatsonchain.com/v1/bsv/${WOC_NETWORK}/address/${this.address}/balance`
+        `https://api.whatsonchain.com/v1/bsv/${WOC_NETWORK}/address/${this.address}/balance`,
+        { headers, signal: controller.signal }
       )
+      clearTimeout(timeoutId)
 
       if (!response.ok) {
+        // On rate limit or server issues, fall back to cached or 0 without noisy logs
+        if (response.status === 429 || response.status >= 500) {
+          if (cached && (now - cached.ts) < BSVWallet.BALANCE_TTL_MS) {
+            return cached.value
+          }
+          return 0
+        }
         throw new Error(`Failed to fetch balance: ${response.statusText}`)
       }
 
@@ -95,10 +130,18 @@ export class BSVWallet {
       const confirmedSats = (data && typeof data.confirmed === 'number') ? data.confirmed : 0
       // Return balance in BSV (float) for display, but use UTXOs for spend checks
       const balanceBsv = confirmedSats / 100000000
+      BSVWallet.balanceCacheByAddress.set(this.address, { value: balanceBsv, ts: Date.now() })
       return balanceBsv
     } catch (error) {
-      console.error('Error fetching wallet balance:', error)
-      throw error
+      // Suppress noisy logs for expected throttling; only log unexpected errors in debug mode
+      const msg = error instanceof Error ? error.message : String(error)
+      const throttled = /Failed to fetch|timeout|Too Many Requests|AbortError/i.test(msg)
+      if (!throttled && bsvConfig.logging.level === 'debug') {
+        console.error('Error fetching wallet balance:', error)
+      }
+      // Use cached or 0 as safe fallback
+      const cached = BSVWallet.balanceCacheByAddress.get(this.address)
+      return cached ? cached.value : 0
     }
   }
 
@@ -117,6 +160,8 @@ export class BlockchainService {
   private wifsForSend: string[] = []
   private rrIndex: number = 0
   private wocMirrorTimestamps: number[] = []
+  // Shared limiter for all WoC tx/raw POSTs (low-fee lane + mirror)
+  private wocTxRawTimestamps: number[] = []
   private broadcastCountSinceLastSample = 0
   // Lightweight per-address UTXO cache to avoid hammering indexers
   private utxoCacheByAddress: Map<string, {
@@ -211,11 +256,11 @@ export class BlockchainService {
         const addr = sdkKey.toPublicKey().toAddress().toString()
         const spendable = await this.getSpendableUtxos(addr, wif)
         
-        // Try to get balance for diagnostics
+        // Estimate balance from spendable UTXOs for diagnostics (avoid extra WoC calls)
         let balance: number | undefined
         try {
-          const tempWallet = new BSVWallet(wif)
-          balance = await tempWallet.getBalance()
+          const totalSats = spendable.reduce((sum: number, u: any) => sum + (u.value || 0), 0)
+          balance = totalSats / 100000000
         } catch {}
         
         diagnostics.push({
@@ -494,18 +539,21 @@ export class BlockchainService {
       const opReturnScript = (bsv as any).Script.fromHex(scriptHex)
 
       // Create transaction using library helpers for fee/change handling
-      const transaction = new (bsv as any).Transaction()
-        .from(bitcoreUtxos)
-        .addOutput(new bsv.Transaction.Output({
-          script: opReturnScript,
-          satoshis: useTrueReturn ? 1 : 0,
-        }))
-        .change(address)
-        .feePerKb(FEE_RATE_SAT_PER_BYTE * 1000)
-      const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
-      transaction.sign(signingKey)
+      const buildSerialized = (feeMultiplier: number): string => {
+        const tx = new (bsv as any).Transaction()
+          .from(bitcoreUtxos)
+          .addOutput(new bsv.Transaction.Output({
+            script: opReturnScript,
+            satoshis: useTrueReturn ? 1 : 0,
+          }))
+          .change(address)
+          .feePerKb(FEE_RATE_SAT_PER_BYTE * 1000 * feeMultiplier)
+        const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
+        tx.sign(signingKey)
+        return tx.serialize()
+      }
 
-      // Broadcast transaction
+      // Broadcast transaction (prefer WoC low-fee lane when enabled and capacity available)
       // Prevent double-use of the same cached UTXOs across rapid sends
       let reservedKeys: string[] = []
       try {
@@ -513,7 +561,21 @@ export class BlockchainService {
           reservedKeys = bitcoreUtxos.map((i: any) => `${i.txId}:${i.outputIndex}`)
           this.markUtxosUsed(reservedKeys)
         }
-        const txid = await this.broadcastTransaction(transaction.serialize())
+        let txid: string
+        const canUseLowFee = WOC_LOW_FEE_ENABLED && this.canTakeWocTxRawSlot()
+        try {
+          if (canUseLowFee) {
+            const lowFeeHex = buildSerialized(Math.max(WOC_LOW_FEE_FACTOR, 0.01))
+            txid = await this.broadcastViaWocOnly(lowFeeHex)
+          } else {
+            const normalHex = buildSerialized(1)
+            txid = await this.broadcastTransaction(normalHex)
+          }
+        } catch (_e) {
+          // Fallback to normal broadcast path on any failure
+          const normalHex = buildSerialized(1)
+          txid = await this.broadcastTransaction(normalHex)
+        }
 
         // Log transaction
       const transactionLog: TransactionLog = {
@@ -605,6 +667,38 @@ export class BlockchainService {
       
       throw error
     }
+  }
+
+  /**
+   * Reserve a WoC tx/raw POST slot if available within the 1s window.
+   * Returns true when reserved, false when capacity is exhausted.
+   */
+  private canTakeWocTxRawSlot(): boolean {
+    const now = Date.now()
+    const capacity = WOC_LOW_FEE_ENABLED ? WOC_LOW_FEE_TPS : WOC_MIRROR_MAX_RPS
+    this.wocTxRawTimestamps = this.wocTxRawTimestamps.filter(t => now - t < 1000)
+    if (this.wocTxRawTimestamps.length >= capacity) return false
+    this.wocTxRawTimestamps.push(now)
+    return true
+  }
+
+  /**
+   * Direct WoC broadcast (tx/raw). Caller must acquire slot first via canTakeWocTxRawSlot.
+   */
+  private async broadcastViaWocOnly(serializedTx: string): Promise<string> {
+    const wocNet = WOC_NETWORK
+    const wocRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txhex: serializedTx })
+    })
+    const wocText = await wocRes.text().catch(() => '')
+    if (wocRes.ok) {
+      const txid = (wocText || '').replace(/"/g, '').trim()
+      if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+      throw new Error(`WOC returned invalid txid: ${wocText}`)
+    }
+    throw new Error(`WOC failed (${wocRes.status})`)
   }
 
   private async refreshUtxoCache(address: string, wif: string): Promise<void> {
@@ -827,19 +921,14 @@ export class BlockchainService {
             const parsed = JSON.parse(lastArcText || '{}')
             if (parsed && typeof parsed.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(parsed.txid)) {
               // Optional mirror to WOC
-              if (MIRROR_TO_WOC) {
+              if (MIRROR_TO_WOC && this.canTakeWocTxRawSlot()) {
                 try {
-                  const now = Date.now()
-                  this.wocMirrorTimestamps = this.wocMirrorTimestamps.filter(t => now - t < 1000)
-                  if (this.wocMirrorTimestamps.length < WOC_MIRROR_MAX_RPS) {
-                    this.wocMirrorTimestamps.push(now)
-                    const wocNet = WOC_NETWORK
-                    fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ txhex: serializedTx })
-                    }).catch(() => {})
-                  }
+                  const wocNet = WOC_NETWORK
+                  fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ txhex: serializedTx })
+                  }).catch(() => {})
                 } catch {}
               }
               return parsed.txid
@@ -848,19 +937,14 @@ export class BlockchainService {
           // Some ARC deployments return plain string txid
           const txid = (lastArcText || '').replace(/"/g, '').trim()
           if (/^[0-9a-fA-F]{64}$/.test(txid)) {
-            if (MIRROR_TO_WOC) {
+            if (MIRROR_TO_WOC && this.canTakeWocTxRawSlot()) {
               try {
-                const now = Date.now()
-                this.wocMirrorTimestamps = this.wocMirrorTimestamps.filter(t => now - t < 1000)
-                if (this.wocMirrorTimestamps.length < WOC_MIRROR_MAX_RPS) {
-                  this.wocMirrorTimestamps.push(now)
-                  const wocNet = WOC_NETWORK
-                  fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ txhex: serializedTx })
-                  }).catch(() => {})
-                }
+                const wocNet = WOC_NETWORK
+                fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ txhex: serializedTx })
+                }).catch(() => {})
               } catch {}
             }
             return txid

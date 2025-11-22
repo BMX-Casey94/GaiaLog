@@ -22,6 +22,42 @@ interface TxLogRecord {
 export async function GET(req: NextRequest) {
   const network = getBSVNetwork()
   try {
+    // Preferred: Use in-memory broadcast log for fresh TXIDs (no external reads)
+    // Always pick the most recent per type; remain fixed until new data appears
+    const local = blockchainService.getLocalTransactionLog()
+    if (Array.isArray(local) && local.length > 0) {
+      const wanted: Array<'air_quality' | 'water_levels' | 'seismic_activity' | 'advanced_metrics'> = [
+        'air_quality', 'water_levels', 'seismic_activity', 'advanced_metrics'
+      ]
+      const readings = wanted.map((type) => {
+        const items = local
+          .filter((t) =>
+            t.stream === type &&
+            t.txid &&
+            t.txid !== 'failed' &&
+            isValidTxId(t.txid) &&
+            (t.status === 'pending' || t.status === 'confirmed')
+          )
+          // Prefer most recent broadcasts
+          .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+        if (items.length === 0) return null
+        const pick = items[0]
+        return {
+          txid: pick.txid,
+          type,
+          timestamp: new Date(pick.timestamp || Date.now()).toISOString(),
+          status: pick.status,
+          data: {
+            provider: (pick.payload && (pick.payload.source || pick.payload.provider)) || 'unknown',
+          },
+        }
+      }).filter(Boolean) as any[]
+      
+      if (readings.length > 0) {
+        return NextResponse.json({ success: true, network, readings, source: 'local-log' })
+      }
+    }
+
     // Prefer DB when available (will be short-circuited to empty when GAIALOG_NO_DB=true)
     const result = await query<TxLogRecord>(
       `SELECT DISTINCT ON (type)
@@ -59,6 +95,11 @@ export async function GET(req: NextRequest) {
         }))
         .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
       return NextResponse.json({ success: true, network, readings })
+    }
+
+    // If WoC reads are disabled, return empty rather than hitting WoC
+    if (process.env.GAIALOG_DISABLE_WOC_READS === 'true') {
+      return NextResponse.json({ success: true, network, readings: [] })
     }
 
     // Fallback: fast WoC lookup for latest of each type (no DB)
