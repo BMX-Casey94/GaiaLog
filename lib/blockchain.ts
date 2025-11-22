@@ -33,6 +33,7 @@ const DUST_LIMIT = 546
 const MIRROR_TO_WOC = process.env.BSV_MIRROR_TO_WOC === 'true'
 const MIRROR_TO_ARC = process.env.BSV_MIRROR_TO_ARC === 'true'
 const WOC_FIRST = process.env.BSV_WOC_FIRST === 'true'
+const WOC_ONLY = process.env.BSV_WOC_ONLY === 'true'
 const WOC_MIRROR_MAX_RPS = 3
 // Optional low-fee WoC lane (limited throughput)
 const WOC_LOW_FEE_ENABLED = process.env.BSV_WOC_LOW_FEE_ENABLED === 'true'
@@ -431,24 +432,12 @@ export class BlockchainService {
         }
       } catch {}
 
-      // Attach corporate verification fields: db_source_hash (if provided) and payload_sha256
-      let payloadWithHashes = payloadWithAscii
-      try {
-        const { sha256CanonicalHex, stringifyCanonical } = await import('./utils')
-        const canon = stringifyCanonical(payloadWithAscii)
-        const digest = await sha256CanonicalHex(payloadWithAscii)
-        payloadWithHashes = {
-          ...((JSON.parse(canon) as any) || payloadWithAscii),
-          payload_sha256: digest
-        }
-      } catch {}
-
       const providerValue = (data as any)?.payload?.source || 'unknown'
       const base: any = {
         app: APP_NAME,
         data_type: data.stream,
         timestamp: data.timestamp,
-        payload: payloadWithHashes,
+        payload: payloadWithAscii,
       }
       // Omit provider for advanced_metrics payloads (per request)
       if (data.stream !== 'advanced_metrics') {
@@ -580,7 +569,7 @@ export class BlockchainService {
         }
         let txid: string
         try {
-          if (WOC_FIRST || WOC_LOW_FEE_ENABLED) {
+          if (WOC_FIRST || WOC_LOW_FEE_ENABLED || WOC_ONLY) {
             // Throttled WoC-first path: wait for slot, then prefer WoC with low-fee factor when enabled
             await this.waitForWocSlot()
             const feeFactor = WOC_LOW_FEE_ENABLED ? Math.max(WOC_LOW_FEE_FACTOR, 0.01) : 1
@@ -594,6 +583,9 @@ export class BlockchainService {
               try {
                 txid = await this.broadcastViaWocOnly(woCHex2)
               } catch {
+                if (WOC_ONLY) {
+                  throw new Error('WoC-only mode: WoC broadcast failed after retries')
+                }
                 const normalHex = buildSerialized(1)
                 txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
               }
@@ -605,6 +597,9 @@ export class BlockchainService {
           }
         } catch (_e) {
           // Final fallback to normal path if anything else blew up
+          if (WOC_ONLY) {
+            throw _e
+          }
           const normalHex = buildSerialized(1)
           txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
         }
@@ -966,7 +961,7 @@ export class BlockchainService {
     let lastArcText: string | undefined
 
     // Optional Method 0: WhatOnChain first (cost-optimised, throttled)
-    if (WOC_FIRST) {
+    if (WOC_FIRST || WOC_ONLY) {
       try {
         await this.waitForWocSlot()
         const wocNet = WOC_NETWORK
@@ -981,9 +976,15 @@ export class BlockchainService {
           if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
         } else {
           errors.push(`WhatOnChain failed (${wocRes.status})`)
+          if (WOC_ONLY) {
+            throw new Error(`WoC-only mode: WhatOnChain failed (${wocRes.status})`)
+          }
         }
       } catch (e) {
         errors.push(`WhatOnChain error: ${e instanceof Error ? e.message : String(e)}`)
+        if (WOC_ONLY) {
+          throw new Error(`WoC-only mode: ${e instanceof Error ? e.message : String(e)}`)
+        }
       }
     }
 
