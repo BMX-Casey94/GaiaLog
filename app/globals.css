@@ -142,3 +142,109 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Device-specific adjustments for GaiaLog Dashboard on mobile */
+/* Overriding bottom positioning to push the dashboard down (smaller bottom value = closer to bottom = pushed down) */
+/* Adding padding-bottom to Hero content to ensure dashboard isn't clipped */
+
+/* iPhone SE (375x667) */
+@media only screen 
+  and (min-device-width: 375px) 
+  and (max-device-width: 375px) 
+  and (min-device-height: 667px) 
+  and (max-device-height: 667px) 
+  and (-webkit-device-pixel-ratio: 2) {
+  .hero-dashboard {
+    bottom: 0rem !important; /* Adjust as needed */
+  }
+  .hero-content-wrapper {
+    padding-bottom: 6rem !important; /* Increased to prevent clipping */
+  }
+}
+
+/* Samsung Galaxy S8+ (360x740) */
+@media only screen 
+  and (min-device-width: 360px) 
+  and (max-device-width: 360px) 
+  and (min-device-height: 740px) 
+  and (max-device-height: 740px) 
+  and (-webkit-device-pixel-ratio: 4) {
+  .hero-dashboard {
+    bottom: -2rem !important; /* Adjust as needed */
+  }
+  .hero-content-wrapper {
+    padding-bottom: 3rem !important; /* Extra space at bottom to prevent clipping */
+  }
+}
+
+/* Surface Duo (540x720) */
+@media only screen 
+  and (min-device-width: 540px) 
+  and (max-device-width: 540px) 
+  and (min-device-height: 720px) 
+  and (max-device-height: 720px) {
+  .hero-dashboard {
+    bottom: -5rem !important; /* Push down more */
+  }
+  .hero-content-wrapper {
+    padding-bottom: 8rem !important; /* Extra space for -5rem push-down + buffer */
+  }
+}
+
+/* Nest Hub (1024x600 in landscape, typically) - Small adjustment */
+@media only screen 
+  and (min-device-width: 1024px) 
+  and (max-device-width: 1024px) 
+  and (min-device-height: 600px) 
+  and (max-device-height: 600px) {
+  .hero-dashboard {
+    bottom: -1.5rem !important; /* Small adjustment - pushed down */
+  }
+  .hero-content-wrapper {
+    padding-bottom: 4.5rem !important; /* Extra space for -1.5rem push-down + buffer */
+  }
+}
+
+/* Alternative approach for more flexible viewport-based targeting */
+@media only screen and (max-width: 375px) and (max-height: 667px) {
+  .hero-dashboard {
+    bottom: -8rem !important;
+  }
+  .hero-content-wrapper {
+    padding-bottom: 11rem !important; /* Extra space for -8rem push-down + buffer */
+  }
+}
+
+@media only screen and (min-width: 376px) and (max-width: 389px) and (min-height: 800px) {
+  .hero-dashboard {
+    bottom: -4rem !important;
+  }
+  .hero-content-wrapper {
+    padding-bottom: 7rem !important; /* Extra space for -4rem push-down + buffer */
+  }
+}
+
+/* iPhone 12 Pro (390x844) - Small adjustment - Placed after alternative query to ensure it takes precedence */
+@media only screen 
+  and (min-device-width: 390px) 
+  and (max-device-width: 390px) 
+  and (min-device-height: 844px) 
+  and (max-device-height: 844px) 
+  and (-webkit-device-pixel-ratio: 3) {
+  .hero-dashboard {
+    bottom: 1rem !important; /* Brought up to close gap with button above */
+  }
+  .hero-content-wrapper {
+    padding-bottom: 3rem !important; /* Reduced padding since dashboard is higher */
+  }
+}
+
+/* Also target iPhone 12 Pro using viewport dimensions as fallback */
+@media only screen and (min-width: 390px) and (max-width: 390px) and (min-height: 844px) and (max-height: 844px) {
+  .hero-dashboard {
+    bottom: 1rem !important; /* Brought up to close gap with button above */
+  }
+  .hero-content-wrapper {
+    padding-bottom: 3rem !important; /* Reduced padding since dashboard is higher */
+  }
+}

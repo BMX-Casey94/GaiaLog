@@ -247,7 +247,7 @@ export function LiveDashboard() {
     return () => clearInterval(interval)
   }, [])
   return (
-    <section id="monitoring" className="py-20 px-4 sm:px-6 lg:px-8 relative">
+    <section id="monitoring" className="py-20 px-4 sm:px-6 lg:px-8 relative live-dashboard-section">
       <div className="absolute inset-0 bg-gradient-to-b from-slate-950/50 via-slate-900/30 to-black/80 pointer-events-none"></div>
       <div className="relative">
         <div className="max-w-7xl mx-auto">

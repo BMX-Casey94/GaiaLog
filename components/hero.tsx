@@ -153,7 +153,7 @@ export function Hero() {
     window.scrollTo({ top: baseTop + extraOffsetPx, behavior: "smooth" })
   }
   return (
-    <div className="relative overflow-hidden h-screen">
+    <div className="relative overflow-hidden h-screen hero-section-container">
       <div
         className="absolute inset-0"
         style={{
@@ -177,17 +177,18 @@ export function Hero() {
         </div>
       </div>
 
-      <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-12 md:pt-20 pb-16 h-full flex flex-col justify-start md:justify-center">
+      <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-12 md:pt-20 pb-16 h-full flex flex-col justify-start md:justify-center hero-content-wrapper">
         <div className="text-center mb-10 md:mb-16 mt-12 md:mt-0">
           <h1 className="text-4xl md:text-6xl lg:text-7xl font-bold text-white mb-6 relative z-20">
             <span className="text-white">GaiaLog</span>
           </h1>
 
-          <p className="text-lg text-slate-300 mb-2 max-w-3xl mx-auto leading-relaxed relative z-20">
-            Immutable environmental data, live from air, water, fire and seismic sensors.
+          <p className="text-sm md:text-lg text-slate-300 mb-2 max-w-3xl mx-auto leading-relaxed relative z-20">
+            Immutable environmental data, live from{' '}
+            <span className="block md:inline">air, water, fire and seismic sensors.</span>
           </p>
 
-          <p className="text-base text-slate-400 mb-8 max-w-4xl mx-auto relative z-20">
+          <p className="hidden md:block text-base text-slate-400 mb-8 max-w-4xl mx-auto relative z-20">
             Every measurement recorded on the BSV blockchain for transparency and verification.
           </p>
 
@@ -211,7 +212,7 @@ export function Hero() {
           </div>
         </div>
 
-        <div className="absolute bottom-12 md:bottom-16 left-1/2 transform -translate-x-1/2 max-w-5xl w-full px-4 z-20">
+        <div className="hero-dashboard absolute bottom-12 md:bottom-16 left-1/2 transform -translate-x-1/2 max-w-5xl w-full px-4 z-20">
           <div className="p-6">
             <div className="flex items-center space-x-2 mb-4">
               <div className="w-3 h-3 bg-red-500 rounded-full" />
