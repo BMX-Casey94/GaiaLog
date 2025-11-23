@@ -43,6 +43,7 @@ export const EvervaultCard = ({
       <div
         onMouseMove={onMouseMove}
         className="group/card rounded-lg w-full relative overflow-hidden bg-transparent flex items-center justify-center h-full"
+        style={{ touchAction: 'pan-y' }}
       >
         {mounted && <CardPattern mouseX={mouseX} mouseY={mouseY} randomString={randomString} />}
         <div className="relative z-10 w-full h-full">{children}</div>

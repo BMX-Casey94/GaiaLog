@@ -141,6 +141,12 @@
   body {
     @apply bg-background text-foreground;
   }
+  
+  /* Allow touch scrolling on cards */
+  [data-glow],
+  .group\/card {
+    touch-action: pan-y;
+  }
 }
 
 /* Device-specific adjustments for GaiaLog Dashboard on mobile */
