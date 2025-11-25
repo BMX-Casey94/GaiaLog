@@ -3,7 +3,11 @@ import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
 // DB write via repositories (Postgres)
 import { upsertTxLog } from './repositories'
 import { bsvConfig } from './bsv-config'
-import { APP_NAME } from './constants'
+import { APP_NAME, SCHEMA_VERSION } from './constants'
+// Data credibility features
+import { dataValidator, qualityScorer } from './validation'
+import { createCredibilityBuilder } from './pipeline-integrity'
+import type { CredibilityMetadata } from './types/credibility'
 
 // Types
 export interface BlockchainData {
@@ -39,8 +43,15 @@ const WOC_MIRROR_MAX_RPS = 3
 const WOC_LOW_FEE_ENABLED = process.env.BSV_WOC_LOW_FEE_ENABLED === 'true'
 const WOC_LOW_FEE_FACTOR = Number(process.env.BSV_WOC_LOW_FEE_FACTOR || 0.1) // 10x reduction by default
 const WOC_LOW_FEE_TPS = Number(process.env.BSV_WOC_LOW_FEE_TPS || 2) // 2 TPS cap by default
+// WoC cooldown configuration (auto-fallback to ARC on repeated failures)
+const WOC_COOLDOWN_THRESHOLD = Number(process.env.BSV_WOC_COOLDOWN_THRESHOLD || 3) // failures before cooldown
+const WOC_COOLDOWN_DURATION_MS = Number(process.env.BSV_WOC_COOLDOWN_DURATION_MS || 75000) // 75s cooldown
 const MIN_SPEND_CONF = Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS || 1)
 const REFRESH_THRESHOLD = Number(process.env.BSV_UTXO_REFRESH_THRESHOLD || 10)
+
+// Data credibility features (opt-in for now)
+const ENABLE_CREDIBILITY = process.env.GAIALOG_ENABLE_CREDIBILITY === 'true'
+const REQUIRE_VALIDATION = process.env.GAIALOG_REQUIRE_VALIDATION === 'true'
 
 // Optional UTXO fetch controls and lightweight pooling (defaults keep current behaviour)
 const ENABLE_UTXO_POOL = process.env.BSV_ENABLE_UTXO_POOL === 'true'
@@ -176,6 +187,9 @@ export class BlockchainService {
   // Transaction status aggregation to reduce log noise
   private txStatusBatch: { confirmed: string[], pending: string[], notFound: string[] } = { confirmed: [], pending: [], notFound: [] }
   private batchIntervalId: NodeJS.Timeout | null = null
+  // WoC cooldown tracking (auto-fallback to ARC on repeated failures)
+  private wocConsecutiveFailures = 0
+  private wocCooldownUntil = 0
 
   constructor() {
     try {
@@ -240,6 +254,76 @@ export class BlockchainService {
         this.txStatusBatch = { confirmed: [], pending: [], notFound: [] }
       }
     }, 60000) // Every 60 seconds
+  }
+
+  /**
+   * Check if WoC is currently in cooldown mode
+   */
+  private isWocInCooldown(): boolean {
+    if (this.wocCooldownUntil > 0 && Date.now() < this.wocCooldownUntil) {
+      return true
+    }
+    // Cooldown expired, reset
+    if (this.wocCooldownUntil > 0 && Date.now() >= this.wocCooldownUntil) {
+      console.log('🔄 WoC cooldown expired, re-enabling WoC broadcasting')
+      this.wocCooldownUntil = 0
+      this.wocConsecutiveFailures = 0
+    }
+    return false
+  }
+
+  /**
+   * Record a WoC failure and potentially trigger cooldown
+   */
+  private recordWocFailure(): void {
+    this.wocConsecutiveFailures++
+    if (this.wocConsecutiveFailures >= WOC_COOLDOWN_THRESHOLD) {
+      this.wocCooldownUntil = Date.now() + WOC_COOLDOWN_DURATION_MS
+      console.warn(`⚠️ WoC hit ${this.wocConsecutiveFailures} consecutive failures, entering cooldown for ${WOC_COOLDOWN_DURATION_MS / 1000}s (using ARC fallback)`)
+    }
+  }
+
+  /**
+   * Record a WoC success, resetting the failure counter
+   */
+  private recordWocSuccess(): void {
+    if (this.wocConsecutiveFailures > 0) {
+      console.log(`✅ WoC recovered after ${this.wocConsecutiveFailures} failure(s), resetting counter`)
+    }
+    this.wocConsecutiveFailures = 0
+  }
+
+  /**
+   * Get current WoC cooldown status (for monitoring/debugging)
+   */
+  public getWocCooldownStatus(): {
+    inCooldown: boolean
+    consecutiveFailures: number
+    cooldownRemainingMs: number
+    cooldownThreshold: number
+    cooldownDurationMs: number
+  } {
+    const now = Date.now()
+    const inCooldown = this.wocCooldownUntil > 0 && now < this.wocCooldownUntil
+    return {
+      inCooldown,
+      consecutiveFailures: this.wocConsecutiveFailures,
+      cooldownRemainingMs: inCooldown ? this.wocCooldownUntil - now : 0,
+      cooldownThreshold: WOC_COOLDOWN_THRESHOLD,
+      cooldownDurationMs: WOC_COOLDOWN_DURATION_MS,
+    }
+  }
+
+  /**
+   * Manually reset WoC cooldown (for admin/debugging)
+   */
+  public resetWocCooldown(): void {
+    const wasInCooldown = this.wocCooldownUntil > 0 && Date.now() < this.wocCooldownUntil
+    this.wocCooldownUntil = 0
+    this.wocConsecutiveFailures = 0
+    if (wasInCooldown) {
+      console.log('🔧 WoC cooldown manually reset by admin')
+    }
   }
 
   private async getFirstWalletWithSpendableUtxos(): Promise<{ wif: string; index: number; address: string; utxos: any[] } | null> {
@@ -433,8 +517,49 @@ export class BlockchainService {
       } catch {}
 
       const providerValue = (data as any)?.payload?.source || 'unknown'
+      
+      // Build credibility metadata if enabled
+      let credibilityMeta: CredibilityMetadata | undefined
+      if (ENABLE_CREDIBILITY) {
+        try {
+          const credBuilder = createCredibilityBuilder(
+            (data as any)?.payload?.timestamp || new Date().toISOString()
+          )
+          
+          // Record fetch stage
+          credBuilder.recordFetch(providerValue, data.payload)
+          
+          // Validate the data
+          const validationResult = dataValidator.validate(data.stream, data.payload || {})
+          credBuilder.recordValidation(data.payload, validationResult)
+          
+          // If validation required and failed, log warning
+          if (REQUIRE_VALIDATION && !validationResult.valid) {
+            console.warn(`⚠️ Data validation failed for ${data.stream}:`, validationResult.errors)
+            // Still proceed but mark as failed validation
+          }
+          
+          // Calculate quality score
+          const qualityScore = qualityScorer.calculateScore(
+            data.payload || {},
+            validationResult,
+            providerValue
+          )
+          credBuilder.recordQualityScore(validationResult, qualityScore)
+          
+          // Record transformation stage
+          credBuilder.recordTransformation(data.payload, payloadWithAscii, 'payload_sanitisation')
+          
+          // Build final metadata
+          credibilityMeta = credBuilder.build()
+        } catch (credErr) {
+          console.warn('⚠️ Credibility metadata generation failed:', credErr)
+        }
+      }
+      
       const base: any = {
         app: APP_NAME,
+        schema_version: SCHEMA_VERSION,
         data_type: data.stream,
         timestamp: data.timestamp,
         payload: payloadWithAscii,
@@ -442,6 +567,10 @@ export class BlockchainService {
       // Omit provider for advanced_metrics payloads (per request)
       if (data.stream !== 'advanced_metrics') {
         base.provider = providerValue
+      }
+      // Add credibility metadata if generated
+      if (credibilityMeta) {
+        base._credibility = credibilityMeta
       }
       const opReturnData = JSON.stringify(base)
 
@@ -569,27 +698,40 @@ export class BlockchainService {
         }
         let txid: string
         try {
-          if (WOC_FIRST || WOC_LOW_FEE_ENABLED || WOC_ONLY) {
+          // Check if WoC is in cooldown - if so, use ARC directly
+          const wocInCooldown = this.isWocInCooldown()
+          
+          if ((WOC_FIRST || WOC_LOW_FEE_ENABLED || WOC_ONLY) && !wocInCooldown) {
             // Throttled WoC-first path: wait for slot, then prefer WoC with low-fee factor when enabled
             await this.waitForWocSlot()
             const feeFactor = WOC_LOW_FEE_ENABLED ? Math.max(WOC_LOW_FEE_FACTOR, 0.01) : 1
             const woCHex = buildSerialized(feeFactor)
             try {
               txid = await this.broadcastViaWocOnly(woCHex)
+              this.recordWocSuccess()
             } catch {
               // Retry WoC once more after a brief wait, then fall back
               await this.waitForWocSlot()
               const woCHex2 = buildSerialized(feeFactor)
               try {
                 txid = await this.broadcastViaWocOnly(woCHex2)
+                this.recordWocSuccess()
               } catch {
-                if (WOC_ONLY) {
+                this.recordWocFailure()
+                // In WOC_ONLY mode, still allow ARC fallback during cooldown
+                if (WOC_ONLY && !this.isWocInCooldown()) {
                   throw new Error('WoC-only mode: WoC broadcast failed after retries')
                 }
+                // Fall back to ARC (either normally or during WoC cooldown)
+                console.log(`🔄 Falling back to ARC broadcast${this.isWocInCooldown() ? ' (WoC in cooldown)' : ''}`)
                 const normalHex = buildSerialized(1)
                 txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
               }
             }
+          } else if (wocInCooldown) {
+            // WoC is in cooldown, use ARC directly
+            const normalHex = buildSerialized(1)
+            txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
           } else {
             // Legacy behavior when not using WoC-first or low-fee lane
             const normalHex = buildSerialized(1)
@@ -597,7 +739,7 @@ export class BlockchainService {
           }
         } catch (_e) {
           // Final fallback to normal path if anything else blew up
-          if (WOC_ONLY) {
+          if (WOC_ONLY && !this.isWocInCooldown()) {
             throw _e
           }
           const normalHex = buildSerialized(1)

@@ -25,3 +25,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# explorer data (JSON index files)
+/data/*
+!/data/.gitkeep

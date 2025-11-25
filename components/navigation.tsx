@@ -1,11 +1,12 @@
 "use client"
 
-import { BarChart3, Link2, Database, HelpCircle, Home } from "lucide-react"
+import { BarChart3, Link2, Database, HelpCircle, Home, Search } from "lucide-react"
 import { NavBar } from "@/components/ui/tubelight-navbar"
 
 export function Navigation() {
   const navItems = [
     { name: "Home", url: "/", icon: Home },
+    { name: "Data Explorer", url: "/explorer", icon: Search },
     { name: "Live Alerts", url: "#monitoring", icon: BarChart3 },
     { name: "Blockchain Explorer", url: "#blockchain", icon: Link2 },
     { name: "Data Sources", url: "#data-sources", icon: Database },
