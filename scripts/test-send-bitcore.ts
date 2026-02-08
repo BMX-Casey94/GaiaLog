@@ -79,7 +79,7 @@ async function main() {
     .sign(priv)
 
   const txhex = tx.serialize()
-  const arcEndpoint = process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc'
+  const arcEndpoint = process.env.BSV_API_ENDPOINT || 'https://arc.taal.com'
   const arcKey = process.env.BSV_ARC_API_KEY
   if (!arcKey) throw new Error('BSV_ARC_API_KEY missing')
   const txid = await broadcastArc(arcEndpoint, arcKey, txhex)

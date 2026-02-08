@@ -22,8 +22,8 @@ async function main() {
   const forceTest = arcKey.startsWith('testnet_')
   const net = forceTest ? 'test' : (process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test')
   const arcEndpoint = process.env.BSV_NETWORK === 'mainnet'
-    ? (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc')
-    : (process.env.BSV_TESTNET_API_ENDPOINT || 'https://api.taal.com/arc')
+    ? (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com')
+    : (process.env.BSV_TESTNET_API_ENDPOINT || 'https://arc-test.taal.com')
   const wif = process.env.BSV_PRIVATE_KEY || process.env.BSV_WALLET_1_PRIVATE_KEY || ''
   if (!wif) throw new Error('No WIF found in env')
 

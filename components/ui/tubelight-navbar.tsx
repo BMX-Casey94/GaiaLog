@@ -1,8 +1,9 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { motion } from "framer-motion"
 import Link from "next/link"
+import { usePathname, useRouter } from "next/navigation"
 import type { LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -18,18 +19,127 @@ interface NavBarProps {
 }
 
 export function NavBar({ items, className }: NavBarProps) {
-  const [activeTab, setActiveTab] = useState(items[0].name)
-  const [isMobile, setIsMobile] = useState(false)
+  const pathname = usePathname()
+  const router = useRouter()
+
+  const sectionIdToName = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const item of items) {
+      const idx = item.url.indexOf("#")
+      if (idx >= 0) {
+        const id = item.url.slice(idx + 1)
+        if (id) map.set(id, item.name)
+      }
+    }
+    return map
+  }, [items])
+
+  const [activeTab, setActiveTab] = useState(() => {
+    // Prefer route-derived state for non-home pages.
+    if (pathname?.startsWith("/explorer")) return "Data Explorer"
+    if (pathname !== "/") return items[0]?.name ?? "Home"
+
+    if (typeof window !== "undefined") {
+      const id = window.location.hash?.replace(/^#/, "")
+      if (id && sectionIdToName.has(id)) return sectionIdToName.get(id) as string
+    }
+    return items[0]?.name ?? "Home"
+  })
+
+  const observerRef = useRef<IntersectionObserver | null>(null)
+  const rafRef = useRef<number | null>(null)
+  const suppressScrollSpyUntilRef = useRef<number>(0)
 
   useEffect(() => {
-    const handleResize = () => {
-      setIsMobile(window.innerWidth < 768)
+    // Keep active state in sync with route changes.
+    if (!pathname) return
+    if (pathname.startsWith("/explorer")) {
+      setActiveTab("Data Explorer")
+      return
+    }
+    if (pathname !== "/") {
+      setActiveTab(items[0]?.name ?? "Home")
+      return
     }
 
-    handleResize()
-    window.addEventListener("resize", handleResize)
-    return () => window.removeEventListener("resize", handleResize)
-  }, [])
+    // Home page: hash can set the active tab.
+    const applyHash = () => {
+      const id = window.location.hash?.replace(/^#/, "")
+      if (id && sectionIdToName.has(id)) {
+        setActiveTab(sectionIdToName.get(id) as string)
+      } else if (window.scrollY < 120) {
+        setActiveTab(items[0]?.name ?? "Home")
+      }
+    }
+
+    applyHash()
+    window.addEventListener("hashchange", applyHash)
+    return () => window.removeEventListener("hashchange", applyHash)
+  }, [items, pathname, sectionIdToName])
+
+  useEffect(() => {
+    // Scroll-spy only on home page.
+    if (pathname !== "/") return
+
+    const homeName = items[0]?.name ?? "Home"
+    const sectionIds = Array.from(sectionIdToName.keys())
+    const sections = sectionIds
+      .map((id) => document.getElementById(id))
+      .filter(Boolean) as HTMLElement[]
+
+    if (sections.length === 0) return
+
+    const maybeSetActive = (next: string) => {
+      // Avoid fighting with immediate "click -> scroll" interactions.
+      if (Date.now() < suppressScrollSpyUntilRef.current) return
+      setActiveTab((prev) => (prev === next ? prev : next))
+    }
+
+    const onScrollTop = () => {
+      if (Date.now() < suppressScrollSpyUntilRef.current) return
+      if (window.scrollY < 120) maybeSetActive(homeName)
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
+        rafRef.current = requestAnimationFrame(() => {
+          rafRef.current = null
+          const visible = entries
+            .filter((e) => e.isIntersecting)
+            .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)
+
+          if (visible.length > 0) {
+            const id = (visible[0].target as HTMLElement).id
+            const name = sectionIdToName.get(id)
+            if (name) maybeSetActive(name)
+          } else if (window.scrollY < 120) {
+            maybeSetActive(homeName)
+          }
+        })
+      },
+      {
+        // Choose the section that crosses the middle band of the viewport.
+        root: null,
+        rootMargin: "-40% 0px -55% 0px",
+        threshold: 0,
+      },
+    )
+
+    for (const el of sections) observer.observe(el)
+    window.addEventListener("scroll", onScrollTop, { passive: true })
+    observerRef.current = observer
+
+    return () => {
+      window.removeEventListener("scroll", onScrollTop)
+      observer.disconnect()
+      observerRef.current = null
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current)
+        rafRef.current = null
+      }
+    }
+  }, [items, pathname, sectionIdToName])
 
   return (
     <div className={cn("fixed bottom-0 sm:top-0 left-1/2 -translate-x-1/2 z-50 mb-6 sm:pt-6 pointer-events-none", className)}>
@@ -37,6 +147,8 @@ export function NavBar({ items, className }: NavBarProps) {
         {items.map((item) => {
           const Icon = item.icon
           const isActive = activeTab === item.name
+          const hashIdx = item.url.indexOf("#")
+          const hash = hashIdx >= 0 ? item.url.slice(hashIdx) : null
 
           return (
             <Link
@@ -44,14 +156,25 @@ export function NavBar({ items, className }: NavBarProps) {
               href={item.url}
               onClick={(e) => {
                 setActiveTab(item.name)
-                // Smooth-scroll for in-page hash links
-                if (item.url.startsWith("#")) {
+                // Smooth-scroll for in-page hash links on the home page,
+                // and route correctly back to home when clicked from other pages.
+                if (hash) {
                   e.preventDefault()
-                  const target = document.querySelector(item.url)
+                  suppressScrollSpyUntilRef.current = Date.now() + 900
+
+                  if (pathname !== "/") {
+                    router.push(`/${hash}`)
+                    return
+                  }
+
+                  const id = hash.replace(/^#/, "")
+                  const target = document.getElementById(id)
                   if (target) {
-                    ;(target as HTMLElement).scrollIntoView({ behavior: "smooth", block: "start" })
-                    // Update the URL hash without jumping
-                    history.replaceState(null, "", item.url)
+                    target.scrollIntoView({ behavior: "smooth", block: "start" })
+                    history.replaceState(null, "", hash)
+                  } else {
+                    // If the element isn't mounted yet, still update the URL.
+                    history.replaceState(null, "", hash)
                   }
                 }
               }}

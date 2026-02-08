@@ -20,6 +20,7 @@ export interface BSVConfig {
   api: {
     mainnet: string
     testnet: string
+    gorillaPoolArc: string
     arcApiKey: string
   }
   logging: {
@@ -45,7 +46,7 @@ export const bsvConfig: BSVConfig = {
     alertThreshold: parseInt(process.env.BSV_ALERT_BALANCE_THRESHOLD || '5000000'),
   },
   transaction: {
-    feeRate: parseInt(process.env.BSV_TX_FEE_RATE || '1'),
+    feeRate: parseFloat(process.env.BSV_TX_FEE_RATE || '0.15'),
     maxRetries: parseInt(process.env.BSV_MAX_TX_RETRIES || '3'),
     retryDelayMs: parseInt(process.env.BSV_RETRY_DELAY_MS || '1000'),
   },
@@ -57,8 +58,9 @@ export const bsvConfig: BSVConfig = {
     maxQueueSize: parseInt(process.env.BSV_MAX_QUEUE_SIZE || '10000'),
   },
   api: {
-    mainnet: process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc',
-    testnet: process.env.BSV_TESTNET_API_ENDPOINT || 'https://api.taal.com/arc',
+    mainnet: process.env.BSV_API_ENDPOINT || 'https://arc.taal.com',
+    testnet: process.env.BSV_TESTNET_API_ENDPOINT || 'https://arc-test.taal.com',
+    gorillaPoolArc: process.env.BSV_GORILLAPOOL_ARC_ENDPOINT || 'https://arc.gorillapool.io',
     arcApiKey: process.env.BSV_ARC_API_KEY || '',
   },
   logging: {

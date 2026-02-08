@@ -184,9 +184,21 @@ export class InMemoryBudgetStore implements BudgetStore {
   }
 }
 
-export const cacheStore = new InMemoryCacheStore()
-export const dedupeStore = new InMemoryDedupeStore()
-export const cursorStore = new InMemoryCursorStore()
-export const budgetStore = new InMemoryBudgetStore()
+// Persist singletons on globalThis to survive Next.js dev-mode module
+// re-evaluations — losing the dedup/cursor/budget stores causes duplicate
+// broadcasts and resets rate-limit counters.
+const _st = globalThis as any
+if (!_st.__GAIALOG_STORES__) {
+  _st.__GAIALOG_STORES__ = {
+    cache: new InMemoryCacheStore(),
+    dedupe: new InMemoryDedupeStore(),
+    cursor: new InMemoryCursorStore(),
+    budget: new InMemoryBudgetStore(),
+  }
+}
+export const cacheStore: InMemoryCacheStore = _st.__GAIALOG_STORES__.cache
+export const dedupeStore: InMemoryDedupeStore = _st.__GAIALOG_STORES__.dedupe
+export const cursorStore: InMemoryCursorStore = _st.__GAIALOG_STORES__.cursor
+export const budgetStore: InMemoryBudgetStore = _st.__GAIALOG_STORES__.budget
 
 

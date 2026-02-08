@@ -922,18 +922,47 @@ export async function collectAirQualityDataBatch(cities: string[], useWAQI: bool
   return results
 }
 
+// Locally cached NOAA station list – the metadata endpoint rarely changes,
+// so we keep the last successful response and reuse it on HTTP 304.
+let _noaaStationCache: any[] | null = null
+
 export async function collectWaterLevelDataBatch(limit: number = 25): Promise<WaterLevelData[]> {
   const out: WaterLevelData[] = []
   const stations = await fetchJsonWithRetry<any>(
     'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels',
     { retries: 2, etagKey: 'noaa:stations:waterlevels', providerId: 'noaa' }
   )
-  const list = (stations as any)?.__notModified ? [] : (stations?.stations || [])
+
+  // When NOAA returns 304 Not Modified, reuse the locally cached station list
+  // instead of treating it as empty (which previously stopped all collection).
+  if ((stations as any)?.__notModified) {
+    if (!_noaaStationCache || _noaaStationCache.length === 0) {
+      console.warn('NOAA station list returned 304 but no local cache available – skipping this cycle')
+      return out
+    }
+  } else {
+    const fresh = stations?.stations || []
+    if (fresh.length > 0) {
+      _noaaStationCache = fresh
+    }
+  }
+  const list = _noaaStationCache || []
   const total = list.length
+  if (total === 0) {
+    console.warn('🌊 NOAA: Station list is empty – nothing to collect')
+    return out
+  }
+  console.log(`🌊 NOAA: Processing ${Math.min(limit, total)} stations (${total} total available)...`)
   const startIndex = (await cursorStore.get('noaa')) as number | null
   let i = typeof startIndex === 'number' ? startIndex : 0
+  const batchStart = Date.now()
   for (let count = 0; count < limit && count < total; count++) {
     const s = list[i % total]
+    // Progress log every 25 stations so the user can see NOAA is actively working
+    if (count > 0 && count % 25 === 0) {
+      const elapsed = ((Date.now() - batchStart) / 1000).toFixed(1)
+      console.log(`🌊 NOAA: ${count}/${Math.min(limit, total)} stations processed (${out.length} readings, ${elapsed}s elapsed)`)
+    }
     try {
       // Country toggle enforcement for NOAA station batch
       try {
@@ -1017,6 +1046,8 @@ export async function collectWaterLevelDataBatch(limit: number = 25): Promise<Wa
     i++
   }
   await cursorStore.set('noaa', i % (total || 1))
+  const totalElapsed = ((Date.now() - batchStart) / 1000).toFixed(1)
+  console.log(`🌊 NOAA: Batch complete – ${out.length} readings from ${Math.min(limit, total)} stations in ${totalElapsed}s`)
   return out
 }
 

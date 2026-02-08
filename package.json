@@ -16,11 +16,13 @@
     "verify:auto-init": "tsx scripts/verify-auto-init-setup.ts",
     "validate:opreturn": "tsx scripts/validate-opreturn.ts",
     "explorer:sync": "tsx scripts/run-junglebus-worker.ts",
+    "explorer:backfill": "tsx scripts/backfill-explorer.ts",
     "explorer:addresses": "tsx scripts/show-wallet-addresses.ts"
   },
   "dependencies": {
     "@bsv/sdk": "^1.6.24",
     "@emotion/is-prop-valid": "latest",
+    "@gorillapool/js-junglebus": "^0.4.4",
     "@hookform/resolvers": "^3.10.0",
     "@radix-ui/react-accordion": "1.2.2",
     "@radix-ui/react-alert-dialog": "1.1.4",

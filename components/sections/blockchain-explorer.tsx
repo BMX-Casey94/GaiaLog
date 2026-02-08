@@ -138,7 +138,7 @@ export function BlockchainExplorer() {
     getBSVExplorerUrl(txid, network as 'main' | 'test')
 
   return (
-    <section id="blockchain" className="py-20 px-4 sm:px-6 lg:px-8 relative">
+    <section id="blockchain" className="py-20 px-4 sm:px-6 lg:px-8 relative scroll-mt-24">
       <div className="absolute inset-0 bg-gradient-to-b from-black/80 via-slate-900/20 to-slate-950/50 pointer-events-none"></div>
       <div className="relative z-10">
         <div className="max-w-7xl mx-auto">

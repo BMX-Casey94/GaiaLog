@@ -10,7 +10,7 @@ export function DataSources() {
       name: "WAQI API",
       type: "Air Quality",
       icon: Cloud,
-      refreshRate: "30 minutes",
+      refreshRate: "10 minutes",
       coverage: "Global",
       status: "operational",
     },
@@ -18,7 +18,7 @@ export function DataSources() {
       name: "NOAA Tides & Currents",
       type: "Water Levels",
       icon: Droplets,
-      refreshRate: "60 minutes",
+      refreshRate: "10 minutes",
       coverage: "Global",
       status: "operational",
     },
@@ -26,7 +26,7 @@ export function DataSources() {
       name: "USGS Earthquake API",
       type: "Seismic Activity",
       icon: Activity,
-      refreshRate: "15 minutes",
+      refreshRate: "10 minutes",
       coverage: "Global",
       status: "operational",
     },
@@ -34,7 +34,7 @@ export function DataSources() {
       name: "Environmental Monitoring",
       type: "UV, Soil, Wildfire Risk",
       icon: Database,
-      refreshRate: "30 minutes",
+      refreshRate: "10 minutes",
       coverage: "Global",
       status: "operational",
     },
@@ -48,7 +48,7 @@ export function DataSources() {
           <div className="text-center mb-16">
             <h2 className="text-3xl md:text-4xl font-bold text-white mb-4">Data Sources & APIs</h2>
             <p className="text-lg text-slate-400 max-w-2xl mx-auto">
-              GaiaLog gathers environmental data from trusted, authoritative sources every 15 minutes and records that data immutably on the
+              GaiaLog gathers environmental data from trusted, authoritative sources every 10 minutes and records that data immutably on the
               blockchain.
             </p>
           </div>

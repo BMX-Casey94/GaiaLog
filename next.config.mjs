@@ -1,11 +1,11 @@
 import { createRequire } from 'module'
+import path from 'path'
+import { fileURLToPath } from 'url'
 const require = createRequire(import.meta.url)
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
   typescript: {
     ignoreBuildErrors: true,
   },
@@ -29,7 +29,7 @@ const nextConfig = {
     // Force single instance of 'bsv' to avoid duplicate-module warnings
     config.resolve = config.resolve || {}
     config.resolve.alias = config.resolve.alias || {}
-    config.resolve.alias['bsv'] = require.resolve('bsv')
+    config.resolve.alias['bsv'] = require.resolve('bsv', { paths: [__dirname] })
     // Ensure server bundles use the single Node runtime copy of bsv
     if (isServer) {
       config.externals = config.externals || []

@@ -120,22 +120,22 @@ export function Footer() {
             <h4 className="font-semibold text-white mb-4">Resources</h4>
             <ul className="space-y-2 text-sm text-slate-400">
               <li>
-                <a href="#monitoring" className="hover:text-white transition-colors">
+                <a href="/#monitoring" className="hover:text-white transition-colors">
                   Live Alerts
                 </a>
               </li>
               <li>
-                <a href="#blockchain" className="hover:text-white transition-colors">
+                <a href="/#blockchain" className="hover:text-white transition-colors">
                   Blockchain Explorer
                 </a>
               </li>
               <li>
-                <a href="#data-sources" className="hover:text-white transition-colors">
+                <a href="/#data-sources" className="hover:text-white transition-colors">
                   Data Sources
                 </a>
               </li>
               <li>
-                <a href="#about" className="hover:text-white transition-colors">
+                <a href="/#how-it-works" className="hover:text-white transition-colors">
                   How It Works
                 </a>
               </li>

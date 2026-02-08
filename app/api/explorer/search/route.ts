@@ -1,51 +1,48 @@
 /**
- * Data Explorer Search API (Database-less)
- * 
+ * Data Explorer Search API (Supabase-backed)
+ *
  * GET /api/explorer/search
- * 
- * Uses JSON file storage instead of PostgreSQL.
- * 
+ *
+ * Uses the `explorer_readings` PostgreSQL table for fast filtered queries
+ * with pagination, full-text location search, and type/date filters.
+ *
  * Query parameters:
- *   q - Location search text
- *   lat - Latitude for radius search
- *   lon - Longitude for radius search
- *   radius - Radius in km (requires lat/lon)
- *   type - Data type filter (air_quality, water_levels, seismic_activity, advanced_metrics)
- *   from - Start date (ISO 8601)
- *   to - End date (ISO 8601)
- *   page - Page number (default: 1)
+ *   q        - Location search text (uses pg_trgm ILIKE)
+ *   type     - Data type filter (air_quality, water_levels, seismic_activity, advanced_metrics)
+ *   from     - Start date (ISO 8601)
+ *   to       - End date (ISO 8601)
+ *   page     - Page number (default: 1)
  *   pageSize - Items per page (default: 50, max: 500)
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { searchReadings, getAggregates, type SearchParams } from '@/lib/explorer-store'
+import { searchReadings, getAggregates, type SearchParams } from '@/lib/supabase-explorer'
 
 export const dynamic = 'force-dynamic'
+
+const WOC_BASE =
+  process.env.BSV_NETWORK === 'mainnet'
+    ? 'https://whatsonchain.com'
+    : 'https://test.whatsonchain.com'
 
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
-    
+
     // Parse query parameters
     const params: SearchParams = {}
-    
+
     const q = searchParams.get('q')
     if (q) params.q = q
-    
-    const lat = searchParams.get('lat')
-    const lon = searchParams.get('lon')
-    const radius = searchParams.get('radius')
-    if (lat && lon) {
-      params.lat = parseFloat(lat)
-      params.lon = parseFloat(lon)
-      params.radiusKm = radius ? parseFloat(radius) : 50 // Default 50km radius
-    }
-    
+
     const dataType = searchParams.get('type')
-    if (dataType && ['air_quality', 'water_levels', 'seismic_activity', 'advanced_metrics'].includes(dataType)) {
+    if (
+      dataType &&
+      ['air_quality', 'water_levels', 'seismic_activity', 'advanced_metrics'].includes(dataType)
+    ) {
       params.dataType = dataType
     }
-    
+
     const from = searchParams.get('from')
     if (from) {
       const fromDate = new Date(from)
@@ -53,7 +50,7 @@ export async function GET(request: NextRequest) {
         params.from = fromDate.getTime()
       }
     }
-    
+
     const to = searchParams.get('to')
     if (to) {
       const toDate = new Date(to)
@@ -61,17 +58,19 @@ export async function GET(request: NextRequest) {
         params.to = toDate.getTime()
       }
     }
-    
+
     const page = searchParams.get('page')
     if (page) params.page = Math.max(1, parseInt(page, 10))
-    
+
     const pageSize = searchParams.get('pageSize')
     if (pageSize) params.pageSize = Math.min(500, Math.max(1, parseInt(pageSize, 10)))
-    
-    // Fetch results from JSON store
-    const results = searchReadings(params)
-    const aggregates = getAggregates(params)
-    
+
+    // Fetch results from Supabase
+    const [results, aggregates] = await Promise.all([
+      searchReadings(params),
+      getAggregates(params),
+    ])
+
     // Transform items for API response
     const items = results.items.map(item => ({
       txid: item.txid,
@@ -83,10 +82,10 @@ export async function GET(request: NextRequest) {
       metrics: item.metrics,
       provider: item.provider,
       blockHeight: item.blockHeight,
-      // Generate WhatsonChain link
-      wocUrl: `https://whatsonchain.com/tx/${item.txid}`,
+      // Default to the OP_RETURN output (GaiaLog writes it as vout 0)
+      wocUrl: `${WOC_BASE}/tx/${String(item.txid).toLowerCase()}?voutOffset=0&output=0`,
     }))
-    
+
     return NextResponse.json({
       success: true,
       data: {
@@ -102,14 +101,17 @@ export async function GET(request: NextRequest) {
           totalReadings: aggregates.totalReadings,
           uniqueLocations: aggregates.uniqueLocations,
           dateRange: {
-            min: aggregates.dateRange.min ? new Date(aggregates.dateRange.min).toISOString() : null,
-            max: aggregates.dateRange.max ? new Date(aggregates.dateRange.max).toISOString() : null,
+            min: aggregates.dateRange.min
+              ? new Date(aggregates.dateRange.min).toISOString()
+              : null,
+            max: aggregates.dateRange.max
+              ? new Date(aggregates.dateRange.max).toISOString()
+              : null,
           },
           byType: aggregates.byType,
         },
       },
     })
-    
   } catch (error) {
     console.error('Explorer search error:', error)
     return NextResponse.json(

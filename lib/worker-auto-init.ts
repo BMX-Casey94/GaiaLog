@@ -13,11 +13,24 @@ import { initializeProviderBudgets } from './provider-registry'
 import { walletManager } from './wallet-manager'
 import { bsvConfig } from './bsv-config'
 
-// Global state to track initialization
-let isInitialized = false
-let isInitializing = false
-let initializationError: Error | null = null
-let initializationAttempts = 0
+// Persist init state on globalThis to survive Next.js dev-mode module
+// re-evaluations (HMR, route compilations) that would otherwise reset
+// these flags and spawn duplicate workers / timers.
+const _g = globalThis as any
+if (!_g.__GAIALOG_INIT_STATE__) {
+  _g.__GAIALOG_INIT_STATE__ = {
+    isInitialized: false,
+    isInitializing: false,
+    initializationError: null as Error | null,
+    initializationAttempts: 0,
+  }
+}
+const _initState: {
+  isInitialized: boolean
+  isInitializing: boolean
+  initializationError: Error | null
+  initializationAttempts: number
+} = _g.__GAIALOG_INIT_STATE__
 const MAX_INIT_ATTEMPTS = 3
 
 /**
@@ -31,7 +44,7 @@ export async function autoInitializeWorkers(): Promise<{
   error?: string
 }> {
   // Return immediately if already initialized
-  if (isInitialized) {
+  if (_initState.isInitialized) {
     return {
       success: true,
       message: 'Workers already initialized and running',
@@ -40,7 +53,7 @@ export async function autoInitializeWorkers(): Promise<{
   }
 
   // Prevent multiple concurrent initializations
-  if (isInitializing) {
+  if (_initState.isInitializing) {
     return {
       success: false,
       message: 'Initialization already in progress',
@@ -49,16 +62,16 @@ export async function autoInitializeWorkers(): Promise<{
   }
 
   // Check if we've exceeded max attempts
-  if (initializationAttempts >= MAX_INIT_ATTEMPTS && initializationError) {
+  if (_initState.initializationAttempts >= MAX_INIT_ATTEMPTS && _initState.initializationError) {
     return {
       success: false,
       message: 'Maximum initialization attempts exceeded',
-      error: initializationError.message
+      error: _initState.initializationError.message
     }
   }
 
-  isInitializing = true
-  initializationAttempts++
+  _initState.isInitializing = true
+  _initState.initializationAttempts++
 
   try {
     console.log('🚀 Auto-initializing GaiaLog workers...')
@@ -128,9 +141,9 @@ export async function autoInitializeWorkers(): Promise<{
     console.log('✅ Queue processing started')
 
     // Mark as successfully initialized
-    isInitialized = true
-    isInitializing = false
-    initializationError = null
+    _initState.isInitialized = true
+    _initState.isInitializing = false
+    _initState.initializationError = null
 
     const finalStatus = getWorkerStatus()
     
@@ -145,13 +158,13 @@ export async function autoInitializeWorkers(): Promise<{
 
   } catch (error) {
     console.error('❌ Worker auto-initialization failed:', error)
-    isInitializing = false
-    initializationError = error instanceof Error ? error : new Error(String(error))
+    _initState.isInitializing = false
+    _initState.initializationError = error instanceof Error ? error : new Error(String(error))
 
     return {
       success: false,
       message: 'Worker initialization failed',
-      error: initializationError.message
+      error: _initState.initializationError.message
     }
   }
 }
@@ -165,7 +178,7 @@ export function getWorkerStatus() {
     const queueStats = workerQueue.getQueueStats()
     
     return {
-      initialized: isInitialized,
+      initialized: _initState.isInitialized,
       walletManager: walletManager.isReady(),
       workerManager: workerManager.isReady(),
       walletCount: walletManager.getWalletCount(),
@@ -191,17 +204,19 @@ export function getWorkerStatus() {
  * Check if workers are initialized
  */
 export function areWorkersInitialized(): boolean {
-  return isInitialized
+  return _initState.isInitialized
 }
 
 /**
  * Reset initialization state (useful for testing or manual restarts)
  */
 export function resetInitialization(): void {
-  isInitialized = false
-  isInitializing = false
-  initializationError = null
-  initializationAttempts = 0
+  _initState.isInitialized = false
+  _initState.isInitializing = false
+  _initState.initializationError = null
+  _initState.initializationAttempts = 0
+  // Also reset the bootstrap guard so bootstrapWorkers() can re-run
+  ;(globalThis as any).__GAIALOG_BOOTSTRAP_DONE__ = false
   console.log('🔄 Worker initialization state reset')
 }
 
@@ -209,7 +224,7 @@ export function resetInitialization(): void {
  * Gracefully shutdown all workers
  */
 export function shutdownWorkers(): void {
-  if (!isInitialized) {
+  if (!_initState.isInitialized) {
     console.log('⚠️ Workers not initialized, nothing to shutdown')
     return
   }
@@ -224,6 +239,6 @@ export function shutdownWorkers(): void {
     console.error('❌ Error during worker shutdown:', error)
   }
 
-  isInitialized = false
+  _initState.isInitialized = false
 }
 

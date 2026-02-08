@@ -279,7 +279,7 @@ export function HowItWorks() {
   ];
 
   return (
-    <section id="how-it-works" className="relative min-h-screen w-full overflow-x-hidden py-20">
+    <section id="how-it-works" className="relative min-h-screen w-full overflow-x-hidden py-20 scroll-mt-24">
       <ShaderCanvas />
       
       <div className="relative z-10 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">

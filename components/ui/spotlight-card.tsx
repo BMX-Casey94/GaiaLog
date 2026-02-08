@@ -3,7 +3,7 @@ import React, { useEffect, useRef, ReactNode } from 'react';
 interface GlowCardProps {
   children: ReactNode;
   className?: string;
-  glowColor?: 'blue' | 'purple' | 'green' | 'red' | 'orange';
+  glowColor?: 'blue' | 'purple' | 'green' | 'red' | 'orange' | 'cyan';
   size?: 'sm' | 'md' | 'lg';
   width?: string | number;
   height?: string | number;
@@ -16,7 +16,8 @@ const glowColorMap = {
   purple: { base: 280, spread: 300 },
   green: { base: 120, spread: 200 },
   red: { base: 0, spread: 200 },
-  orange: { base: 30, spread: 200 }
+  orange: { base: 30, spread: 200 },
+  cyan: { base: 190, spread: 180 },
 };
 
 const sizeMap = {
@@ -69,8 +70,8 @@ const GlowCard: React.FC<GlowCardProps> = ({
     const baseStyles = {
       '--base': base,
       '--spread': spread,
-      '--radius': '14',
-      '--border': '3',
+      '--radius': '16',
+      '--border': '2',
       '--backdrop': 'hsl(0 0% 60% / 0.12)',
       '--backup-border': 'var(--backdrop)',
       '--size': '200',
@@ -87,7 +88,7 @@ const GlowCard: React.FC<GlowCardProps> = ({
       backgroundColor: 'var(--backdrop, transparent)',
       backgroundSize: 'calc(100% + (2 * var(--border-size))) calc(100% + (2 * var(--border-size)))',
       backgroundPosition: '50% 50%',
-      backgroundAttachment: disableGlow ? 'initial' : 'fixed',
+      backgroundAttachment: 'fixed',
       border: disableGlow ? '1px solid rgba(148, 163, 184, 0.2)' : 'var(--border-size) solid var(--backup-border)',
       position: 'relative' as const,
       touchAction: 'pan-y' as const,
@@ -147,17 +148,34 @@ const GlowCard: React.FC<GlowCardProps> = ({
       will-change: filter;
       opacity: var(--outer, 1);
       border-radius: calc(var(--radius) * 1px);
-      border-width: calc(var(--border-size) * 20);
-      filter: blur(calc(var(--border-size) * 10));
+      border-width: 0;
+      filter: blur(calc(var(--border-size) * 4));
       background: none;
       pointer-events: none;
       border: none;
     }
     
     [data-glow] > [data-glow]::before {
-      inset: -10px;
-      border-width: 10px;
+      inset: -4px;
+      border-width: 4px;
     }
+  `;
+
+  // Shared layout classes – overflow-hidden prevents glow pseudo-elements
+  // and content from leaking outside the card boundary.
+  const layoutClasses = `
+    ${getSizeClasses()}
+    ${!customSize ? 'aspect-[3/4]' : ''}
+    rounded-2xl 
+    relative 
+    overflow-hidden
+    grid 
+    grid-rows-[1fr_auto] 
+    shadow-[0_1rem_2rem_-1rem_black] 
+    p-4 
+    gap-4 
+    backdrop-blur-[5px]
+    ${className}
   `;
 
   if (disableGlow) {
@@ -165,19 +183,7 @@ const GlowCard: React.FC<GlowCardProps> = ({
       <div
         ref={cardRef}
         style={getInlineStyles()}
-        className={`
-          ${getSizeClasses()}
-          ${!customSize ? 'aspect-[3/4]' : ''}
-          rounded-2xl 
-          relative 
-          grid 
-          grid-rows-[1fr_auto] 
-          shadow-[0_1rem_2rem_-1rem_black] 
-          p-4 
-          gap-4 
-          backdrop-blur-[5px]
-          ${className}
-        `}
+        className={layoutClasses}
       >
         {children}
       </div>
@@ -191,19 +197,7 @@ const GlowCard: React.FC<GlowCardProps> = ({
         ref={cardRef}
         data-glow
         style={getInlineStyles()}
-        className={`
-          ${getSizeClasses()}
-          ${!customSize ? 'aspect-[3/4]' : ''}
-          rounded-2xl 
-          relative 
-          grid 
-          grid-rows-[1fr_auto] 
-          shadow-[0_1rem_2rem_-1rem_black] 
-          p-4 
-          gap-4 
-          backdrop-blur-[5px]
-          ${className}
-        `}
+        className={layoutClasses}
       >
         <div ref={innerRef} data-glow></div>
         {children}

@@ -11,12 +11,8 @@
 import { APP_NAME } from './constants'
 import {
   addReadingsBatch,
-  saveCursor,
-  loadCursor,
-  loadIndex,
   type StoredReading,
-  type JunglebusCursor,
-} from './explorer-store'
+} from './supabase-explorer'
 
 // Configuration
 const START_BLOCK = parseInt(process.env.JUNGLEBUS_START_BLOCK || '0', 10)
@@ -321,10 +317,9 @@ export class JungleBusWorker {
     console.log(`📍 Network: ${process.env.BSV_NETWORK || 'testnet'}`)
     console.log(`📫 Addresses to scan: ${this.addresses.length}`)
     
-    // Get existing txids to avoid duplicates
-    const existingIndex = loadIndex()
-    const existingTxids = new Set(existingIndex.readings.map(r => r.txid))
-    console.log(`📊 Existing readings: ${existingTxids.size}`)
+    // Supabase handles deduplication via UNIQUE(txid) – no need to pre-load
+    const existingTxids = new Set<string>()
+    console.log(`📊 Supabase handles deduplication – scanning all addresses`)
     
     // Scan each address
     for (const address of this.addresses) {
@@ -374,9 +369,9 @@ export class JungleBusWorker {
             console.log(`   ✅ ${decoded.txid.substring(0, 8)}... | ${decoded.dataType} | ${locationStr}`)
           }
           
-          // Save in batches
+          // Save in batches (async – Supabase insert)
           if (readings.length >= BATCH_SIZE) {
-            addReadingsBatch(readings)
+            await addReadingsBatch(readings)
             readings.length = 0
           }
           
@@ -388,22 +383,13 @@ export class JungleBusWorker {
         
         // Save remaining readings
         if (readings.length > 0) {
-          addReadingsBatch(readings)
+          await addReadingsBatch(readings)
         }
         
       } catch (error) {
         console.error(`   ❌ Error scanning address:`, error)
       }
     }
-    
-    // Update cursor
-    const cursorData: JunglebusCursor = {
-      subscriptionId: 'woc-indexer',
-      lastBlock: 0,
-      processedCount: loadIndex().processedCount,
-      updatedAt: Date.now(),
-    }
-    saveCursor(cursorData)
     
     if (!this.shouldStop) {
       console.log(`\n✅ Indexing complete!`)

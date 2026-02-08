@@ -62,22 +62,76 @@ export interface LocationSuggestion {
   avgLon: number | null
 }
 
-// File paths
-const DATA_DIR = process.env.EXPLORER_DATA_DIR || path.join(process.cwd(), 'data')
-const INDEX_FILE = path.join(DATA_DIR, 'explorer-index.json')
-const CURSOR_FILE = path.join(DATA_DIR, 'junglebus-cursor.json')
+// ============================================
+// Filesystem-resilient data directory resolution
+// Tries configured dir → cwd/data → /tmp fallback → in-memory only
+// ============================================
 
-// In-memory cache
+function resolveDataDir(): string {
+  const candidates = [
+    process.env.EXPLORER_DATA_DIR,
+    path.join(process.cwd(), 'data'),
+    // Vercel only allows writes to /tmp
+    process.env.VERCEL ? '/tmp/gaialog-data' : null,
+    '/tmp/gaialog-data',
+  ].filter(Boolean) as string[]
+
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true })
+      }
+      // Smoke-test writability
+      const testFile = path.join(dir, '.write-test')
+      fs.writeFileSync(testFile, 'ok')
+      fs.unlinkSync(testFile)
+      return dir
+    } catch {
+      // Directory not writable, try next
+    }
+  }
+
+  // All candidates failed – run in pure in-memory mode
+  return ''
+}
+
+let _resolvedDir: string | null = null
+function getDataDir(): string {
+  if (_resolvedDir === null) {
+    _resolvedDir = resolveDataDir()
+    if (!_resolvedDir) {
+      console.warn('⚠️ Explorer store: no writable directory found – running in-memory only')
+    }
+  }
+  return _resolvedDir
+}
+
+function getIndexFilePath(): string {
+  const dir = getDataDir()
+  return dir ? path.join(dir, 'explorer-index.json') : ''
+}
+
+function getCursorFilePath(): string {
+  const dir = getDataDir()
+  return dir ? path.join(dir, 'junglebus-cursor.json') : ''
+}
+
+// In-memory cache (serves as primary store on Vercel / read-only fs)
 let indexCache: ExplorerIndex | null = null
 let indexCacheTime = 0
 const CACHE_TTL_MS = 60000 // Reload from disk every 60 seconds
 
 /**
- * Ensure data directory exists
+ * Ensure data directory exists (safe for read-only fs)
  */
 function ensureDataDir(): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true })
+  const dir = getDataDir()
+  if (dir && !fs.existsSync(dir)) {
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+    } catch {
+      // Non-fatal on read-only fs
+    }
   }
 }
 
@@ -94,9 +148,10 @@ export function loadIndex(): ExplorerIndex {
   
   ensureDataDir()
   
-  if (fs.existsSync(INDEX_FILE)) {
+  const indexFile = getIndexFilePath()
+  if (indexFile && fs.existsSync(indexFile)) {
     try {
-      const data = fs.readFileSync(INDEX_FILE, 'utf-8')
+      const data = fs.readFileSync(indexFile, 'utf-8')
       indexCache = JSON.parse(data)
       indexCacheTime = now
       return indexCache!
@@ -105,13 +160,15 @@ export function loadIndex(): ExplorerIndex {
     }
   }
   
-  // Return empty index
-  indexCache = {
-    version: 1,
-    lastBlock: 0,
-    lastUpdated: now,
-    processedCount: 0,
-    readings: [],
+  // Return empty index (or keep existing in-memory data if we already have it)
+  if (!indexCache) {
+    indexCache = {
+      version: 1,
+      lastBlock: 0,
+      lastUpdated: now,
+      processedCount: 0,
+      readings: [],
+    }
   }
   indexCacheTime = now
   return indexCache
@@ -123,13 +180,38 @@ export function loadIndex(): ExplorerIndex {
 export function saveIndex(index: ExplorerIndex): void {
   ensureDataDir()
   index.lastUpdated = Date.now()
-  fs.writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2))
   indexCache = index
   indexCacheTime = Date.now()
+
+  const indexFile = getIndexFilePath()
+  if (indexFile) {
+    try {
+      fs.writeFileSync(indexFile, JSON.stringify(index, null, 2))
+    } catch {
+      // Non-fatal: in-memory cache is the primary store
+    }
+  }
+}
+
+// Auto-flush: accumulate writes and persist to disk periodically
+let _pendingWrites = 0
+let _flushTimer: ReturnType<typeof setTimeout> | null = null
+const AUTO_FLUSH_THRESHOLD = 5    // Flush every N new readings
+const AUTO_FLUSH_DELAY_MS = 10000 // Or flush after 10 s of inactivity
+
+function scheduleAutoFlush(): void {
+  if (_flushTimer) clearTimeout(_flushTimer)
+  _flushTimer = setTimeout(() => {
+    if (indexCache && _pendingWrites > 0) {
+      saveIndex(indexCache)
+      _pendingWrites = 0
+    }
+  }, AUTO_FLUSH_DELAY_MS)
 }
 
 /**
- * Add a reading to the index (deduplicates by txid)
+ * Add a reading to the index (deduplicates by txid).
+ * Auto-flushes to disk after a small batch or a short idle period.
  */
 export function addReading(reading: StoredReading): boolean {
   const index = loadIndex()
@@ -146,8 +228,17 @@ export function addReading(reading: StoredReading): boolean {
     index.lastBlock = reading.blockHeight
   }
   
-  // Don't save on every add - caller should batch and save
   indexCache = index
+  _pendingWrites++
+
+  // Auto-flush when threshold reached, otherwise schedule delayed flush
+  if (_pendingWrites >= AUTO_FLUSH_THRESHOLD) {
+    saveIndex(index)
+    _pendingWrites = 0
+  } else {
+    scheduleAutoFlush()
+  }
+
   return true
 }
 
@@ -362,9 +453,10 @@ export function getIndexStats(): {
   const index = loadIndex()
   
   let fileSizeBytes = 0
+  const indexFile = getIndexFilePath()
   try {
-    if (fs.existsSync(INDEX_FILE)) {
-      const stats = fs.statSync(INDEX_FILE)
+    if (indexFile && fs.existsSync(indexFile)) {
+      const stats = fs.statSync(indexFile)
       fileSizeBytes = stats.size
     }
   } catch {}
@@ -391,9 +483,10 @@ export interface JunglebusCursor {
 export function loadCursor(subscriptionId: string): JunglebusCursor | null {
   ensureDataDir()
   
-  if (fs.existsSync(CURSOR_FILE)) {
+  const cursorFile = getCursorFilePath()
+  if (cursorFile && fs.existsSync(cursorFile)) {
     try {
-      const data = fs.readFileSync(CURSOR_FILE, 'utf-8')
+      const data = fs.readFileSync(cursorFile, 'utf-8')
       const cursor = JSON.parse(data)
       if (cursor.subscriptionId === subscriptionId) {
         return cursor
@@ -407,7 +500,15 @@ export function loadCursor(subscriptionId: string): JunglebusCursor | null {
 export function saveCursor(cursor: JunglebusCursor): void {
   ensureDataDir()
   cursor.updatedAt = Date.now()
-  fs.writeFileSync(CURSOR_FILE, JSON.stringify(cursor, null, 2))
+
+  const cursorFile = getCursorFilePath()
+  if (cursorFile) {
+    try {
+      fs.writeFileSync(cursorFile, JSON.stringify(cursor, null, 2))
+    } catch {
+      // Non-fatal on read-only fs
+    }
+  }
 }
 
 // ============================================
@@ -437,8 +538,13 @@ function toRad(deg: number): number {
  * Clear the index (for testing/reset)
  */
 export function clearIndex(): void {
-  if (fs.existsSync(INDEX_FILE)) {
-    fs.unlinkSync(INDEX_FILE)
+  const indexFile = getIndexFilePath()
+  if (indexFile && fs.existsSync(indexFile)) {
+    try {
+      fs.unlinkSync(indexFile)
+    } catch {
+      // Non-fatal on read-only fs
+    }
   }
   indexCache = null
 }

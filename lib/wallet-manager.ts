@@ -293,5 +293,10 @@ export class WalletManager {
   }
 }
 
-// Export singleton instance
-export const walletManager = new WalletManager()
+// Persist singleton on globalThis to survive Next.js dev-mode module
+// re-evaluations that would otherwise create duplicate wallet managers.
+const _wmg = globalThis as any
+if (!_wmg.__GAIALOG_WALLET_MANAGER__) {
+  _wmg.__GAIALOG_WALLET_MANAGER__ = new WalletManager()
+}
+export const walletManager: WalletManager = _wmg.__GAIALOG_WALLET_MANAGER__

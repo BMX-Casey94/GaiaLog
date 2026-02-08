@@ -195,7 +195,7 @@ export function Hero() {
           <div className="flex flex-col sm:flex-row gap-4 justify-center relative z-20">
             <Button
               size="lg"
-              className="bg-purple-600 hover:bg-purple-700 text-white"
+              variant="purple"
               onClick={scrollToMonitoring}
             >
               View Live Alerts

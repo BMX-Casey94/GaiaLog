@@ -1,4 +1,8 @@
 import * as bsv from 'bsv'
+// BSV has no protocol-enforced dust limit (unlike BTC's 546 sat).
+// Override the library's inherited BTC default so change outputs of any
+// value (≥1 sat) are kept instead of being silently absorbed into fees.
+;(bsv.Transaction as any).DUST_AMOUNT = 1
 import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
 // DB write via repositories (Postgres)
 import { upsertTxLog } from './repositories'
@@ -8,6 +12,8 @@ import { APP_NAME, SCHEMA_VERSION } from './constants'
 import { dataValidator, qualityScorer } from './validation'
 import { createCredibilityBuilder } from './pipeline-integrity'
 import type { CredibilityMetadata } from './types/credibility'
+// Explorer store – feed new broadcasts for the /explorer page (Supabase-backed)
+import { addReading, type StoredReading } from './supabase-explorer'
 
 // Types
 export interface BlockchainData {
@@ -30,23 +36,21 @@ const BSV_PRIVATE_KEY = process.env.BSV_PRIVATE_KEY || process.env.BSV_WALLET_1_
 const BSV_FALLBACK_WIF = (bsvConfig?.wallets?.privateKeys && bsvConfig.wallets.privateKeys.length > 0) ? bsvConfig.wallets.privateKeys[0] : ''
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY
 const WOC_NETWORK = (process.env.BSV_NETWORK === 'mainnet') ? 'main' : 'test'
-const GORILLAPOOL_MAPI_ENDPOINT = (process.env.BSV_GORILLAPOOL_MAPI_ENDPOINT || 'https://mapi.gorillapool.io')
-// Default to ~1 sat/kB when not configured
-const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.001)
-const DUST_LIMIT = 546
-const MIRROR_TO_WOC = process.env.BSV_MIRROR_TO_WOC === 'true'
-const MIRROR_TO_ARC = process.env.BSV_MIRROR_TO_ARC === 'true'
-const WOC_FIRST = process.env.BSV_WOC_FIRST === 'true'
-const WOC_ONLY = process.env.BSV_WOC_ONLY === 'true'
-const WOC_MIRROR_MAX_RPS = 3
-// Optional low-fee WoC lane (limited throughput)
-const WOC_LOW_FEE_ENABLED = process.env.BSV_WOC_LOW_FEE_ENABLED === 'true'
-const WOC_LOW_FEE_FACTOR = Number(process.env.BSV_WOC_LOW_FEE_FACTOR || 0.1) // 10x reduction by default
-const WOC_LOW_FEE_TPS = Number(process.env.BSV_WOC_LOW_FEE_TPS || 2) // 2 TPS cap by default
-// WoC cooldown configuration (auto-fallback to ARC on repeated failures)
-const WOC_COOLDOWN_THRESHOLD = Number(process.env.BSV_WOC_COOLDOWN_THRESHOLD || 3) // failures before cooldown
-const WOC_COOLDOWN_DURATION_MS = Number(process.env.BSV_WOC_COOLDOWN_DURATION_MS || 75000) // 75s cooldown
-const MIN_SPEND_CONF = Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS || 1)
+// Broadcasting endpoints: GorillaPool ARC (primary) → TAAL ARC (fallback)
+const GORILLAPOOL_ARC_ENDPOINT = (process.env.BSV_GORILLAPOOL_ARC_ENDPOINT || 'https://arc.gorillapool.io').replace(/\/$/, '')
+const TAAL_ARC_ENDPOINT = (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com').replace(/\/$/, '')
+// GorillaPool/TAAL ARC minimum: 100 sat/kB (0.1 sat/byte)
+// Default to 0.15 sat/byte (150 sat/kB) for comfortable margin above the 100 sat/kB floor
+const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.15)
+// BSV has no dust limit — 1 sat is the minimum viable output
+const DUST_LIMIT = 1
+// UTXO spend policy: default allows all UTXOs (including unconfirmed).
+// Protection against long unconfirmed chains is handled architecturally:
+//   1. usedKeys TTL — prevents re-spending the same UTXO for 30 min
+//   2. mempool-chain backoff — pauses a wallet for 10 min on "too-long-mempool-chain"
+//   3. UTXO splitter — creates fan-out pools from confirmed UTXOs
+// Override with BSV_MIN_SPEND_CONFIRMATIONS=1 (or higher) if desired.
+const MIN_SPEND_CONF = Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS ?? 0)
 const REFRESH_THRESHOLD = Number(process.env.BSV_UTXO_REFRESH_THRESHOLD || 10)
 
 // Data credibility features (opt-in for now)
@@ -59,6 +63,9 @@ const ENABLE_UTXO_DB_LOCKS = process.env.BSV_ENABLE_UTXO_DB_LOCKS === 'true'
 const UTXO_POOL_TTL_MS = Number(process.env.BSV_UTXO_POOL_TTL_MS || 10000)
 const UTXO_FETCH_BACKOFF_BASE_MS = Number(process.env.BSV_UTXO_FETCH_BACKOFF_BASE_MS || 250)
 const UTXO_FETCH_MAX_RETRIES = Number(process.env.BSV_UTXO_FETCH_MAX_RETRIES || 4)
+// How long to treat an input UTXO as "used" (to avoid re-spends while indexers lag).
+// This prevents txn-mempool-conflict when WoC /unspent still lists a just-spent UTXO.
+const UTXO_USED_KEY_TTL_MS = Number(process.env.BSV_UTXO_USED_KEY_TTL_MS || 30 * 60 * 1000) // 30 min
 
 // Supabase client removed; we persist via Postgres repositories (tx_log)
 
@@ -173,23 +180,19 @@ export class BlockchainService {
   private lastInitError: string | null = null
   private wifsForSend: string[] = []
   private rrIndex: number = 0
-  private wocMirrorTimestamps: number[] = []
-  // Shared limiter for all WoC tx/raw POSTs (low-fee lane + mirror)
-  private wocTxRawTimestamps: number[] = []
   private broadcastCountSinceLastSample = 0
   // Lightweight per-address UTXO cache to avoid hammering indexers
   private utxoCacheByAddress: Map<string, {
     fetchedAt: number
     utxos: any[]
-    usedKeys: Set<string>
+    // key -> expiresAt (ms). We keep recently-used keys even across refreshes
+    // so we don't re-spend an input while indexers are eventually consistent.
+    usedKeys: Map<string, number>
     inFlight: Promise<void> | null
   }> = new Map()
   // Transaction status aggregation to reduce log noise
   private txStatusBatch: { confirmed: string[], pending: string[], notFound: string[] } = { confirmed: [], pending: [], notFound: [] }
   private batchIntervalId: NodeJS.Timeout | null = null
-  // WoC cooldown tracking (auto-fallback to ARC on repeated failures)
-  private wocConsecutiveFailures = 0
-  private wocCooldownUntil = 0
 
   constructor() {
     try {
@@ -247,83 +250,13 @@ export class BlockchainService {
           console.log(`   ⏳ Pending in mempool: ${pending.length} transactions`)
         }
         if (notFound.length > 0) {
-          console.log(`   ⚠️  Not found on WOC: ${notFound.length} transactions (may be rejected or still propagating)`)
+          console.log(`   ⚠️  Not found on-chain: ${notFound.length} transactions (may be rejected or still propagating)`)
         }
         
         // Reset batch
         this.txStatusBatch = { confirmed: [], pending: [], notFound: [] }
       }
     }, 60000) // Every 60 seconds
-  }
-
-  /**
-   * Check if WoC is currently in cooldown mode
-   */
-  private isWocInCooldown(): boolean {
-    if (this.wocCooldownUntil > 0 && Date.now() < this.wocCooldownUntil) {
-      return true
-    }
-    // Cooldown expired, reset
-    if (this.wocCooldownUntil > 0 && Date.now() >= this.wocCooldownUntil) {
-      console.log('🔄 WoC cooldown expired, re-enabling WoC broadcasting')
-      this.wocCooldownUntil = 0
-      this.wocConsecutiveFailures = 0
-    }
-    return false
-  }
-
-  /**
-   * Record a WoC failure and potentially trigger cooldown
-   */
-  private recordWocFailure(): void {
-    this.wocConsecutiveFailures++
-    if (this.wocConsecutiveFailures >= WOC_COOLDOWN_THRESHOLD) {
-      this.wocCooldownUntil = Date.now() + WOC_COOLDOWN_DURATION_MS
-      console.warn(`⚠️ WoC hit ${this.wocConsecutiveFailures} consecutive failures, entering cooldown for ${WOC_COOLDOWN_DURATION_MS / 1000}s (using ARC fallback)`)
-    }
-  }
-
-  /**
-   * Record a WoC success, resetting the failure counter
-   */
-  private recordWocSuccess(): void {
-    if (this.wocConsecutiveFailures > 0) {
-      console.log(`✅ WoC recovered after ${this.wocConsecutiveFailures} failure(s), resetting counter`)
-    }
-    this.wocConsecutiveFailures = 0
-  }
-
-  /**
-   * Get current WoC cooldown status (for monitoring/debugging)
-   */
-  public getWocCooldownStatus(): {
-    inCooldown: boolean
-    consecutiveFailures: number
-    cooldownRemainingMs: number
-    cooldownThreshold: number
-    cooldownDurationMs: number
-  } {
-    const now = Date.now()
-    const inCooldown = this.wocCooldownUntil > 0 && now < this.wocCooldownUntil
-    return {
-      inCooldown,
-      consecutiveFailures: this.wocConsecutiveFailures,
-      cooldownRemainingMs: inCooldown ? this.wocCooldownUntil - now : 0,
-      cooldownThreshold: WOC_COOLDOWN_THRESHOLD,
-      cooldownDurationMs: WOC_COOLDOWN_DURATION_MS,
-    }
-  }
-
-  /**
-   * Manually reset WoC cooldown (for admin/debugging)
-   */
-  public resetWocCooldown(): void {
-    const wasInCooldown = this.wocCooldownUntil > 0 && Date.now() < this.wocCooldownUntil
-    this.wocCooldownUntil = 0
-    this.wocConsecutiveFailures = 0
-    if (wasInCooldown) {
-      console.log('🔧 WoC cooldown manually reset by admin')
-    }
   }
 
   private async getFirstWalletWithSpendableUtxos(): Promise<{ wif: string; index: number; address: string; utxos: any[] } | null> {
@@ -333,14 +266,28 @@ export class BlockchainService {
       : (BSV_PRIVATE_KEY ? [BSV_PRIVATE_KEY] : (BSV_FALLBACK_WIF ? [BSV_FALLBACK_WIF] : []))
     if (list.length === 0) return null
     
-    const diagnostics: Array<{ address: string; spendableCount: number; totalBalance?: number; error?: string }> = []
+    const diagnostics: Array<{ address: string; spendableCount: number; totalBalance?: number; error?: string; backedOff?: boolean }> = []
     
+    // Import backoff checker (lazy — non-fatal if module unavailable)
+    let isBackedOff: ((addr: string) => boolean) | null = null
+    try {
+      const mod = await import('./utxo-maintainer')
+      isBackedOff = mod.isWalletBackedOff
+    } catch {}
+
     for (let i = 0; i < list.length; i++) {
       const pick = (this.rrIndex + i) % list.length
       const wif = list[pick]
       try {
         const sdkKey = SDKPrivateKey.fromWif(wif)
         const addr = sdkKey.toPublicKey().toAddress().toString()
+
+        // Skip wallets in mempool-chain backoff (prevents hammering doomed UTXOs)
+        if (isBackedOff && isBackedOff(addr)) {
+          diagnostics.push({ address: addr, spendableCount: 0, backedOff: true })
+          continue
+        }
+
         const spendable = await this.getSpendableUtxos(addr, wif)
         
         // Estimate balance from spendable UTXOs for diagnostics (avoid extra WoC calls)
@@ -457,6 +404,7 @@ export class BlockchainService {
   }
 
   async writeToChain(data: BlockchainData): Promise<string> {
+    let fromAddress = '' // hoisted so outer catch can signal per-wallet backoff
     try {
       // Check if blockchain is configured
       if (!BSV_PRIVATE_KEY && !BSV_FALLBACK_WIF) {
@@ -466,7 +414,8 @@ export class BlockchainService {
       // Pick a wallet that currently has spendable UTXOs (fair round-robin)
       const picked = await this.getFirstWalletWithSpendableUtxos()
       if (!picked) throw new Error('No UTXOs available across wallets')
-      const { wif, index: walletIndexForLog, address: fromAddress } = picked
+      const { wif, index: walletIndexForLog, address: pickedAddress } = picked
+      fromAddress = pickedAddress
 
       // Proceed based on UTXO availability rather than blunt balance threshold
 
@@ -608,7 +557,37 @@ export class BlockchainService {
             }
           } catch {}
         } else {
-          // No DB lock: just pick the first candidate
+          // No DB lock: pick the first candidate that isn't already in-flight.
+          // Check usedKeys directly (not just the pre-filtered snapshot) to close
+          // the race window between concurrent writeToChain calls.
+          const addrCache = this.utxoCacheByAddress.get(address)
+          const alreadyUsed = addrCache?.usedKeys?.get(key)
+          if (alreadyUsed && alreadyUsed > Date.now()) continue // skip — another call grabbed it
+          // Mark used IMMEDIATELY to prevent concurrent calls from selecting the same UTXO
+          if (ENABLE_UTXO_POOL && addrCache) {
+            addrCache.usedKeys.set(key, Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS))
+          }
+          selectedUtxo = u
+          inputKey = key
+          break
+        }
+      }
+      // If every candidate was already claimed, force-refresh and try once more.
+      // Change outputs from recent TXs may now be visible to the indexer.
+      if (!selectedUtxo) {
+        await this.refreshUtxoCache(address, wif, true)
+        const freshUtxos = await this.getSpendableUtxos(address, wif)
+        const freshCandidates = freshUtxos.length <= lowWater
+          ? [...freshUtxos].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
+          : [...freshUtxos].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
+        for (const u of freshCandidates) {
+          const key = `${u.tx_hash}:${u.tx_pos}`
+          const addrCache = this.utxoCacheByAddress.get(address)
+          const alreadyUsed = addrCache?.usedKeys?.get(key)
+          if (alreadyUsed && alreadyUsed > Date.now()) continue
+          if (ENABLE_UTXO_POOL && addrCache) {
+            addrCache.usedKeys.set(key, Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS))
+          }
           selectedUtxo = u
           inputKey = key
           break
@@ -688,63 +667,17 @@ export class BlockchainService {
         return { lockingScript: scriptHex, satoshis: sats }
       }) : []
 
-      // Broadcast transaction (prefer WoC low-fee lane when enabled and capacity available)
-      // Prevent double-use of the same cached UTXOs across rapid sends
+      // Broadcast transaction via GorillaPool ARC (primary) → TAAL ARC (fallback)
+      // Note: UTXO was already marked used at selection time (race-condition guard).
+      // The call below simply refreshes the TTL.
       let reservedKeys: string[] = []
       try {
         if (ENABLE_UTXO_POOL) {
           reservedKeys = bitcoreUtxos.map((i: any) => `${i.txId}:${i.outputIndex}`)
-          this.markUtxosUsed(reservedKeys)
+          this.markUtxosUsed(reservedKeys) // refresh TTL
         }
-        let txid: string
-        try {
-          // Check if WoC is in cooldown - if so, use ARC directly
-          const wocInCooldown = this.isWocInCooldown()
-          
-          if ((WOC_FIRST || WOC_LOW_FEE_ENABLED || WOC_ONLY) && !wocInCooldown) {
-            // Throttled WoC-first path: wait for slot, then prefer WoC with low-fee factor when enabled
-            await this.waitForWocSlot()
-            const feeFactor = WOC_LOW_FEE_ENABLED ? Math.max(WOC_LOW_FEE_FACTOR, 0.01) : 1
-            const woCHex = buildSerialized(feeFactor)
-            try {
-              txid = await this.broadcastViaWocOnly(woCHex)
-              this.recordWocSuccess()
-            } catch {
-              // Retry WoC once more after a brief wait, then fall back
-              await this.waitForWocSlot()
-              const woCHex2 = buildSerialized(feeFactor)
-              try {
-                txid = await this.broadcastViaWocOnly(woCHex2)
-                this.recordWocSuccess()
-              } catch {
-                this.recordWocFailure()
-                // In WOC_ONLY mode, still allow ARC fallback during cooldown
-                if (WOC_ONLY && !this.isWocInCooldown()) {
-                  throw new Error('WoC-only mode: WoC broadcast failed after retries')
-                }
-                // Fall back to ARC (either normally or during WoC cooldown)
-                console.log(`🔄 Falling back to ARC broadcast${this.isWocInCooldown() ? ' (WoC in cooldown)' : ''}`)
-                const normalHex = buildSerialized(1)
-                txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
-              }
-            }
-          } else if (wocInCooldown) {
-            // WoC is in cooldown, use ARC directly
-            const normalHex = buildSerialized(1)
-            txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
-          } else {
-            // Legacy behavior when not using WoC-first or low-fee lane
-            const normalHex = buildSerialized(1)
-            txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
-          }
-        } catch (_e) {
-          // Final fallback to normal path if anything else blew up
-          if (WOC_ONLY && !this.isWocInCooldown()) {
-            throw _e
-          }
-          const normalHex = buildSerialized(1)
-          txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
-        }
+        const normalHex = buildSerialized(1)
+        const txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
 
         // Log transaction
       const transactionLog: TransactionLog = {
@@ -756,6 +689,27 @@ export class BlockchainService {
       }
 
       this.transactionLog.push(transactionLog)
+
+      // ── Feed reading to /explorer store (zero API calls) ──
+      try {
+        const pl: any = payloadWithAscii ?? data.payload ?? {}
+        const explorerReading: StoredReading = {
+          txid,
+          dataType: data.stream,
+          location: pl.location || pl.location_ascii || pl.station_name || pl.city || null,
+          lat: pl.coordinates?.lat ?? pl.coordinates?.latitude ?? pl.latitude ?? null,
+          lon: pl.coordinates?.lon ?? pl.coordinates?.longitude ?? pl.longitude ?? null,
+          timestamp: data.timestamp,
+          metrics: pl,
+          provider: (data as any)?.payload?.source || null,
+          blockHeight: 0, // Will be set when confirmed
+          blockTime: null,
+        }
+        addReading(explorerReading)
+      } catch {
+        // Non-fatal – explorer store is secondary
+      }
+
       // Persist to tx_log (pending on broadcast, will be confirmed later)
       try {
         if (process.env.GAIALOG_NO_DB !== 'true') {
@@ -800,9 +754,21 @@ export class BlockchainService {
     } catch (error) {
       // Suppress noisy logs for expected, transient availability issues
       const msg = error instanceof Error ? error.message : String(error)
-      const transient = /already reserved|No UTXOs available across wallets|No reservable UTXO/i.test(msg)
+      const transient = /already reserved|No UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND/i.test(msg)
+
+      // Signal per-wallet mempool-chain backoff so round-robin skips this wallet
+      if (msg.includes('MEMPOOL_CHAIN_LIMIT') && fromAddress) {
+        try {
+          const { signalMempoolChainLimit } = await import('./utxo-maintainer')
+          signalMempoolChainLimit(fromAddress)
+        } catch {}
+      }
+
       if (!transient) {
         console.error('❌ Error writing to blockchain:', error)
+      } else if (/txn-mempool-conflict|DOUBLE_SPEND/i.test(msg)) {
+        // One-liner instead of full stack trace — this is recoverable
+        console.warn(`⚠️  UTXO conflict (will retry with fresh UTXO): ${msg.split('\n')[0].substring(0, 120)}`)
       }
       
       // Log failed transaction
@@ -838,76 +804,16 @@ export class BlockchainService {
     }
   }
 
-  /**
-   * Reserve a WoC tx/raw POST slot if available within the 1s window.
-   * Returns true when reserved, false when capacity is exhausted.
-   */
-  private canTakeWocTxRawSlot(): boolean {
-    const now = Date.now()
-    const capacity = WOC_LOW_FEE_ENABLED ? WOC_LOW_FEE_TPS : WOC_MIRROR_MAX_RPS
-    this.wocTxRawTimestamps = this.wocTxRawTimestamps.filter(t => now - t < 1000)
-    if (this.wocTxRawTimestamps.length >= capacity) return false
-    this.wocTxRawTimestamps.push(now)
-    return true
-  }
-
-  /**
-   * Wait until a WoC tx/raw slot is available, reserving it when acquired.
-   * Uses the same internal slot accounting as mirrors/low-fee path.
-   */
-  private async waitForWocSlot(): Promise<void> {
-    // Busy-wait in short sleeps until a slot is available
-    while (true) {
-      if (this.canTakeWocTxRawSlot()) return
-      await new Promise(r => setTimeout(r, 15))
-    }
-  }
-
-  /**
-   * Direct WoC broadcast (tx/raw). Caller must acquire slot first via canTakeWocTxRawSlot.
-   */
-  private async broadcastViaWocOnly(serializedTx: string): Promise<string> {
-    const wocNet = WOC_NETWORK
-    const wocRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ txhex: serializedTx })
-    })
-    const wocText = await wocRes.text().catch(() => '')
-    if (wocRes.ok) {
-      const txid = (wocText || '').replace(/"/g, '').trim()
-      if (/^[0-9a-fA-F]{64}$/.test(txid)) {
-        // Mirror WoC success to ARC asynchronously to keep mempools in sync
-        try {
-          const arcKey = process.env.BSV_ARC_API_KEY
-          const arcEndpoint = (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc').replace(/\/$/, '')
-          if (arcKey && MIRROR_TO_ARC) {
-            fetch(`${arcEndpoint}/v1/tx`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${arcKey}`,
-              },
-              body: JSON.stringify({ rawTx: serializedTx })
-            }).catch(() => {})
-          }
-        } catch {}
-        return txid
-      }
-      throw new Error(`WOC returned invalid txid: ${wocText}`)
-    }
-    throw new Error(`WOC failed (${wocRes.status})`)
-  }
-
-  private async refreshUtxoCache(address: string, wif: string): Promise<void> {
+  private async refreshUtxoCache(address: string, wif: string, force = false): Promise<void> {
     let cache = this.utxoCacheByAddress.get(address)
     if (!cache) {
-      cache = { fetchedAt: 0, utxos: [], usedKeys: new Set<string>(), inFlight: null }
+      cache = { fetchedAt: 0, utxos: [], usedKeys: new Map<string, number>(), inFlight: null }
       this.utxoCacheByAddress.set(address, cache)
     }
     if (cache.inFlight) {
       await cache.inFlight
-      return
+      if (!force) return
+      // force=true: the previous in-flight refresh may not have picked up the latest change outputs
     }
     cache.inFlight = (async () => {
       // Fetch UTXOs for the given address using a temporary wallet
@@ -915,7 +821,14 @@ export class BlockchainService {
       const fetched = await tempWallet.getUTXOs()
       cache!.utxos = Array.isArray(fetched) ? fetched : []
       cache!.fetchedAt = Date.now()
-      cache!.usedKeys.clear()
+      // Do NOT clear usedKeys on refresh — WoC /unspent can lag, so a just-spent
+      // UTXO may still appear briefly. We prune by expiry instead.
+      try {
+        const now = Date.now()
+        for (const [k, exp] of cache!.usedKeys.entries()) {
+          if (exp <= now) cache!.usedKeys.delete(k)
+        }
+      } catch {}
       
       // Debug logging for UTXO refresh
       console.log(`🔁 UTXO cache refreshed for ${address.substring(0, 10)}...: ${cache!.utxos.length} raw UTXO(s) fetched`)
@@ -948,9 +861,7 @@ export class BlockchainService {
       const raw = await temp.getUTXOs()
       return Array.isArray(raw)
         ? raw.filter((u: any) => {
-            const conf = (u.confirmations || 0) >= MIN_SPEND_CONF
-            const byHeight = typeof u.height === 'number' ? (u.height > 0 || (u.height === 0 && MIN_SPEND_CONF <= 1)) : true
-            return conf || byHeight
+            return (u.confirmations || 0) >= MIN_SPEND_CONF || (typeof u.height !== 'number') || u.height > 0
           })
         : []
     }
@@ -960,14 +871,24 @@ export class BlockchainService {
       await this.refreshUtxoCache(address, explicitWif || '')
       cache = this.utxoCacheByAddress.get(address)!
     }
+    // Best-effort prune expired used keys
+    try {
+      for (const [k, exp] of cache.usedKeys.entries()) {
+        if (exp <= now) cache.usedKeys.delete(k)
+      }
+    } catch {}
     // Only refresh on TTL if available confirmed UTXOs is low
     const availableNow = (cache?.utxos || [])
       .filter((u: any) => {
-        const conf = (u.confirmations || 0) >= MIN_SPEND_CONF
-        const byHeight = typeof u.height === 'number' ? (u.height > 0 || (u.height === 0 && MIN_SPEND_CONF <= 1)) : true
-        return conf || byHeight
+        return (u.confirmations || 0) >= MIN_SPEND_CONF || (typeof u.height !== 'number') || u.height > 0
       })
-      .filter((u: any) => !cache!.usedKeys.has(`${u.tx_hash}:${u.tx_pos}`))
+      .filter((u: any) => {
+        const key = `${u.tx_hash}:${u.tx_pos}`
+        const exp = cache!.usedKeys.get(key)
+        if (!exp) return true
+        if (exp <= now) { cache!.usedKeys.delete(key); return true }
+        return false
+      })
     if (now - cache.fetchedAt > UTXO_POOL_TTL_MS && availableNow.length < REFRESH_THRESHOLD) {
       // Refresh using an explicit WIF that matches this address
       let matchWif = explicitWif || ''
@@ -986,12 +907,14 @@ export class BlockchainService {
     }
     const used = cache.usedKeys
     const available = cache.utxos
+      .filter((u: any) => (u.confirmations || 0) >= MIN_SPEND_CONF || (typeof u.height !== 'number') || u.height > 0)
       .filter((u: any) => {
-        const conf = (u.confirmations || 0) >= MIN_SPEND_CONF
-        const byHeight = typeof u.height === 'number' ? (u.height > 0 || (u.height === 0 && MIN_SPEND_CONF <= 1)) : true
-        return conf || byHeight
+        const key = `${u.tx_hash}:${u.tx_pos}`
+        const exp = used.get(key)
+        if (!exp) return true
+        if (exp <= now) { used.delete(key); return true }
+        return false
       })
-      .filter((u: any) => !used.has(`${u.tx_hash}:${u.tx_pos}`))
     if (available.length === 0) {
       // Try a forced refresh once
       let matchWif = explicitWif || ''
@@ -1007,21 +930,24 @@ export class BlockchainService {
       if (matchWif) await this.refreshUtxoCache(address, matchWif)
       const refreshed = this.utxoCacheByAddress.get(address)!
       return refreshed.utxos
+        .filter((u: any) => (u.confirmations || 0) >= MIN_SPEND_CONF || (typeof u.height !== 'number') || u.height > 0)
         .filter((u: any) => {
-          const conf = (u.confirmations || 0) >= MIN_SPEND_CONF
-          const byHeight = typeof u.height === 'number' ? (u.height > 0 || (u.height === 0 && MIN_SPEND_CONF <= 1)) : true
-          return conf || byHeight
+          const key = `${u.tx_hash}:${u.tx_pos}`
+          const exp = refreshed.usedKeys.get(key)
+          if (!exp) return true
+          if (exp <= now) { refreshed.usedKeys.delete(key); return true }
+          return false
         })
-        .filter((u: any) => !refreshed.usedKeys.has(`${u.tx_hash}:${u.tx_pos}`))
     }
     return available
   }
 
   private markUtxosUsed(keys: string[]): void {
     if (!ENABLE_UTXO_POOL) return
+    const exp = Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS)
     // Mark in every address cache (keys are globally unique per address anyway)
     for (const cache of this.utxoCacheByAddress.values()) {
-      for (const k of keys) cache.usedKeys.add(k)
+      for (const k of keys) cache.usedKeys.set(k, exp)
     }
   }
 
@@ -1054,7 +980,7 @@ export class BlockchainService {
           if (cache) {
             cache.fetchedAt = 0 // Force refresh by making cache stale
             cache.utxos = [] // Clear existing UTXOs
-            cache.usedKeys.clear() // Clear used keys
+            cache.usedKeys.clear() // Clear used key TTLs (explicit force refresh)
             cache.inFlight = null // Cancel any in-flight refresh
           }
         }
@@ -1095,193 +1021,179 @@ export class BlockchainService {
     console.log('✅ UTXO cache refresh complete')
   }
 
+  // ARC txStatus values that indicate the TX was genuinely accepted.
+  // SEEN_IN_ORPHAN_MEMPOOL means ARC accepted but parent chain is long/unconfirmed;
+  // the TX will propagate automatically once parents confirm in a block.
+  private static ARC_OK_STATUSES = new Set([
+    'SEEN_ON_NETWORK',
+    'MINED',
+    'ACCEPTED',
+    'STORED',
+    'ANNOUNCED_TO_NETWORK',
+    'SEEN_IN_ORPHAN_MEMPOOL',
+  ])
+
+  // ARC txStatus values that mean the TX was rejected (should NOT be treated as success)
+  private static ARC_REJECT_STATUSES = new Set([
+    'DOUBLE_SPEND_ATTEMPTED',
+    'REJECTED',
+    'INVALID',
+    'EVICTED',
+  ])
+
+  /**
+   * Parse an ARC response and return the txid ONLY if the TX was genuinely accepted.
+   * ARC returns HTTP 200 + a valid txid even for DOUBLE_SPEND_ATTEMPTED — we must
+   * inspect the txStatus field to avoid logging a rejected TX as "successful".
+   */
+  private parseArcResponse(responseText: string, providerLabel: string): string | null {
+    try {
+      const parsed = JSON.parse(responseText || '{}')
+      const txid = typeof parsed.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(parsed.txid)
+        ? parsed.txid : null
+      const status = typeof parsed.txStatus === 'string' ? parsed.txStatus : ''
+
+      // Reject if ARC explicitly flagged as failed
+      if (txid && BlockchainService.ARC_REJECT_STATUSES.has(status)) {
+        const competing = Array.isArray(parsed.competingTxs) ? ` (competing: ${parsed.competingTxs[0]?.substring(0, 12)}...)` : ''
+        console.warn(`⚠️  ARC (${providerLabel}): TX rejected — txStatus=${status}${competing} txid=${txid.substring(0, 12)}...`)
+        return null
+      }
+
+      // Accept if status is known-good or if no status field was returned (legacy ARC)
+      if (txid && (BlockchainService.ARC_OK_STATUSES.has(status) || !status)) {
+        if (bsvConfig.logging.level === 'debug') {
+          console.log(`📡 ARC (${providerLabel}): txStatus=${status || 'N/A'} txid=${txid.substring(0, 12)}...`)
+        }
+        return txid
+      }
+
+      // Unknown status with a txid — log but accept cautiously
+      if (txid) {
+        console.warn(`⚠️  ARC (${providerLabel}): Unknown txStatus="${status}" — accepting txid=${txid.substring(0, 12)}... cautiously`)
+        return txid
+      }
+    } catch {}
+
+    // Fallback: some ARC deployments return plain string txid (no JSON)
+    const plain = (responseText || '').replace(/"/g, '').trim()
+    if (/^[0-9a-fA-F]{64}$/.test(plain)) return plain
+    return null
+  }
+
   private async broadcastTransaction(
     serializedTx: string,
     prevouts?: Array<{ lockingScript: string; satoshis: number }>
   ): Promise<string> {
     const errors: string[] = []
-    let lastArcText: string | undefined
 
-    // Optional Method 0: WhatOnChain first (cost-optimised, throttled)
-    if (WOC_FIRST || WOC_ONLY) {
-      try {
-        await this.waitForWocSlot()
-        const wocNet = WOC_NETWORK
-        const wocRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ txhex: serializedTx })
-        })
-        const wocText = await wocRes.text().catch(() => '')
-        if (wocRes.ok) {
-          const txid = (wocText || '').replace(/"/g, '').trim()
-          if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
-        } else {
-          errors.push(`WhatOnChain failed (${wocRes.status})`)
-          if (WOC_ONLY) {
-            throw new Error(`WoC-only mode: WhatOnChain failed (${wocRes.status})`)
-          }
-        }
-      } catch (e) {
-        errors.push(`WhatOnChain error: ${e instanceof Error ? e.message : String(e)}`)
-        if (WOC_ONLY) {
-          throw new Error(`WoC-only mode: ${e instanceof Error ? e.message : String(e)}`)
-        }
-      }
-    }
-
-    // Method 1: TAAL ARC (primary)
+    // Build the ARC request body (shared by both ARC providers)
+    const arcBody: any = { rawTx: serializedTx }
     try {
-      const arcKey = process.env.BSV_ARC_API_KEY
-      const arcEndpoint = process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc'
-      if (arcKey) {
-        // Prefer sending ARC Extended Format when prevouts are available
-        const arcBody: any = { rawTx: serializedTx }
-        try {
-          const useExtended = prevouts && prevouts.length > 0 && (process.env.BSV_ARC_EXTENDED_FORMAT !== 'false')
-          if (useExtended) {
-            arcBody.inputs = prevouts.map(p => ({
-              lockingScript: p.lockingScript,
-              satoshis: Math.max(0, Number(p.satoshis) || 0),
-            }))
-          }
-        } catch {}
-        const arcRes = await fetch(`${arcEndpoint.replace(/\/$/, '')}/v1/tx`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${arcKey}`,
-          },
-          body: JSON.stringify(arcBody)
-        })
-        lastArcText = await arcRes.text().catch(() => '')
-        if (arcRes.ok) {
-          // Try JSON { txid }
-          try {
-            const parsed = JSON.parse(lastArcText || '{}')
-            if (parsed && typeof parsed.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(parsed.txid)) {
-              // Optional mirror to WOC
-              if (MIRROR_TO_WOC && this.canTakeWocTxRawSlot()) {
-                try {
-                  const wocNet = WOC_NETWORK
-                  fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ txhex: serializedTx })
-                  }).catch(() => {})
-                } catch {}
-              }
-              return parsed.txid
-            }
-          } catch {}
-          // Some ARC deployments return plain string txid
-          const txid = (lastArcText || '').replace(/"/g, '').trim()
-          if (/^[0-9a-fA-F]{64}$/.test(txid)) {
-            if (MIRROR_TO_WOC && this.canTakeWocTxRawSlot()) {
-              try {
-                const wocNet = WOC_NETWORK
-                fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ txhex: serializedTx })
-                }).catch(() => {})
-              } catch {}
-            }
-            return txid
-          }
-        } else {
-          errors.push(`ARC failed (${arcRes.status}): ${lastArcText || arcRes.statusText}`)
-        }
-      } else {
-        errors.push('ARC not configured (BSV_ARC_API_KEY missing)')
+      const useExtended = prevouts && prevouts.length > 0 && (process.env.BSV_ARC_EXTENDED_FORMAT !== 'false')
+      if (useExtended) {
+        arcBody.inputs = prevouts.map(p => ({
+          lockingScript: p.lockingScript,
+          satoshis: Math.max(0, Number(p.satoshis) || 0),
+        }))
       }
-    } catch (e) {
-      errors.push(`ARC error: ${e instanceof Error ? e.message : String(e)}`)
-    }
+    } catch {}
 
-    // Method 2: GorillaPool mAPI (fallback)
+    // Method 1: GorillaPool ARC (primary) — public access, no API key required
     try {
-      const gpEndpoint = (process.env.BSV_GORILLAPOOL_MAPI_ENDPOINT || 'https://mapi.gorillapool.io').replace(/\/$/, '')
-      const gpRes = await fetch(`${gpEndpoint}/mapi/tx`, {
+      const gpHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+      const gpApiKey = process.env.BSV_GORILLAPOOL_API_KEY
+      if (gpApiKey) gpHeaders['Authorization'] = `Bearer ${gpApiKey}`
+
+      const gpRes = await fetch(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rawTx: serializedTx })
+        headers: gpHeaders,
+        body: JSON.stringify(arcBody)
       })
       const gpText = await gpRes.text().catch(() => '')
       if (gpRes.ok) {
-        try {
-          const gpData = JSON.parse(gpText || '{}')
-          if (gpData?.payload) {
-            const payload = JSON.parse(gpData.payload)
-            if (payload?.returnResult === 'success' && typeof payload.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(payload.txid)) {
-              // Mirror GorillaPool success to ARC asynchronously to keep mempools in sync
-              try {
-                const arcKey = process.env.BSV_ARC_API_KEY
-                const arcEndpoint = (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc').replace(/\/$/, '')
-                if (arcKey && MIRROR_TO_ARC) {
-                  fetch(`${arcEndpoint}/v1/tx`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${arcKey}` },
-                    body: JSON.stringify({ rawTx: serializedTx })
-                  }).catch(() => {})
-                }
-              } catch {}
-              return payload.txid
-            }
-            if (payload?.returnResult === 'failure') {
-              errors.push(`GorillaPool rejected: ${payload?.resultDescription || 'Unknown reason'}`)
-            }
-          }
-        } catch {
-          // If response isn't standard envelope, try raw string txid
-          const txid = (gpText || '').replace(/"/g, '').trim()
-          if (/^[0-9a-fA-F]{64}$/.test(txid)) {
-            // Mirror GorillaPool success to ARC asynchronously
-            try {
-              const arcKey = process.env.BSV_ARC_API_KEY
-              const arcEndpoint = (process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc').replace(/\/$/, '')
-              if (arcKey && MIRROR_TO_ARC) {
-                fetch(`${arcEndpoint}/v1/tx`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${arcKey}` },
-                  body: JSON.stringify({ rawTx: serializedTx })
-                }).catch(() => {})
-              }
-            } catch {}
-            return txid
-          }
-        }
+        const txid = this.parseArcResponse(gpText, 'GorillaPool')
+        if (txid) return txid
+        errors.push(`GorillaPool ARC: rejected or unexpected response: ${gpText.substring(0, 200)}`)
       } else {
-        errors.push(`GorillaPool failed (${gpRes.status})`)
-      }
-    } catch (e) {
-      errors.push(`GorillaPool error: ${e instanceof Error ? e.message : String(e)}`)
-    }
-
-    // Method 3: WhatOnChain (last resort)
-    try {
-      // Avoid double-broadcasting if we already mirrored
-      if (!MIRROR_TO_WOC) {
-        const wocNet = WOC_NETWORK
-        const wocRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/tx/raw`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ txhex: serializedTx })
-        })
-        const wocText = await wocRes.text().catch(() => '')
-        if (wocRes.ok) {
-          const txid = (wocText || '').replace(/"/g, '').trim()
-          if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
-        } else {
-          errors.push(`WhatOnChain failed (${wocRes.status})`)
+        if (bsvConfig.logging.level !== 'error') {
+          console.warn(`⚠️  ARC (GorillaPool) ${gpRes.status}: ${gpText.substring(0, 150)}`)
         }
+        errors.push(`GorillaPool ARC failed (${gpRes.status}): ${gpText.substring(0, 300)}`)
       }
     } catch (e) {
-      errors.push(`WhatOnChain error: ${e instanceof Error ? e.message : String(e)}`)
+      errors.push(`GorillaPool ARC error: ${e instanceof Error ? e.message : String(e)}`)
     }
 
-    // If we reach here, all methods failed
-    throw new Error(`All broadcast methods failed:\n${errors.join('\n')}`)
+    // Method 2: TAAL ARC (fallback)
+    try {
+      const arcKey = process.env.BSV_ARC_API_KEY
+      const taalHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (arcKey) taalHeaders['Authorization'] = `Bearer ${arcKey}`
+
+      const arcRes = await fetch(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
+        method: 'POST',
+        headers: taalHeaders,
+        body: JSON.stringify(arcBody)
+      })
+      const arcText = await arcRes.text().catch(() => '')
+      if (arcRes.ok) {
+        const txid = this.parseArcResponse(arcText, 'TAAL')
+        if (txid) return txid
+        errors.push(`TAAL ARC: rejected or unexpected response: ${arcText.substring(0, 200)}`)
+      } else {
+        if (bsvConfig.logging.level !== 'error') {
+          console.warn(`⚠️  ARC (TAAL) ${arcRes.status}: ${arcText.substring(0, 150)}`)
+        }
+        errors.push(`TAAL ARC failed (${arcRes.status}): ${arcText.substring(0, 300)}`)
+      }
+    } catch (e) {
+      errors.push(`TAAL ARC error: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    // Method 3: WhatsOnChain broadcast (final fallback)
+    // WoC broadcasts directly to miners and does NOT share ARC's
+    // double-spend conflict memory — this unblocks UTXOs that ARC
+    // incorrectly flags as DOUBLE_SPEND_ATTEMPTED due to stale conflicts.
+    try {
+      const wocNetwork = WOC_NETWORK
+      const wocHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (WHATSONCHAIN_API_KEY) wocHeaders['woc-api-key'] = WHATSONCHAIN_API_KEY
+
+      const wocRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNetwork}/tx/raw`, {
+        method: 'POST',
+        headers: wocHeaders,
+        body: JSON.stringify({ txhex: serializedTx })
+      })
+      const wocText = await wocRes.text().catch(() => '')
+      if (wocRes.ok) {
+        // WoC returns the txid as a plain string (with quotes)
+        const txid = wocText.replace(/"/g, '').trim()
+        if (/^[0-9a-fA-F]{64}$/.test(txid)) {
+          console.log(`📡 WoC broadcast accepted: txid=${txid.substring(0, 12)}...`)
+          return txid
+        }
+        errors.push(`WoC returned unexpected response: ${wocText.substring(0, 200)}`)
+      } else {
+        if (bsvConfig.logging.level !== 'error') {
+          console.warn(`⚠️  WoC broadcast ${wocRes.status}: ${wocText.substring(0, 150)}`)
+        }
+        errors.push(`WoC broadcast failed (${wocRes.status}): ${wocText.substring(0, 300)}`)
+      }
+    } catch (e) {
+      errors.push(`WoC broadcast error: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    // If we reach here, all methods failed.
+    // Detect the specific "too-long-mempool-chain" transient condition — this resolves
+    // automatically once the next block is mined and parent TXs are confirmed.
+    const allErrors = errors.join('\n')
+    const isMempoolChain = allErrors.includes('too-long-mempool-chain')
+    if (isMempoolChain) {
+      console.warn(`⏳ Mempool chain too long — waiting for next block to shorten the unconfirmed ancestor chain. Will retry automatically.`)
+      throw new Error('MEMPOOL_CHAIN_LIMIT')
+    }
+    throw new Error(`All broadcast methods failed:\n${allErrors}`)
   }
 
   private async scheduleConfirmationCheck(txid: string, streamType: string): Promise<void> {
@@ -1370,11 +1282,9 @@ export class BlockchainService {
 
       const selected: any[] = []
       let totalInput = 0
-      // Apply WoC low-fee factor when enabled so even direct sends use cheap fees
-      const feeFactor = WOC_LOW_FEE_ENABLED ? Math.max(WOC_LOW_FEE_FACTOR, 0.01) : 1
-      const feePerKb = FEE_RATE_SAT_PER_BYTE * 1000 * feeFactor
+      const feePerKb = FEE_RATE_SAT_PER_BYTE * 1000
       const baseOverhead = 200 // bytes rough baseline
-      const estimatedFee = Math.ceil((baseOverhead) * FEE_RATE_SAT_PER_BYTE * feeFactor)
+      const estimatedFee = Math.ceil(baseOverhead * FEE_RATE_SAT_PER_BYTE)
       const target = amountSats + estimatedFee + DUST_LIMIT
       for (const u of sorted) {
         selected.push({
@@ -1460,5 +1370,10 @@ export class BlockchainService {
   }
 }
 
-// Export singleton instance
-export const blockchainService = new BlockchainService()
+// Persist singleton on globalThis to survive Next.js dev-mode module
+// re-evaluations that would otherwise create duplicate service instances.
+const _bs = globalThis as any
+if (!_bs.__GAIALOG_BLOCKCHAIN_SERVICE__) {
+  _bs.__GAIALOG_BLOCKCHAIN_SERVICE__ = new BlockchainService()
+}
+export const blockchainService: BlockchainService = _bs.__GAIALOG_BLOCKCHAIN_SERVICE__

@@ -563,5 +563,10 @@ export class WorkerQueue {
   }
 }
 
-// Export singleton instance
-export const workerQueue = new WorkerQueue()
+// Persist singleton on globalThis to survive Next.js dev-mode module
+// re-evaluations that would otherwise create duplicate queue processors.
+const _wq = globalThis as any
+if (!_wq.__GAIALOG_WORKER_QUEUE__) {
+  _wq.__GAIALOG_WORKER_QUEUE__ = new WorkerQueue()
+}
+export const workerQueue: WorkerQueue = _wq.__GAIALOG_WORKER_QUEUE__

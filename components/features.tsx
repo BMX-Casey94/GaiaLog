@@ -114,7 +114,7 @@ export function Features() {
             </div>
           </div>
 
-          <Button size="lg" className="mt-8 bg-purple-600 hover:bg-purple-700">
+          <Button size="lg" variant="purple" className="mt-8">
             Start Exploring Data
           </Button>
         </div>

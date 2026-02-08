@@ -26,7 +26,7 @@ import path from 'path'
 dotenv.config({ path: path.join(process.cwd(), '.env.local') })
 
 import { JungleBusWorker } from '../lib/junglebus'
-import { getIndexStats } from '../lib/explorer-store'
+import { getIndexStats } from '../lib/supabase-explorer'
 
 console.log()
 console.log('═══════════════════════════════════════════════════════════')
@@ -64,60 +64,65 @@ addresses.forEach((addr, i) => {
 console.log(`📁 Data dir: ${process.env.EXPLORER_DATA_DIR || './data'}`)
 console.log()
 
-// Show current index stats
-try {
-  const stats = getIndexStats()
-  console.log('📊 Current Index:')
-  console.log(`   Readings: ${stats.totalReadings}`)
-  console.log(`   Last updated: ${stats.lastUpdated ? new Date(stats.lastUpdated).toLocaleString() : 'Never'}`)
-  console.log(`   File size: ${stats.fileSizeBytes > 0 ? `${Math.round(stats.fileSizeBytes / 1024)} KB` : 'N/A'}`)
-} catch {
-  console.log('📊 No existing index found - starting fresh')
-}
-console.log()
-
-// Create worker
-const worker = new JungleBusWorker(addresses)
-
-// Handle shutdown
-const shutdown = async (signal: string) => {
-  console.log()
-  console.log(`🛑 ${signal} received, shutting down...`)
-  await worker.stop()
-  
-  // Show final stats
+// Main async function
+async function main() {
+  // Show current index stats (async - Supabase backed)
   try {
-    const finalStats = getIndexStats()
-    console.log()
-    console.log('📊 Final Index:')
-    console.log(`   Readings: ${finalStats.totalReadings}`)
-    console.log(`   File size: ${Math.round(finalStats.fileSizeBytes / 1024)} KB`)
-  } catch {}
-  
+    const stats = await getIndexStats()
+    console.log('📊 Current Index (Supabase):')
+    console.log(`   Readings: ${stats.totalReadings}`)
+    console.log(`   Last updated: ${stats.lastUpdated ? new Date(stats.lastUpdated).toLocaleString() : 'Never'}`)
+  } catch {
+    console.log('📊 No existing index found - starting fresh')
+  }
   console.log()
-  process.exit(0)
+
+  // Create worker
+  const worker = new JungleBusWorker(addresses)
+
+  // Handle shutdown
+  const shutdown = async (signal: string) => {
+    console.log()
+    console.log(`🛑 ${signal} received, shutting down...`)
+    await worker.stop()
+    
+    // Show final stats
+    try {
+      const finalStats = await getIndexStats()
+      console.log()
+      console.log('📊 Final Index:')
+      console.log(`   Readings: ${finalStats.totalReadings}`)
+    } catch {}
+    
+    console.log()
+    process.exit(0)
+  }
+
+  process.on('SIGINT', () => shutdown('SIGINT'))
+  process.on('SIGTERM', () => shutdown('SIGTERM'))
+
+  // Start indexing
+  console.log('🔄 Starting transaction indexer (WoC small sync)...')
+  console.log('   For full backfill: npm run explorer:backfill')
+  console.log('   Press Ctrl+C to stop')
+  console.log()
+
+  try {
+    await worker.start()
+    
+    // Show final stats after completion
+    try {
+      const finalStats = await getIndexStats()
+      console.log()
+      console.log('📊 Final Index:')
+      console.log(`   Readings: ${finalStats.totalReadings}`)
+    } catch {}
+    process.exit(0)
+  } catch (error) {
+    console.error('❌ Indexer error:', error)
+    process.exit(1)
+  }
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'))
-process.on('SIGTERM', () => shutdown('SIGTERM'))
-
-// Start indexing
-console.log('🔄 Starting transaction indexer...')
-console.log('   This will scan your wallet addresses via WhatsonChain')
-console.log('   Press Ctrl+C to stop')
-console.log()
-
-worker.start().then(() => {
-  // Show final stats after completion
-  try {
-    const finalStats = getIndexStats()
-    console.log()
-    console.log('📊 Final Index:')
-    console.log(`   Readings: ${finalStats.totalReadings}`)
-    console.log(`   File size: ${Math.round(finalStats.fileSizeBytes / 1024)} KB`)
-  } catch {}
-  process.exit(0)
-}).catch(error => {
-  console.error('❌ Indexer error:', error)
-  process.exit(1)
-})
+// Run main
+main()

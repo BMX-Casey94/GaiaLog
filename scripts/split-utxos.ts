@@ -17,6 +17,8 @@ import dotenv from 'dotenv'
 }
 
 import * as bsv from 'bsv'
+// BSV has no protocol-enforced dust limit — override the BTC-inherited default
+;(bsv.Transaction as any).DUST_AMOUNT = 1
 import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
 
 const ARC_ENDPOINT = (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com').replace(/\/$/, '')
@@ -24,7 +26,8 @@ const ARC_KEY = process.env.BSV_ARC_API_KEY || ''
 const NETWORK = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY
 const FEE_RATE_SAT_PER_BYTE = Number((process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE) || 0.001)
-const DUST_LIMIT = 546
+// BSV has no protocol-enforced dust limit — 1 sat is the minimum viable output
+const DUST_LIMIT = 1
 
 type Args = {
   wallet: number

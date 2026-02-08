@@ -21,6 +21,10 @@ export const metadata: Metadata = {
   title: "GaiaLog - Environmental Blockchain Monitoring",
   description: "Real-time environmental data monitoring with BSV blockchain integration",
   generator: "GaiaLog",
+  icons: {
+    icon: "/gaialog-logo-128.png",
+    apple: "/gaialog-logo-128.png",
+  },
 }
 
 export default function RootLayout({

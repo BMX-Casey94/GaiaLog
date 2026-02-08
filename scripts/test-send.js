@@ -64,7 +64,7 @@ async function main() {
 
   const txhex = tx.serialize()
 
-  const arcEndpoint = process.env.BSV_API_ENDPOINT || 'https://api.taal.com/arc'
+  const arcEndpoint = process.env.BSV_API_ENDPOINT || 'https://arc.taal.com'
   const apiKey = process.env.BSV_ARC_API_KEY
   if (!apiKey) throw new Error('BSV_ARC_API_KEY missing')
 

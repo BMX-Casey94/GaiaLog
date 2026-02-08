@@ -272,7 +272,16 @@ export abstract class BaseWorker {
             }
             this.stats.totalTransactions++
           } catch (e) {
-            console.error(`❌ ${this.workerId}: Direct broadcast failed:`, e)
+            const eMsg = e instanceof Error ? e.message : String(e)
+            const isTransient = /MEMPOOL_CHAIN_LIMIT|No reservable UTXO|No UTXOs available|txn-mempool-conflict|DOUBLE_SPEND/i.test(eMsg)
+            if (isTransient) {
+              // Transient UTXO contention — will resolve on next cache refresh or block
+              if (bsvConfig.logging.level === 'debug') {
+                console.warn(`⏳ ${this.workerId}: ${eMsg.split('\n')[0].substring(0, 100)} — will retry`)
+              }
+            } else {
+              console.error(`❌ ${this.workerId}: Direct broadcast failed:`, e)
+            }
           }
         } else {
           // Normal queue path (when Supabase is stable)
@@ -513,12 +522,16 @@ export class NOAAWorker extends BaseWorker {
   protected async collectData(): Promise<EnvironmentalData[]> {
     const data: EnvironmentalData[] = []
     try {
-      // One-off verification: run 50-station sample once after startup, then revert to 150
+      // First run: always use a small batch (50) so data appears quickly on startup.
+      // Subsequent runs use the configured NOAA_STATION_BATCH_SIZE (or 150 default).
       const flagKey = '__NOAA_ONEOFF_DONE__'
       const done = (global as any)[flagKey] === true
-      // If NOAA_STATION_BATCH_SIZE is set, use it; otherwise keep the one-off behaviour
       const configured = Number(process.env.NOAA_STATION_BATCH_SIZE)
-      const limit = Number.isFinite(configured) && configured > 0 ? configured : (done ? 150 : 50)
+      const fullBatch = Number.isFinite(configured) && configured > 0 ? configured : 150
+      const limit = done ? fullBatch : Math.min(50, fullBatch)
+      if (!done) {
+        console.log(`🌊 NOAA-Weather: First run – using fast-start batch of ${limit} stations (full batch: ${fullBatch})`)
+      }
       const batch = await collectWaterLevelDataBatch(limit)
       if (!done) (global as any)[flagKey] = true
       for (const item of batch) {
@@ -750,7 +763,13 @@ export class AdvancedMetricsWorker extends BaseWorker {
         }
       }
     } catch (e) {
-      console.error('WeatherAPI advanced fetch error:', e)
+      // Log once at warn level on first failure, then debug only — avoids noisy stack traces
+      const warnKey = '__WEATHERAPI_WARNED__'
+      if (!(global as any)[warnKey]) {
+        ;(global as any)[warnKey] = true
+        const msg = e instanceof Error ? e.message : String(e)
+        console.warn(`⚠️  WeatherAPI: ${msg} — if this persists, verify WEATHERAPI_KEY is valid/unexpired. Falling back to OWM.`)
+      }
     }
     // OWM fallback (15‑min cache handled inside provider)
     try {
@@ -868,5 +887,10 @@ export class WorkerManager {
   }
 }
 
-// Export singleton instance
-export const workerManager = new WorkerManager()
+// Persist singleton on globalThis to survive Next.js dev-mode module
+// re-evaluations that would otherwise create duplicate managers/workers.
+const _wm = globalThis as any
+if (!_wm.__GAIALOG_WORKER_MANAGER__) {
+  _wm.__GAIALOG_WORKER_MANAGER__ = new WorkerManager()
+}
+export const workerManager: WorkerManager = _wm.__GAIALOG_WORKER_MANAGER__

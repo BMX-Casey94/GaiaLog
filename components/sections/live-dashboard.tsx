@@ -247,7 +247,7 @@ export function LiveDashboard() {
     return () => clearInterval(interval)
   }, [])
   return (
-    <section id="monitoring" className="py-20 px-4 sm:px-6 lg:px-8 relative live-dashboard-section">
+    <section id="monitoring" className="py-20 px-4 sm:px-6 lg:px-8 relative scroll-mt-24 live-dashboard-section">
       <div className="absolute inset-0 bg-gradient-to-b from-slate-950/50 via-slate-900/30 to-black/80 pointer-events-none"></div>
       <div className="relative">
         <div className="max-w-7xl mx-auto">
@@ -261,17 +261,19 @@ export function LiveDashboard() {
           
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-            <GlowCard glowColor="blue" customSize disableGlow className="h-64">
-              <div className="flex items-center justify-center space-x-2 text-blue-400 mb-1">
-                <Database className="h-5 w-5" />
-                <span className="font-semibold">Air Quality Alerts</span>
+            {/* Air Quality */}
+            <GlowCard glowColor="blue" customSize className="flex flex-col">
+              <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
+                <Database className="h-4 w-4 text-blue-400" />
+                <span className="font-semibold text-sm text-blue-400">Air Quality Alerts</span>
               </div>
+              <div className="flex-1 flex flex-col justify-center py-3">
               {(() => {
                 const current = alerts.filter(a => a.type === 'air')
                 const toShow = current.length > 0 ? current : (stickyByType.air ? [stickyByType.air] : [])
                 return toShow.length > 0 ? (
                   toShow.map((alert, index) => (
-                  <div key={index} className="mb-3 text-center">
+                  <div key={index} className="text-center">
                     <div className="flex items-center justify-center space-x-2 mb-2">
                       {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
                       {alert.severity === 'high' && <AlertTriangle className="h-4 w-4 text-orange-500" />}
@@ -284,56 +286,46 @@ export function LiveDashboard() {
                         {alert.severity.toUpperCase()}
                       </span>
                     </div>
-                    <div className="text-sm text-slate-400 mb-2">
-                      {alert.details}
-                    </div>
-                    <div className="text-xs text-slate-500 mb-1">
-                      📍 {alert.location}
-                    </div>
-                    <div className="text-xs text-slate-600 mb-1">
-                      🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}
-                    </div>
+                    <div className="text-sm text-slate-400 mb-2">{alert.details}</div>
+                    <div className="text-xs text-slate-500 mb-1">📍 {alert.location}</div>
+                    <div className="text-xs text-slate-600">🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
                   </div>
                   ))
                 ) : data?.airQuality ? (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Good</div>
-                  <div className="text-sm text-slate-400 mb-3">Air quality is safe</div>
-                  <div className="text-sm text-slate-400 mb-2">
-                    AQI: {data.airQuality.aqi} • PM2.5: {data.airQuality.pm25} μg/m³
-                  </div>
-                  <div className="text-xs text-slate-500 mb-1">
-                    📍 {data.airQuality.location}
-                  </div>
-                  <div className="text-xs text-slate-600 mb-1">
-                    🕒 {new Date(data.airQuality.timestamp).toLocaleString('en-GB')}
-                  </div>
+                  <div className="text-sm text-slate-400 mb-2">AQI: {data.airQuality.aqi} • PM2.5: {data.airQuality.pm25} μg/m³</div>
+                  <div className="text-xs text-slate-500 mb-1">📍 {data.airQuality.location}</div>
+                  <div className="text-xs text-slate-600">🕒 {new Date(data.airQuality.timestamp).toLocaleString('en-GB')}</div>
                 </div>
                 ) : (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400 mb-3">No air quality data available</div>
+                  <div className="text-sm text-slate-400">No air quality data available</div>
                 </div>
                 )
               })()}
-              <div className="flex justify-center mt-2">
+              </div>
+              <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
                 <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
                 </Badge>
               </div>
             </GlowCard>
 
-            <GlowCard glowColor="blue" customSize disableGlow className="h-64">
-              <div className="flex items-center justify-center space-x-2 text-blue-400 mb-1">
-                <Droplets className="h-5 w-5" />
-                <span className="font-semibold">Water Level Alerts</span>
+            {/* Water Levels */}
+            <GlowCard glowColor="blue" customSize className="flex flex-col">
+              <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
+                <Droplets className="h-4 w-4 text-blue-400" />
+                <span className="font-semibold text-sm text-blue-400">Water Level Alerts</span>
               </div>
+              <div className="flex-1 flex flex-col justify-center py-3">
               {(() => {
                 const current = alerts.filter(a => a.type === 'water')
                 const toShow = current.length > 0 ? current : (stickyByType.water ? [stickyByType.water] : [])
                 return toShow.length > 0 ? (
                   toShow.map((alert, index) => (
-                  <div key={index} className="mb-3 text-center">
+                  <div key={index} className="text-center">
                     <div className="flex items-center justify-center space-x-2 mb-2">
                       {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
                       {alert.severity === 'high' && <AlertTriangle className="h-4 w-4 text-orange-500" />}
@@ -346,56 +338,46 @@ export function LiveDashboard() {
                         {alert.severity.toUpperCase()}
                       </span>
                     </div>
-                    <div className="text-sm text-slate-400 mb-2">
-                      {alert.details}
-                    </div>
-                    <div className="text-xs text-slate-500 mb-1">
-                      📍 {alert.location}
-                    </div>
-                    <div className="text-xs text-slate-600 mb-1">
-                      🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}
-                    </div>
+                    <div className="text-sm text-slate-400 mb-2">{alert.details}</div>
+                    <div className="text-xs text-slate-500 mb-1">📍 {alert.location}</div>
+                    <div className="text-xs text-slate-600">🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
                   </div>
                   ))
                 ) : data?.waterLevels ? (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Good</div>
-                  <div className="text-sm text-slate-400 mb-3">Water levels are safe</div>
-                  <div className="text-sm text-slate-400 mb-2">
-                    Level: {data.waterLevels.river_level}m
-                  </div>
-                  <div className="text-xs text-slate-500 mb-1">
-                    📍 {data.waterLevels.location}
-                  </div>
-                  <div className="text-xs text-slate-600 mb-1">
-                    🕒 {new Date(data.waterLevels.timestamp).toLocaleString('en-GB')}
-                  </div>
+                  <div className="text-sm text-slate-400 mb-2">Level: {data.waterLevels.river_level}m</div>
+                  <div className="text-xs text-slate-500 mb-1">📍 {data.waterLevels.location}</div>
+                  <div className="text-xs text-slate-600">🕒 {new Date(data.waterLevels.timestamp).toLocaleString('en-GB')}</div>
                 </div>
                 ) : (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400 mb-3">No water level data available</div>
+                  <div className="text-sm text-slate-400">No water level data available</div>
                 </div>
                 )
               })()}
-              <div className="flex justify-center mt-2">
+              </div>
+              <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
                 <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
                 </Badge>
               </div>
             </GlowCard>
 
-            <GlowCard glowColor="blue" customSize disableGlow className="h-64">
-              <div className="flex items-center justify-center space-x-2 text-blue-400 mb-1">
-                <Activity className="h-5 w-5" />
-                <span className="font-semibold">Seismic Alerts</span>
+            {/* Seismic */}
+            <GlowCard glowColor="blue" customSize className="flex flex-col">
+              <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
+                <Activity className="h-4 w-4 text-blue-400" />
+                <span className="font-semibold text-sm text-blue-400">Seismic Alerts</span>
               </div>
+              <div className="flex-1 flex flex-col justify-center py-3">
               {(() => {
                 const current = alerts.filter(a => a.type === 'seismic')
                 const toShow = current.length > 0 ? current : (stickyByType.seismic ? [stickyByType.seismic] : [])
                 return toShow.length > 0 ? (
                   toShow.map((alert, index) => (
-                  <div key={index} className="mb-3 text-center">
+                  <div key={index} className="text-center">
                     <div className="flex items-center justify-center space-x-2 mb-2">
                       {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
                       {alert.severity === 'high' && <AlertTriangle className="h-4 w-4 text-orange-500" />}
@@ -408,56 +390,46 @@ export function LiveDashboard() {
                         {alert.severity.toUpperCase()}
                       </span>
                     </div>
-                    <div className="text-sm text-slate-400 mb-2">
-                      {alert.details}
-                    </div>
-                    <div className="text-xs text-slate-500 mb-1">
-                      📍 {alert.location}
-                    </div>
-                    <div className="text-xs text-slate-600 mb-1">
-                      🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}
-                    </div>
+                    <div className="text-sm text-slate-400 mb-2">{alert.details}</div>
+                    <div className="text-xs text-slate-500 mb-1">📍 {alert.location}</div>
+                    <div className="text-xs text-slate-600">🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
                   </div>
                   ))
                 ) : data?.seismic ? (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Good</div>
-                  <div className="text-sm text-slate-400 mb-3">Seismic activity is normal</div>
-                  <div className="text-sm text-slate-400 mb-2">
-                    Magnitude: {data.seismic.magnitude}M • Depth: {data.seismic.depth ? `${data.seismic.depth} (km)` : 'Unknown (km)'}
-                  </div>
-                  <div className="text-xs text-slate-500 mb-1">
-                    📍 {data.seismic.location}
-                  </div>
-                  <div className="text-xs text-slate-600 mb-1">
-                    🕒 {new Date(data.seismic.timestamp).toLocaleString('en-GB')}
-                  </div>
+                  <div className="text-sm text-slate-400 mb-2">Magnitude: {data.seismic.magnitude}M • Depth: {data.seismic.depth ? `${data.seismic.depth} miles` : 'Unknown'}</div>
+                  <div className="text-xs text-slate-500 mb-1">📍 {data.seismic.location}</div>
+                  <div className="text-xs text-slate-600">🕒 {new Date(data.seismic.timestamp).toLocaleString('en-GB')}</div>
                 </div>
                 ) : (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400 mb-3">No seismic data available</div>
+                  <div className="text-sm text-slate-400">No seismic data available</div>
                 </div>
                 )
               })()}
-              <div className="flex justify-center mt-2">
+              </div>
+              <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
                 <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
                 </Badge>
               </div>
             </GlowCard>
 
-            <GlowCard glowColor="blue" customSize disableGlow className="h-64">
-              <div className="flex items-center justify-center space-x-2 text-blue-400 mb-1">
-                <Thermometer className="h-5 w-5" />
-                <span className="font-semibold">Environmental Alerts</span>
+            {/* Environmental */}
+            <GlowCard glowColor="blue" customSize className="flex flex-col">
+              <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
+                <Thermometer className="h-4 w-4 text-blue-400" />
+                <span className="font-semibold text-sm text-blue-400">Environmental Alerts</span>
               </div>
+              <div className="flex-1 flex flex-col justify-center py-3">
               {(() => {
                 const current = alerts.filter(a => a.type === 'environmental')
                 const toShow = current.length > 0 ? current : (stickyByType.environmental ? [stickyByType.environmental] : [])
                 return toShow.length > 0 ? (
                   toShow.map((alert, index) => (
-                  <div key={index} className="mb-3 text-center">
+                  <div key={index} className="text-center">
                     <div className="flex items-center justify-center space-x-2 mb-2">
                       {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
                       {alert.severity === 'high' && <AlertTriangle className="h-4 w-4 text-orange-500" />}
@@ -470,39 +442,27 @@ export function LiveDashboard() {
                         {alert.severity.toUpperCase()}
                       </span>
                     </div>
-                    <div className="text-sm text-slate-400 mb-2">
-                      {alert.details}
-                    </div>
-                    <div className="text-xs text-slate-500 mb-1">
-                      📍 {alert.location}
-                    </div>
-                    <div className="text-xs text-slate-600 mb-1">
-                      🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}
-                    </div>
+                    <div className="text-sm text-slate-400 mb-2">{alert.details}</div>
+                    <div className="text-xs text-slate-500 mb-1">📍 {alert.location}</div>
+                    <div className="text-xs text-slate-600">🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
                   </div>
                   ))
                 ) : data?.advancedMetrics ? (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Good</div>
-                  <div className="text-sm text-slate-400 mb-3">Environmental conditions are safe</div>
-                  <div className="text-sm text-slate-400 mb-2">
-                    Score: {typeof data.advancedMetrics.scoreDisplay === 'number' ? data.advancedMetrics.scoreDisplay.toFixed(1) : data.advancedMetrics.environmental_quality_score}/100 • UV: {typeof data.advancedMetrics.uvDisplay === 'number' ? data.advancedMetrics.uvDisplay.toFixed(1) : data.advancedMetrics.uv_index}
-                  </div>
-                  <div className="text-xs text-slate-500 mb-1">
-                    📍 {data.advancedMetrics.location}
-                  </div>
-                  <div className="text-xs text-slate-600 mb-1">
-                    🕒 {new Date(data.advancedMetrics.timestamp).toLocaleString('en-GB')}
-                  </div>
+                  <div className="text-sm text-slate-400 mb-2">Score: {typeof data.advancedMetrics.scoreDisplay === 'number' ? data.advancedMetrics.scoreDisplay.toFixed(1) : data.advancedMetrics.environmental_quality_score}/100 • UV: {typeof data.advancedMetrics.uvDisplay === 'number' ? data.advancedMetrics.uvDisplay.toFixed(1) : data.advancedMetrics.uv_index}</div>
+                  <div className="text-xs text-slate-500 mb-1">📍 {data.advancedMetrics.location}</div>
+                  <div className="text-xs text-slate-600">🕒 {new Date(data.advancedMetrics.timestamp).toLocaleString('en-GB')}</div>
                 </div>
                 ) : (
                 <div className="text-green-400 text-center">
                   <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400 mb-3">No environmental data available</div>
+                  <div className="text-sm text-slate-400">No environmental data available</div>
                 </div>
                 )
               })()}
-              <div className="flex justify-center mt-2">
+              </div>
+              <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
                 <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
                   {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
                 </Badge>
