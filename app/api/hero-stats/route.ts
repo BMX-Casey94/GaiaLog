@@ -69,7 +69,7 @@ export async function GET() {
             
             // Get latest air quality (quickly) and a small recent tx sample count
             const [latestAir, txs] = await Promise.all([
-              findLatestByType(net, 'air_quality', 10),
+              findLatestByType(net, 'air_quality', 25),
               addr ? fetchWalletTransactions(net, addr, 10) : Promise.resolve([] as { tx_hash: string; height: number }[])
             ])
             

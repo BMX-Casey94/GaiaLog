@@ -56,9 +56,21 @@ export interface LocationSuggestion {
   avgLon: number | null
 }
 
+interface AggregateResult {
+  totalReadings: number
+  uniqueLocations: number
+  dateRange: { min: number | null; max: number | null }
+  byType: Record<string, number>
+}
+
 // ─── Singleton Supabase Client ───────────────────────────────────────────────
 
 let _client: SupabaseClient | null = null
+let _unfilteredAggregateCache: { value: AggregateResult; expiresAt: number } | null = null
+const AGGREGATE_CACHE_TTL_MS = 30000
+const AGGREGATE_SCAN_PAGE_SIZE = 1000
+let _locationKeysTableAvailable: boolean | null = null
+let _locationKeysRetryAfterMs = 0
 
 function getClient(): SupabaseClient {
   if (_client) return _client
@@ -109,6 +121,7 @@ export async function addReading(reading: StoredReading): Promise<boolean> {
     console.error('Explorer addReading error:', error.message)
     return false
   }
+  _unfilteredAggregateCache = null
   return true
 }
 
@@ -147,6 +160,10 @@ export async function addReadingsBatch(readings: StoredReading[]): Promise<numbe
     } else {
       inserted += count ?? batch.length
     }
+  }
+
+  if (inserted > 0) {
+    _unfilteredAggregateCache = null
   }
 
   return inserted
@@ -208,6 +225,48 @@ export async function searchReadings(params: SearchParams): Promise<SearchResult
     pageSize,
     hasMore: offset + items.length < total,
   }
+}
+
+/**
+ * Fast path for unique location count.
+ *
+ * Reads from a precomputed `explorer_location_keys` table maintained by a DB
+ * trigger. Returns null if the table is unavailable.
+ */
+export async function getUniqueLocationCountFast(): Promise<number | null> {
+  if (_locationKeysTableAvailable === false && Date.now() < _locationKeysRetryAfterMs) {
+    return null
+  }
+
+  const sb = getClient()
+  const { count, error } = await sb
+    .from('explorer_location_keys')
+    .select('normalized_location', { count: 'exact', head: true })
+
+  if (error) {
+    const message = String(error.message || '')
+    const code = String((error as any).code || '')
+    const missingRelation =
+      code === '42P01' ||
+      message.toLowerCase().includes('relation') && message.toLowerCase().includes('does not exist')
+
+    if (missingRelation) {
+      if (_locationKeysTableAvailable !== false) {
+        console.warn(
+          'Explorer location keys table is missing. Apply DB migration to enable fast location counts.'
+        )
+      }
+      _locationKeysTableAvailable = false
+      _locationKeysRetryAfterMs = Date.now() + 60000
+      return null
+    }
+
+    console.error('Explorer unique location fast count error:', error.message)
+    return null
+  }
+
+  _locationKeysTableAvailable = true
+  return typeof count === 'number' ? count : 0
 }
 
 /**
@@ -313,85 +372,138 @@ export async function getAggregates(params?: SearchParams): Promise<{
   dateRange: { min: number | null; max: number | null }
   byType: Record<string, number>
 }> {
-  const sb = getClient()
+  const hasFilters = !!(params?.q || params?.dataType || params?.from || params?.to)
 
-  // If no filters, use fast COUNT queries on the full table
-  if (!params || (!params.q && !params.dataType && !params.from && !params.to)) {
-    // Total count
-    const { count: totalCount } = await sb
-      .from('explorer_readings')
-      .select('*', { count: 'exact', head: true })
-
-    // Count by type
-    const { data: typeData } = await sb
-      .from('explorer_readings')
-      .select('data_type')
-
-    const byType: Record<string, number> = {}
-    if (typeData) {
-      for (const row of typeData) {
-        const dt = row.data_type as string
-        byType[dt] = (byType[dt] || 0) + 1
-      }
-    }
-
-    // Unique locations (using distinct count)
-    const { data: locData } = await sb
-      .from('explorer_readings')
-      .select('location')
-      .not('location', 'is', null)
-
-    const uniqueLocations = locData
-      ? new Set(locData.map(r => (r.location as string).toLowerCase())).size
-      : 0
-
-    // Date range
-    const { data: minRow } = await sb
-      .from('explorer_readings')
-      .select('timestamp')
-      .order('timestamp', { ascending: true })
-      .limit(1)
-      .single()
-
-    const { data: maxRow } = await sb
-      .from('explorer_readings')
-      .select('timestamp')
-      .order('timestamp', { ascending: false })
-      .limit(1)
-      .single()
-
+  // Keep hot unfiltered hero stats fast and stable across quick refreshes.
+  if (!hasFilters && _unfilteredAggregateCache && _unfilteredAggregateCache.expiresAt > Date.now()) {
     return {
-      totalReadings: totalCount ?? 0,
-      uniqueLocations,
-      dateRange: {
-        min: minRow ? new Date(minRow.timestamp).getTime() : null,
-        max: maxRow ? new Date(maxRow.timestamp).getTime() : null,
-      },
-      byType,
+      ..._unfilteredAggregateCache.value,
+      byType: { ..._unfilteredAggregateCache.value.byType },
+      dateRange: { ..._unfilteredAggregateCache.value.dateRange },
     }
   }
 
-  // Filtered aggregates – delegate to searchReadings for the filtered set
-  const result = await searchReadings({ ...params, page: 1, pageSize: 500 })
+  const aggregates = await computeAggregatesDeterministic(params)
+
+  if (!hasFilters) {
+    _unfilteredAggregateCache = {
+      value: aggregates,
+      expiresAt: Date.now() + AGGREGATE_CACHE_TTL_MS,
+    }
+  }
+
+  return aggregates
+}
+
+async function computeAggregatesDeterministic(params?: SearchParams): Promise<AggregateResult> {
+  const sb = getClient()
+
+  // Get an exact total using the same filters.
+  let countQuery = sb
+    .from('explorer_readings')
+    .select('txid', { count: 'exact', head: true })
+  countQuery = applySearchFilters(countQuery, params)
+
+  const { count: totalCount, error: countError } = await countQuery
+  if (countError) {
+    throw new Error(`Failed to count explorer aggregates: ${countError.message}`)
+  }
+
   const locations = new Set<string>()
   const byType: Record<string, number> = {}
   let min: number | null = null
   let max: number | null = null
 
-  for (const r of result.items) {
-    if (r.location) locations.add(r.location.toLowerCase())
-    byType[r.dataType] = (byType[r.dataType] || 0) + 1
-    const ts = r.timestamp
-    if (min === null || ts < min) min = ts
-    if (max === null || ts > max) max = ts
+  let lastTxid: string | null = null
+  let guard = 0
+
+  while (true) {
+    let query = sb
+      .from('explorer_readings')
+      .select('txid, data_type, location, timestamp')
+      .order('txid', { ascending: true })
+      .limit(AGGREGATE_SCAN_PAGE_SIZE)
+
+    query = applySearchFilters(query, params)
+
+    if (lastTxid) {
+      query = query.gt('txid', lastTxid)
+    }
+
+    const { data, error } = await query
+
+    if (error) {
+      throw new Error(`Failed to scan explorer aggregates: ${error.message}`)
+    }
+
+    if (!data || data.length === 0) {
+      break
+    }
+
+    for (const row of data) {
+      const dataType = typeof row.data_type === 'string' ? row.data_type : ''
+      if (dataType) {
+        byType[dataType] = (byType[dataType] || 0) + 1
+      }
+
+      const normalizedLocation = normaliseLocationKey(row.location)
+      if (normalizedLocation) {
+        locations.add(normalizedLocation)
+      }
+
+      const ts = new Date(row.timestamp as string).getTime()
+      if (Number.isFinite(ts)) {
+        if (min === null || ts < min) min = ts
+        if (max === null || ts > max) max = ts
+      }
+    }
+
+    lastTxid = String(data[data.length - 1].txid)
+    if (data.length < AGGREGATE_SCAN_PAGE_SIZE) {
+      break
+    }
+
+    // Safety guard to avoid endless loops if the cursor column is malformed.
+    guard += 1
+    if (guard > 100000) {
+      throw new Error('Explorer aggregate scan exceeded safety limit')
+    }
   }
 
   return {
-    totalReadings: result.total,
+    totalReadings: totalCount ?? 0,
     uniqueLocations: locations.size,
     dateRange: { min, max },
     byType,
   }
+}
+
+function applySearchFilters(query: any, params?: SearchParams): any {
+  if (!params) return query
+
+  if (params.q && params.q.trim()) {
+    query = query.ilike('location', `%${params.q.trim()}%`)
+  }
+
+  if (params.dataType) {
+    query = query.eq('data_type', params.dataType)
+  }
+
+  if (params.from) {
+    query = query.gte('timestamp', new Date(params.from).toISOString())
+  }
+
+  if (params.to) {
+    query = query.lte('timestamp', new Date(params.to).toISOString())
+  }
+
+  return query
+}
+
+function normaliseLocationKey(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const normalised = value.trim().toLowerCase()
+  return normalised.length > 0 ? normalised : null
 }
 
 /**

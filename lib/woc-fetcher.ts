@@ -15,6 +15,16 @@ const MIN_REQUEST_INTERVAL_MS = 350 // ~3 RPS = 333ms, use 350ms for safety
 // Round-robin index for wallet selection
 let walletRoundRobinIndex = 0
 
+// WoC latest-read tuning for high-throughput wallets
+const WOC_LATEST_MIN_CANDIDATES = Math.max(10, Number(process.env.BSV_WOC_LATEST_MIN_CANDIDATES || 25))
+const WOC_LATEST_MAX_CANDIDATES = Math.max(WOC_LATEST_MIN_CANDIDATES, Number(process.env.BSV_WOC_LATEST_MAX_CANDIDATES || 80))
+const WOC_LATEST_CACHE_TTL_MS = Math.max(3000, Number(process.env.BSV_WOC_LATEST_CACHE_TTL_MS || 20000))
+const WOC_LATEST_NEGATIVE_CACHE_TTL_MS = Math.max(1000, Number(process.env.BSV_WOC_LATEST_NEGATIVE_CACHE_TTL_MS || 5000))
+
+type LatestByTypeResult = { data_type: string; payload: any; timestamp: number; provider?: string; txid: string } | null
+type LatestByTypeCacheEntry = { ts: number; value: LatestByTypeResult; inFlight: Promise<LatestByTypeResult> | null }
+const latestByTypeCache = new Map<string, LatestByTypeCacheEntry>()
+
 /**
  * Get all configured wallet addresses (derived from private keys)
  */
@@ -100,28 +110,23 @@ export async function fetchWalletTransactions(
   maxResults: number = 50
 ): Promise<{ tx_hash: string; height: number }[]> {
   const base = `https://api.whatsonchain.com/v1/bsv/${network}/address/${walletAddr}`
-  const allTxids = new Set<string>()
-  
-  // Strategy 1: Try /unspent first (fastest, single API call)
-  // This works well for wallets with recent UTXOs
-  try {
-    const unspentRes = await fetchWoC(`${base}/unspent`, walletAddr)
-    if (unspentRes.ok) {
-      const unspent: any[] = await unspentRes.json()
-      if (Array.isArray(unspent) && unspent.length > 0) {
-        unspent.forEach((u: any) => {
-          if (u.tx_hash) allTxids.add(u.tx_hash)
-        })
-        console.log(`[WoC] Got ${allTxids.size} transaction IDs from /unspent for ${walletAddr.substring(0, 10)}...`)
-      }
+  const txidSet = new Set<string>()
+  const orderedTxids: string[] = []
+  const addTxids = (txids: string[]) => {
+    for (const txid of txids) {
+      if (!txid || typeof txid !== 'string') continue
+      if (txidSet.has(txid)) continue
+      txidSet.add(txid)
+      orderedTxids.push(txid)
+      if (orderedTxids.length >= maxResults) break
     }
-  } catch (error: any) {
-    console.log(`[WoC] /unspent failed: ${error.message}`)
   }
-  
-  // Strategy 2: If /unspent didn't give us enough, try /history to get more
-  // This helps when wallets have spent most UTXOs
-  if (allTxids.size < maxResults) {
+
+  // Strategy order is tuned for "latest" lookups:
+  // 1) /history (usually most recent first)
+  // 2) /txs
+  // 3) /unspent (good fallback but biased toward currently-unspent chain tips)
+  if (orderedTxids.length < maxResults) {
     try {
       const listRes = await fetchWoC(`${base}/history`, walletAddr)
       if (listRes.ok) {
@@ -129,19 +134,17 @@ export async function fetchWalletTransactions(
         const txs: string[] = Array.isArray(txsRaw)
           ? (txsRaw[0]?.tx_hash ? txsRaw.map((t: any) => t.tx_hash) : (typeof txsRaw[0] === 'string' ? txsRaw : []))
           : []
-        
-        txs.forEach((txid: string) => {
-          if (txid && typeof txid === 'string') allTxids.add(txid)
-        })
-        console.log(`[WoC] Combined with /history: now have ${allTxids.size} total transaction IDs for ${walletAddr.substring(0, 10)}...`)
+        addTxids(txs)
+        if (orderedTxids.length > 0) {
+          console.log(`[WoC] Got ${orderedTxids.length} recent transaction IDs from /history for ${walletAddr.substring(0, 10)}...`)
+        }
       }
     } catch (error: any) {
       console.log(`[WoC] /history failed: ${error.message}`)
     }
   }
-  
-  // Strategy 3: If still not enough, try /txs endpoint
-  if (allTxids.size < maxResults) {
+
+  if (orderedTxids.length < maxResults) {
     try {
       const txsRes = await fetchWoC(`${base}/txs`, walletAddr)
       if (txsRes.ok) {
@@ -149,20 +152,33 @@ export async function fetchWalletTransactions(
         const txs: string[] = Array.isArray(txsRaw)
           ? (txsRaw[0]?.tx_hash ? txsRaw.map((t: any) => t.tx_hash) : (typeof txsRaw[0] === 'string' ? txsRaw : []))
           : []
-        
-        txs.forEach((txid: string) => {
-          if (txid && typeof txid === 'string') allTxids.add(txid)
-        })
-        console.log(`[WoC] Combined with /txs: now have ${allTxids.size} total transaction IDs for ${walletAddr.substring(0, 10)}...`)
+        addTxids(txs)
       }
     } catch (error: any) {
       console.log(`[WoC] /txs failed: ${error.message}`)
     }
   }
-  
-  // Convert to array and return
-  if (allTxids.size > 0) {
-    const txArray = Array.from(allTxids).slice(0, maxResults).map(txid => ({
+
+  if (orderedTxids.length < maxResults) {
+    try {
+      const unspentRes = await fetchWoC(`${base}/unspent`, walletAddr)
+      if (unspentRes.ok) {
+        const unspent: any[] = await unspentRes.json()
+        if (Array.isArray(unspent) && unspent.length > 0) {
+          const fromUnspent = unspent
+            .map((u: any) => u?.tx_hash)
+            .filter((v: any) => typeof v === 'string')
+          addTxids(fromUnspent)
+          console.log(`[WoC] Combined with /unspent: now have ${orderedTxids.length} candidate transaction IDs for ${walletAddr.substring(0, 10)}...`)
+        }
+      }
+    } catch (error: any) {
+      console.log(`[WoC] /unspent failed: ${error.message}`)
+    }
+  }
+
+  if (orderedTxids.length > 0) {
+    const txArray = orderedTxids.slice(0, maxResults).map(txid => ({
       tx_hash: txid,
       height: 0,
     }))
@@ -288,6 +304,20 @@ export async function findLatestByType(
   dataType: 'air_quality' | 'water_levels' | 'seismic_activity' | 'advanced_metrics',
   maxCandidatesPerWallet: number = 20 // Increased to 20 to find all data types (still fast)
 ): Promise<{ data_type: string; payload: any; timestamp: number; provider?: string; txid: string } | null> {
+  const effectiveCandidates = Math.min(
+    WOC_LATEST_MAX_CANDIDATES,
+    Math.max(WOC_LATEST_MIN_CANDIDATES, maxCandidatesPerWallet || WOC_LATEST_MIN_CANDIDATES)
+  )
+  const cacheKey = `${network}:${dataType}:${effectiveCandidates}`
+  const now = Date.now()
+  const cached = latestByTypeCache.get(cacheKey)
+  if (cached && cached.inFlight) return cached.inFlight
+  if (cached && !cached.inFlight) {
+    const ttl = cached.value ? WOC_LATEST_CACHE_TTL_MS : WOC_LATEST_NEGATIVE_CACHE_TTL_MS
+    if ((now - cached.ts) < ttl) return cached.value
+  }
+
+  const inFlight = (async (): Promise<LatestByTypeResult> => {
   const addresses = getAllWalletAddresses()
   if (addresses.length === 0) {
     console.warn('[WoC] No wallet addresses found - check BSV_WALLET_*_PRIVATE_KEY env vars')
@@ -309,14 +339,13 @@ export async function findLatestByType(
   for (const addr of addresses) {
     try {
       // Get transactions (limited to avoid timeout)
-      const txs = await fetchWalletTransactions(network, addr, maxCandidatesPerWallet)
+      const txs = await fetchWalletTransactions(network, addr, effectiveCandidates)
       if (txs.length === 0) {
         console.log(`[WoC] No transactions found for wallet ${addr.substring(0, 10)}...`)
         continue
       }
       
-      // Only check first 25 transactions (early exit to save time)
-      const candidates = txs.slice(0, maxCandidatesPerWallet)
+      const candidates = txs.slice(0, effectiveCandidates)
       console.log(`[WoC] Checking ${candidates.length} transactions from wallet ${addr.substring(0, 10)}... for type ${dataType}`)
       
       // Check transactions one by one, stop on first match
@@ -347,5 +376,16 @@ export async function findLatestByType(
   
   console.log(`[WoC] No ${dataType} transactions found across ${addresses.length} wallet(s)`)
   return null
+  })()
+
+  latestByTypeCache.set(cacheKey, { ts: now, value: null, inFlight })
+  try {
+    const value = await inFlight
+    latestByTypeCache.set(cacheKey, { ts: Date.now(), value, inFlight: null })
+    return value
+  } catch (err) {
+    latestByTypeCache.set(cacheKey, { ts: Date.now(), value: null, inFlight: null })
+    throw err
+  }
 }
 

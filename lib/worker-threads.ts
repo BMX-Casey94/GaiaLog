@@ -274,13 +274,17 @@ export abstract class BaseWorker {
           } catch (e) {
             const eMsg = e instanceof Error ? e.message : String(e)
             const isTransient = /MEMPOOL_CHAIN_LIMIT|No reservable UTXO|No UTXOs available|txn-mempool-conflict|DOUBLE_SPEND/i.test(eMsg)
+            // Reliability guard: never drop a reading on direct-broadcast failure.
+            // Route to queue so retry/backoff/idempotency logic can recover safely.
+            const queueId = workerQueue.addToQueue(bsvData, item.priority)
+            this.stats.totalTransactions++
+
             if (isTransient) {
-              // Transient UTXO contention — will resolve on next cache refresh or block
-              if (bsvConfig.logging.level === 'debug') {
-                console.warn(`⏳ ${this.workerId}: ${eMsg.split('\n')[0].substring(0, 100)} — will retry`)
+              if (bsvConfig.logging.level !== 'error') {
+                console.warn(`⏳ ${this.workerId}: direct broadcast transient failure, queued for retry (${queueId}) - ${eMsg.split('\n')[0].substring(0, 140)}`)
               }
             } else {
-              console.error(`❌ ${this.workerId}: Direct broadcast failed:`, e)
+              console.error(`❌ ${this.workerId}: Direct broadcast failed, queued for retry (${queueId}):`, e)
             }
           }
         } else {

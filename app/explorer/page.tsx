@@ -224,7 +224,11 @@ export default function ExplorerPage() {
   const [page, setPage] = useState(1)
   
   // Stats state
-  const [stats, setStats] = useState<any>(null)
+  const [stats, setStats] = useState<any>({
+    totalReadings: 0,
+    uniqueLocations: null,
+    network: 'testnet',
+  })
   
   // Fetch location suggestions
   const fetchSuggestions = useCallback(async (query: string) => {
@@ -366,6 +370,13 @@ export default function ExplorerPage() {
       if (data.success) {
         setResults(data.data)
         setPage(pageNum)
+        const fastTotal = Number(data?.data?.pagination?.total)
+        if (Number.isFinite(fastTotal) && fastTotal >= 0) {
+          setStats((prev: any) => ({
+            ...prev,
+            totalReadings: fastTotal,
+          }))
+        }
       } else {
         setError(data.error || 'Search failed')
       }
@@ -378,18 +389,55 @@ export default function ExplorerPage() {
   
   // Fetch stats on mount
   useEffect(() => {
+    let cancelled = false
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+
     async function fetchStats() {
       try {
         const res = await fetch('/api/explorer/stats')
         const data = await res.json()
         if (data.success) {
-          setStats(data.data)
+          setStats((prev: any) => ({
+            ...prev,
+            ...data.data,
+            // Keep the fast UI value if stats endpoint returns fallback zero.
+            totalReadings:
+              prev.totalReadings > 0 && (data.data?.totalReadings ?? 0) === 0
+                ? prev.totalReadings
+                : (data.data?.totalReadings ?? prev.totalReadings),
+          }))
+          return typeof data?.data?.uniqueLocations === 'number'
+        } else {
+          setStats((prev: any) => ({
+            ...prev,
+            uniqueLocations: typeof prev?.uniqueLocations === 'number' ? prev.uniqueLocations : null,
+          }))
+          return false
         }
       } catch (e) {
         console.error('Failed to fetch stats:', e)
+        setStats((prev: any) => ({
+          ...prev,
+          uniqueLocations: typeof prev?.uniqueLocations === 'number' ? prev.uniqueLocations : null,
+        }))
+        return false
       }
     }
-    fetchStats()
+
+    async function pollStatsUntilReady() {
+      if (cancelled) return
+      const hasLocations = await fetchStats()
+      if (!cancelled && !hasLocations) {
+        retryTimer = setTimeout(pollStatsUntilReady, 4000)
+      }
+    }
+
+    pollStatsUntilReady()
+
+    return () => {
+      cancelled = true
+      if (retryTimer) clearTimeout(retryTimer)
+    }
   }, [])
   
   // Initial search on mount
@@ -465,39 +513,39 @@ export default function ExplorerPage() {
           </div>
           
           {/* Stats bar (glass-morphism, matches hero dashboard) */}
-          {stats && (
-            <div className="max-w-3xl mx-auto mb-10">
-              <div className="grid grid-cols-3 gap-4">
-                <div className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 text-center">
-                  <div className="flex items-center justify-center space-x-2 mb-1">
-                    <Hash className="h-4 w-4 text-purple-400" />
-                    <span className="text-sm text-slate-300">Readings</span>
-                  </div>
-                  <div className="text-2xl font-bold text-white">
-                    {(stats.totalReadings ?? 0).toLocaleString()}
-                  </div>
+          <div className="max-w-3xl mx-auto mb-10">
+            <div className="grid grid-cols-3 gap-4">
+              <div className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 text-center">
+                <div className="flex items-center justify-center space-x-2 mb-1">
+                  <Hash className="h-4 w-4 text-purple-400" />
+                  <span className="text-sm text-slate-300">Readings</span>
                 </div>
-                <div className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 text-center">
-                  <div className="flex items-center justify-center space-x-2 mb-1">
-                    <MapPin className="h-4 w-4 text-cyan-400" />
-                    <span className="text-sm text-slate-300">Locations</span>
-                  </div>
-                  <div className="text-2xl font-bold text-white">
-                    {(stats.uniqueLocations ?? 0).toLocaleString()}
-                  </div>
+                <div className="text-2xl font-bold text-white">
+                  {(stats.totalReadings ?? 0).toLocaleString()}
                 </div>
-                <div className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 text-center">
-                  <div className="flex items-center justify-center space-x-2 mb-1">
-                    <Globe className="h-4 w-4 text-green-400" />
-                    <span className="text-sm text-slate-300">Network</span>
-                  </div>
-                  <div className="text-2xl font-bold text-green-400 capitalize">
-                    {stats.network || 'testnet'}
-                  </div>
+              </div>
+              <div className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 text-center">
+                <div className="flex items-center justify-center space-x-2 mb-1">
+                  <MapPin className="h-4 w-4 text-cyan-400" />
+                  <span className="text-sm text-slate-300">Locations</span>
+                </div>
+                <div className="text-2xl font-bold text-white">
+                  {typeof stats.uniqueLocations === 'number'
+                    ? stats.uniqueLocations.toLocaleString()
+                    : '...'}
+                </div>
+              </div>
+              <div className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 text-center">
+                <div className="flex items-center justify-center space-x-2 mb-1">
+                  <Globe className="h-4 w-4 text-green-400" />
+                  <span className="text-sm text-slate-300">Network</span>
+                </div>
+                <div className="text-2xl font-bold text-green-400 capitalize">
+                  {stats.network || 'testnet'}
                 </div>
               </div>
             </div>
-          )}
+          </div>
           
           {/* Search Bar (glass-morphism) */}
           <div ref={searchRef} className="relative max-w-2xl mx-auto mb-8">

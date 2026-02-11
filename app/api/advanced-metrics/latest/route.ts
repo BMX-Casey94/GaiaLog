@@ -62,7 +62,7 @@ export async function GET() {
 		}
 		const net = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
 		const latest = await Promise.race([
-			findLatestByType(net, 'advanced_metrics', 10),
+			findLatestByType(net, 'advanced_metrics', 25),
 			timeoutPromise
 		]) as Awaited<ReturnType<typeof findLatestByType>>
 		

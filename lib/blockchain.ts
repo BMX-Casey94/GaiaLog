@@ -534,13 +534,23 @@ export class BlockchainService {
       const scriptPubKey = (bsv.Script as any).fromAddress
         ? (bsv.Script as any).fromAddress(address).toHex()
         : this.p2pkhLockingScriptHexFromWif(wif)
-      // Select a single confirmed UTXO
+      // Prefer confirmed UTXOs first (prevents long unconfirmed ancestor chains).
+      // Fallback to mixed spendable UTXOs only if no confirmed inputs are available.
+      const preferConfirmed = process.env.BSV_PREFER_CONFIRMED_UTXOS !== 'false'
+      const isConfirmedUtxo = (u: any): boolean => {
+        const conf = Number(u?.confirmations || 0)
+        const h = typeof u?.height === 'number' ? u.height : null
+        return conf > 0 || (h != null && h > 0)
+      }
+      const confirmedOnly = utxos.filter(isConfirmedUtxo)
+      const selectionPool = (preferConfirmed && confirmedOnly.length > 0) ? confirmedOnly : utxos
+
       // If below low-watermark, prefer the smallest to leave the largest for the splitter
       const lowWater = Number(process.env.BSV_UTXO_LOW_WATERMARK || 50)
       // Order candidate UTXOs
-      const candidates = utxos.length <= lowWater
-        ? [...utxos].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
-        : [...utxos].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
+      const candidates = selectionPool.length <= lowWater
+        ? [...selectionPool].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
+        : [...selectionPool].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
       // Try to reserve one; skip already-reserved inputs
       let selectedUtxo: any | null = null
       let inputKey = ''
@@ -577,9 +587,11 @@ export class BlockchainService {
       if (!selectedUtxo) {
         await this.refreshUtxoCache(address, wif, true)
         const freshUtxos = await this.getSpendableUtxos(address, wif)
-        const freshCandidates = freshUtxos.length <= lowWater
-          ? [...freshUtxos].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
-          : [...freshUtxos].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
+        const freshConfirmedOnly = freshUtxos.filter(isConfirmedUtxo)
+        const freshPool = (preferConfirmed && freshConfirmedOnly.length > 0) ? freshConfirmedOnly : freshUtxos
+        const freshCandidates = freshPool.length <= lowWater
+          ? [...freshPool].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
+          : [...freshPool].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
         for (const u of freshCandidates) {
           const key = `${u.tx_hash}:${u.tx_pos}`
           const addrCache = this.utxoCacheByAddress.get(address)
@@ -1029,6 +1041,7 @@ export class BlockchainService {
     'MINED',
     'ACCEPTED',
     'STORED',
+    'RECEIVED',
     'ANNOUNCED_TO_NETWORK',
     'SEEN_IN_ORPHAN_MEMPOOL',
   ])
@@ -1087,17 +1100,20 @@ export class BlockchainService {
   ): Promise<string> {
     const errors: string[] = []
 
-    // Build the ARC request body (shared by both ARC providers)
-    const arcBody: any = { rawTx: serializedTx }
-    try {
-      const useExtended = prevouts && prevouts.length > 0 && (process.env.BSV_ARC_EXTENDED_FORMAT !== 'false')
-      if (useExtended) {
-        arcBody.inputs = prevouts.map(p => ({
+    // Build ARC request bodies:
+    // - extended format includes prevouts for stricter validation
+    // - raw-only body is a compatibility fallback (some ARC gateways reject extended metadata)
+    const arcBodyRaw: any = { rawTx: serializedTx }
+    const useExtended = !!(prevouts && prevouts.length > 0 && (process.env.BSV_ARC_EXTENDED_FORMAT !== 'false'))
+    const arcBodyExtended: any = { rawTx: serializedTx }
+    if (useExtended) {
+      try {
+        arcBodyExtended.inputs = prevouts!.map(p => ({
           lockingScript: p.lockingScript,
           satoshis: Math.max(0, Number(p.satoshis) || 0),
         }))
-      }
-    } catch {}
+      } catch {}
+    }
 
     // Method 1: GorillaPool ARC (primary) — public access, no API key required
     try {
@@ -1108,7 +1124,7 @@ export class BlockchainService {
       const gpRes = await fetch(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
         method: 'POST',
         headers: gpHeaders,
-        body: JSON.stringify(arcBody)
+        body: JSON.stringify(useExtended ? arcBodyExtended : arcBodyRaw)
       })
       const gpText = await gpRes.text().catch(() => '')
       if (gpRes.ok) {
@@ -1119,7 +1135,38 @@ export class BlockchainService {
         if (bsvConfig.logging.level !== 'error') {
           console.warn(`⚠️  ARC (GorillaPool) ${gpRes.status}: ${gpText.substring(0, 150)}`)
         }
-        errors.push(`GorillaPool ARC failed (${gpRes.status}): ${gpText.substring(0, 300)}`)
+        // GorillaPool sometimes rejects extended-format metadata with 461.
+        // Retry once without prevouts before failing over to TAAL/WoC.
+        const gp461 = gpRes.status === 461 || /malformed|false\/empty top stack/i.test(gpText)
+        if (useExtended && gp461) {
+          try {
+            const gpCompatRes = await fetch(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
+              method: 'POST',
+              headers: gpHeaders,
+              body: JSON.stringify(arcBodyRaw)
+            })
+            const gpCompatText = await gpCompatRes.text().catch(() => '')
+            if (gpCompatRes.ok) {
+              const txid = this.parseArcResponse(gpCompatText, 'GorillaPool')
+              if (txid) {
+                if (bsvConfig.logging.level !== 'error') {
+                  console.warn('⚠️  ARC (GorillaPool): accepted after rawTx compatibility retry (without extended inputs)')
+                }
+                return txid
+              }
+              errors.push(`GorillaPool ARC compatibility retry: unexpected response: ${gpCompatText.substring(0, 200)}`)
+            } else {
+              if (bsvConfig.logging.level !== 'error') {
+                console.warn(`⚠️  ARC (GorillaPool compat) ${gpCompatRes.status}: ${gpCompatText.substring(0, 150)}`)
+              }
+              errors.push(`GorillaPool ARC compatibility retry failed (${gpCompatRes.status}): ${gpCompatText.substring(0, 300)}`)
+            }
+          } catch (compatErr) {
+            errors.push(`GorillaPool ARC compatibility retry error: ${compatErr instanceof Error ? compatErr.message : String(compatErr)}`)
+          }
+        } else {
+          errors.push(`GorillaPool ARC failed (${gpRes.status}): ${gpText.substring(0, 300)}`)
+        }
       }
     } catch (e) {
       errors.push(`GorillaPool ARC error: ${e instanceof Error ? e.message : String(e)}`)
@@ -1134,7 +1181,7 @@ export class BlockchainService {
       const arcRes = await fetch(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
         method: 'POST',
         headers: taalHeaders,
-        body: JSON.stringify(arcBody)
+        body: JSON.stringify(useExtended ? arcBodyExtended : arcBodyRaw)
       })
       const arcText = await arcRes.text().catch(() => '')
       if (arcRes.ok) {

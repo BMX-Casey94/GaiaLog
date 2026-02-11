@@ -65,11 +65,23 @@ export async function GET(request: NextRequest) {
     const pageSize = searchParams.get('pageSize')
     if (pageSize) params.pageSize = Math.min(500, Math.max(1, parseInt(pageSize, 10)))
 
+    // Heavy aggregate scans can be expensive on large datasets.
+    // Keep search path responsive by default, and only compute full aggregates
+    // when explicitly requested.
+    const includeAggregates = ['1', 'true', 'yes'].includes(
+      (searchParams.get('includeAggregates') || '').toLowerCase()
+    )
+
     // Fetch results from Supabase
-    const [results, aggregates] = await Promise.all([
-      searchReadings(params),
-      getAggregates(params),
-    ])
+    const results = await searchReadings(params)
+    const aggregates = includeAggregates
+      ? await getAggregates(params)
+      : {
+          totalReadings: results.total,
+          uniqueLocations: 0,
+          dateRange: { min: null, max: null },
+          byType: {},
+        }
 
     // Transform items for API response
     const items = results.items.map(item => ({

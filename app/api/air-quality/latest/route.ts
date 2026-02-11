@@ -63,8 +63,8 @@ export async function GET() {
 		}
 		const net = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
 		const latest = await Promise.race([
-			// Reduce scan depth for quicker responses
-			findLatestByType(net, 'air_quality', 10),
+			// Use a wider candidate window for high-throughput wallets while staying bounded.
+			findLatestByType(net, 'air_quality', 25),
 			timeoutPromise
 		]) as Awaited<ReturnType<typeof findLatestByType>>
 		
