@@ -273,7 +273,7 @@ export abstract class BaseWorker {
             this.stats.totalTransactions++
           } catch (e) {
             const eMsg = e instanceof Error ? e.message : String(e)
-            const isTransient = /MEMPOOL_CHAIN_LIMIT|No reservable UTXO|No UTXOs available|txn-mempool-conflict|DOUBLE_SPEND/i.test(eMsg)
+            const isTransient = /MEMPOOL_CHAIN_LIMIT|No reservable UTXO|No UTXOs available|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(eMsg)
             // Reliability guard: never drop a reading on direct-broadcast failure.
             // Route to queue so retry/backoff/idempotency logic can recover safely.
             const queueId = workerQueue.addToQueue(bsvData, item.priority)

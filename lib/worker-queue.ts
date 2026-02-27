@@ -455,6 +455,11 @@ export class WorkerQueue {
         // Insufficient fee: wait for mempool to clear or increase retry delay
         delay = Math.max(delay, 60000) // At least 60 seconds
         retryMessage = 'low fee, waiting for mempool to clear'
+      } else if (error.includes('HEAP_PRESSURE_BACKOFF')) {
+        // Heap pressure guard triggered: pause writes briefly to let GC recover.
+        delay = Math.max(delay, 60000) // At least 60 seconds
+        shouldForceUtxoRefresh = false
+        retryMessage = 'heap pressure backoff, waiting for memory recovery'
       } else if (error.includes('No UTXOs available') || error.includes('No reservable UTXO')) {
         // UTXO exhaustion: wait longer for UTXOs to confirm
         delay = Math.max(delay, 45000) // At least 45 seconds

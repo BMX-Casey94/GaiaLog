@@ -1,4 +1,5 @@
 import * as bsv from 'bsv'
+import * as v8 from 'v8'
 // BSV has no protocol-enforced dust limit (unlike BTC's 546 sat).
 // Override the library's inherited BTC default so change outputs of any
 // value (≥1 sat) are kept instead of being silently absorbed into fees.
@@ -66,6 +67,13 @@ const UTXO_FETCH_MAX_RETRIES = Number(process.env.BSV_UTXO_FETCH_MAX_RETRIES || 
 // How long to treat an input UTXO as "used" (to avoid re-spends while indexers lag).
 // This prevents txn-mempool-conflict when WoC /unspent still lists a just-spent UTXO.
 const UTXO_USED_KEY_TTL_MS = Number(process.env.BSV_UTXO_USED_KEY_TTL_MS || 30 * 60 * 1000) // 30 min
+const LOG_SUMMARY_INTERVAL_MS = Math.max(60000, Number(process.env.BSV_LOG_SUMMARY_INTERVAL_MS || 30 * 60 * 1000)) // 30 min
+const MAX_IN_MEMORY_TX_LOG = Math.max(100, Number(process.env.BSV_MAX_IN_MEMORY_TX_LOG || 500))
+const MAX_CONFIRMATION_CHECK_ATTEMPTS = Math.max(1, Number(process.env.BSV_CONFIRMATION_MAX_ATTEMPTS || 60))
+const HEAP_GUARD_ENABLED = process.env.BSV_HEAP_GUARD_ENABLED !== 'false'
+const HEAP_GUARD_HIGH_WATERMARK = Math.min(0.98, Math.max(0.5, Number(process.env.BSV_HEAP_GUARD_HIGH_WATERMARK || 0.82)))
+const HEAP_GUARD_PAUSE_MS = Math.max(5000, Number(process.env.BSV_HEAP_GUARD_PAUSE_MS || 30000))
+const HEAP_GUARD_MAX_BYTES = Math.max(0, Number(process.env.BSV_HEAP_GUARD_MAX_BYTES || 0))
 
 // Supabase client removed; we persist via Postgres repositories (tx_log)
 
@@ -190,9 +198,15 @@ export class BlockchainService {
     usedKeys: Map<string, number>
     inFlight: Promise<void> | null
   }> = new Map()
-  // Transaction status aggregation to reduce log noise
-  private txStatusBatch: { confirmed: string[], pending: string[], notFound: string[] } = { confirmed: [], pending: [], notFound: [] }
-  private batchIntervalId: NodeJS.Timeout | null = null
+  // Transaction status aggregation to reduce log noise and memory pressure
+  private txStatusBatch: { confirmed: number; pending: number; notFound: number; retryLimitReached: number } =
+    { confirmed: 0, pending: 0, notFound: 0, retryLimitReached: 0 }
+  private summaryIntervalId: NodeJS.Timeout | null = null
+  private confirmationAttemptsByTxid: Map<string, number> = new Map()
+  private operationalStats: { broadcastsOk: number; broadcastsFailed: number; utxoRefreshes: number; rawUtxosFetched: number; heapBackoffs: number } =
+    { broadcastsOk: 0, broadcastsFailed: 0, utxoRefreshes: 0, rawUtxosFetched: 0, heapBackoffs: 0 }
+  private operationalErrors: Map<string, number> = new Map()
+  private heapBackoffUntilMs = 0
 
   constructor() {
     try {
@@ -214,8 +228,8 @@ export class BlockchainService {
         this.wifsForSend = list
       } catch {}
       
-      // Start transaction status batch logging
-      this.startTxStatusBatchLogging()
+      // Start interval-based operational summary logging
+      this.startSummaryLogging()
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
       this.lastInitError = msg
@@ -236,27 +250,85 @@ export class BlockchainService {
     }
   }
 
-  private startTxStatusBatchLogging(): void {
-    // Log aggregated transaction statuses every 60 seconds instead of individually
-    this.batchIntervalId = setInterval(() => {
-      const { confirmed, pending, notFound } = this.txStatusBatch
-      
-      if (confirmed.length > 0 || pending.length > 0 || notFound.length > 0) {
-        console.log(`📊 Transaction Status Update:`)
-        if (confirmed.length > 0) {
-          console.log(`   ✅ Confirmed: ${confirmed.length} transactions`)
-        }
-        if (pending.length > 0) {
-          console.log(`   ⏳ Pending in mempool: ${pending.length} transactions`)
-        }
-        if (notFound.length > 0) {
-          console.log(`   ⚠️  Not found on-chain: ${notFound.length} transactions (may be rejected or still propagating)`)
-        }
-        
-        // Reset batch
-        this.txStatusBatch = { confirmed: [], pending: [], notFound: [] }
+  private startSummaryLogging(): void {
+    this.summaryIntervalId = setInterval(() => {
+      const tx = this.txStatusBatch
+      const stats = this.operationalStats
+      const totalErrors = Array.from(this.operationalErrors.values()).reduce((sum, n) => sum + n, 0)
+      const heapMb = Math.round(process.memoryUsage().heapUsed / (1024 * 1024))
+      const rssMb = Math.round(process.memoryUsage().rss / (1024 * 1024))
+
+      console.log('📊 Blockchain 30m summary:')
+      console.log(`   ✅ Broadcasts: ${stats.broadcastsOk} success, ${stats.broadcastsFailed} failed`)
+      console.log(`   🧾 Confirmation checks: ${tx.confirmed} confirmed, ${tx.pending} pending, ${tx.notFound} not-found, ${tx.retryLimitReached} retry-limit`)
+      console.log(`   🔁 UTXO refresh: ${stats.utxoRefreshes} refreshes, ${stats.rawUtxosFetched} raw UTXO(s) fetched`)
+      if (stats.heapBackoffs > 0) {
+        console.log(`   🛑 Heap guard: ${stats.heapBackoffs} temporary backoff event(s)`)
       }
-    }, 60000) // Every 60 seconds
+      console.log(`   🧠 Memory: heap=${heapMb} MB, rss=${rssMb} MB`)
+      if (totalErrors > 0) {
+        const topErrors = Array.from(this.operationalErrors.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([k, n]) => `${k}=${n}`)
+          .join(', ')
+        console.log(`   ⚠️  Errors: ${totalErrors} total (${topErrors})`)
+      }
+
+      this.txStatusBatch = { confirmed: 0, pending: 0, notFound: 0, retryLimitReached: 0 }
+      this.operationalStats = { broadcastsOk: 0, broadcastsFailed: 0, utxoRefreshes: 0, rawUtxosFetched: 0, heapBackoffs: 0 }
+      this.operationalErrors.clear()
+    }, LOG_SUMMARY_INTERVAL_MS)
+  }
+
+  private recordOperationalError(scope: string, error: unknown): void {
+    const msg = error instanceof Error ? error.message : String(error)
+    const safe = msg.replace(/\s+/g, ' ').trim().slice(0, 120)
+    const key = `${scope}:${safe || 'unknown'}`
+    this.operationalErrors.set(key, (this.operationalErrors.get(key) || 0) + 1)
+  }
+
+  private appendTransactionLog(entry: TransactionLog): void {
+    this.transactionLog.push(entry)
+    if (this.transactionLog.length > MAX_IN_MEMORY_TX_LOG) {
+      const overflow = this.transactionLog.length - MAX_IN_MEMORY_TX_LOG
+      this.transactionLog.splice(0, overflow)
+    }
+  }
+
+  private compactPayloadForLog(payload: unknown): any {
+    try {
+      const text = JSON.stringify(payload)
+      if (!text) return payload
+      if (text.length <= 2048) return payload
+      return {
+        _truncated: true,
+        bytes: Buffer.byteLength(text, 'utf8'),
+        preview: text.slice(0, 512),
+      }
+    } catch {
+      return { _truncated: true, reason: 'unserializable-payload' }
+    }
+  }
+
+  private enforceHeapGuard(): void {
+    if (!HEAP_GUARD_ENABLED) return
+    const now = Date.now()
+    if (now < this.heapBackoffUntilMs) {
+      const waitMs = this.heapBackoffUntilMs - now
+      throw new Error(`HEAP_PRESSURE_BACKOFF:${waitMs}`)
+    }
+
+    const heapUsed = process.memoryUsage().heapUsed
+    const heapLimit = v8.getHeapStatistics().heap_size_limit || 0
+    const overWatermark = heapLimit > 0 && (heapUsed / heapLimit) >= HEAP_GUARD_HIGH_WATERMARK
+    const overAbsoluteCap = HEAP_GUARD_MAX_BYTES > 0 && heapUsed >= HEAP_GUARD_MAX_BYTES
+    if (!overWatermark && !overAbsoluteCap) return
+
+    this.heapBackoffUntilMs = now + HEAP_GUARD_PAUSE_MS
+    this.operationalStats.heapBackoffs += 1
+    this.recordOperationalError('heap-guard', `heapUsed=${heapUsed};heapLimit=${heapLimit}`)
+    throw new Error('HEAP_PRESSURE_BACKOFF')
   }
 
   private async getFirstWalletWithSpendableUtxos(): Promise<{ wif: string; index: number; address: string; utxos: any[] } | null> {
@@ -411,6 +483,7 @@ export class BlockchainService {
         console.warn('⚠️ Blockchain private key not configured, skipping write to chain')
         return 'blockchain-not-configured'
       }
+      this.enforceHeapGuard()
       // Pick a wallet that currently has spendable UTXOs (fair round-robin)
       const picked = await this.getFirstWalletWithSpendableUtxos()
       if (!picked) throw new Error('No UTXOs available across wallets')
@@ -696,11 +769,12 @@ export class BlockchainService {
         txid,
         stream: data.stream,
         timestamp: data.timestamp,
-        payload: data.payload,
+        payload: this.compactPayloadForLog(data.payload),
         status: 'pending'
       }
 
-      this.transactionLog.push(transactionLog)
+      this.appendTransactionLog(transactionLog)
+      this.operationalStats.broadcastsOk += 1
 
       // ── Feed reading to /explorer store (zero API calls) ──
       try {
@@ -766,7 +840,9 @@ export class BlockchainService {
     } catch (error) {
       // Suppress noisy logs for expected, transient availability issues
       const msg = error instanceof Error ? error.message : String(error)
-      const transient = /already reserved|No UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND/i.test(msg)
+      const transient = /already reserved|No UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(msg)
+      this.operationalStats.broadcastsFailed += 1
+      this.recordOperationalError('writeToChain', msg)
 
       // Signal per-wallet mempool-chain backoff so round-robin skips this wallet
       if (msg.includes('MEMPOOL_CHAIN_LIMIT') && fromAddress) {
@@ -789,11 +865,11 @@ export class BlockchainService {
           txid: 'failed',
           stream: data.stream,
           timestamp: data.timestamp,
-          payload: data.payload,
+          payload: this.compactPayloadForLog(data.payload),
           status: 'failed',
           error: msg || 'Unknown error'
         }
-        this.transactionLog.push(failedLog)
+        this.appendTransactionLog(failedLog)
         try {
           if (process.env.GAIALOG_NO_DB !== 'true') {
             await upsertTxLog({
@@ -842,9 +918,11 @@ export class BlockchainService {
         }
       } catch {}
       
-      // Debug logging for UTXO refresh
-      console.log(`🔁 UTXO cache refreshed for ${address.substring(0, 10)}...: ${cache!.utxos.length} raw UTXO(s) fetched`)
+      this.operationalStats.utxoRefreshes += 1
+      this.operationalStats.rawUtxosFetched += cache!.utxos.length
+      // UTXO refresh detail is debug-only to avoid log spam in production.
       if (cache!.utxos.length > 0 && bsvConfig.logging.level === 'debug') {
+        console.log(`🔁 UTXO cache refreshed for ${address.substring(0, 10)}...: ${cache!.utxos.length} raw UTXO(s) fetched`)
         cache!.utxos.slice(0, 3).forEach((u: any, idx: number) => {
           console.log(`   UTXO ${idx + 1}: value=${u.value || u.satoshis || 'unknown'}, conf=${u.confirmations || 0}, height=${u.height || 'unknown'}, tx=${(u.tx_hash || u.txId || '').substring(0, 16)}...`)
         })
@@ -1247,6 +1325,15 @@ export class BlockchainService {
     // Wait 60 seconds for transaction to propagate and get indexed (increased from 30s)
     setTimeout(async () => {
       try {
+        const previousAttempts = this.confirmationAttemptsByTxid.get(txid) || 0
+        if (previousAttempts >= MAX_CONFIRMATION_CHECK_ATTEMPTS) {
+          this.txStatusBatch.retryLimitReached += 1
+          this.recordOperationalError('confirmation-check', 'max-attempts-reached')
+          this.confirmationAttemptsByTxid.delete(txid)
+          return
+        }
+        this.confirmationAttemptsByTxid.set(txid, previousAttempts + 1)
+
         const network = WOC_NETWORK
         const wocUrl = `https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`
         const headers: Record<string, string> = {}
@@ -1274,21 +1361,22 @@ export class BlockchainService {
               retries: null,
               error: null,
             })
-            // Add to batch instead of logging immediately
-            this.txStatusBatch.confirmed.push(txid.substring(0, 12))
+            this.txStatusBatch.confirmed += 1
+            this.confirmationAttemptsByTxid.delete(txid)
           } else {
-            // Still in mempool, check again later (increased delay to 2 minutes)
-            this.txStatusBatch.pending.push(txid.substring(0, 12))
+            // Still in mempool, check again later.
+            this.txStatusBatch.pending += 1
             setTimeout(() => this.scheduleConfirmationCheck(txid, streamType).catch(() => {}), 120000)
           }
         } else if (response.status === 404) {
           // Transaction not found - might have been rejected or not yet indexed
-          this.txStatusBatch.notFound.push(txid.substring(0, 12))
-          // Check one more time after 2 minutes (increased from 60s)
+          this.txStatusBatch.notFound += 1
+          // Check again after 2 minutes.
           setTimeout(() => this.scheduleConfirmationCheck(txid, streamType).catch(() => {}), 120000)
         }
       } catch (error) {
         // Silently fail - confirmation checking is best-effort
+        this.recordOperationalError('confirmation-check', error)
       }
     }, 60000) // Initial check after 60 seconds (increased from 30s)
   }
@@ -1410,10 +1498,11 @@ export class BlockchainService {
 
   // Cleanup method to stop batch logging
   destroy(): void {
-    if (this.batchIntervalId) {
-      clearInterval(this.batchIntervalId)
-      this.batchIntervalId = null
+    if (this.summaryIntervalId) {
+      clearInterval(this.summaryIntervalId)
+      this.summaryIntervalId = null
     }
+    this.confirmationAttemptsByTxid.clear()
   }
 }
 
