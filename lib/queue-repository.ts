@@ -12,22 +12,30 @@ export type QueueRow = {
   updated_at: string | null
 }
 
-export async function ensureQueueTable(): Promise<void> {
-  await query(`
-    CREATE TABLE IF NOT EXISTS worker_queue (
-      id text PRIMARY KEY,
-      priority text NOT NULL,
-      data jsonb NOT NULL,
-      timestamp bigint NOT NULL,
-      retry_count integer NOT NULL DEFAULT 0,
-      max_retries integer NOT NULL DEFAULT 3,
-      status text NOT NULL DEFAULT 'queued',
-      last_error text NULL,
-      updated_at timestamptz NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS worker_queue_status_idx ON worker_queue(status);
-    CREATE INDEX IF NOT EXISTS worker_queue_updated_idx ON worker_queue(updated_at);
-  `)
+let _queueTableReady: Promise<void> | null = null
+
+export function ensureQueueTable(): Promise<void> {
+  if (!_queueTableReady) {
+    _queueTableReady = query(`
+      CREATE TABLE IF NOT EXISTS worker_queue (
+        id text PRIMARY KEY,
+        priority text NOT NULL,
+        data jsonb NOT NULL,
+        timestamp bigint NOT NULL,
+        retry_count integer NOT NULL DEFAULT 0,
+        max_retries integer NOT NULL DEFAULT 3,
+        status text NOT NULL DEFAULT 'queued',
+        last_error text NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS worker_queue_status_idx ON worker_queue(status);
+      CREATE INDEX IF NOT EXISTS worker_queue_updated_idx ON worker_queue(updated_at);
+    `).then(() => {}).catch((err) => {
+      _queueTableReady = null
+      throw err
+    })
+  }
+  return _queueTableReady
 }
 
 export async function enqueueQueueItem(row: Omit<QueueRow, 'status' | 'last_error' | 'updated_at'>): Promise<void> {

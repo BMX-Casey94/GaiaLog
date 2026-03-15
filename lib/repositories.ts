@@ -409,9 +409,11 @@ export async function upsertTxLog(entry: {
 
 
 // On-chain per-transaction copies (non-destructive; created lazily)
-async function ensureOnchainTables(): Promise<void> {
-  try {
-    await query(`
+let _onchainTablesReady: Promise<void> | null = null
+
+function ensureOnchainTables(): Promise<void> {
+  if (!_onchainTablesReady) {
+    _onchainTablesReady = query(`
       CREATE TABLE IF NOT EXISTS air_quality_onchain (
         txid text PRIMARY KEY,
         provider text,
@@ -436,8 +438,12 @@ async function ensureOnchainTables(): Promise<void> {
         collected_at timestamptz,
         payload jsonb
       );
-    `)
-  } catch {}
+    `).then(() => {}).catch((err) => {
+      _onchainTablesReady = null
+      throw err
+    })
+  }
+  return _onchainTablesReady
 }
 
 export async function upsertAirQualityOnchain(txid: string, provider: string, collectedAt: Date, payload: any): Promise<void> {
