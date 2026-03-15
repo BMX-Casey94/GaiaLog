@@ -5,12 +5,12 @@ dotenv.config({ path: '.env.local' })
 dotenv.config()
 
 import { getOverlayServerConfig } from '@/lib/overlay-config'
-import overlayServerModule from '@/lib/overlay-server'
+import { createOverlayApp } from '@/lib/overlay-server'
 
 async function main() {
   try {
     const config = getOverlayServerConfig()
-    const app = await overlayServerModule.createOverlayApp()
+    const app = await createOverlayApp()
     const server = app.listen(config.port, config.bindHost, () => {
       console.log(`🧩 Overlay server listening on http://${config.bindHost}:${config.port} (${config.hostId})`)
     })
