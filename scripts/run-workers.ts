@@ -59,6 +59,30 @@ async function main() {
         console.warn('⚠️ DB host is localhost; if you expect Supabase, set DATABASE_URL or SUPABASE_DB_URL in .env.local for workers.')
       }
     } catch {}
+    try {
+      const { getSpendSourceStatus } = await import('../lib/spend-source')
+      const { getOverlayFallbackConfig } = await import('../lib/overlay-config')
+      const spendSource = getSpendSourceStatus()
+      const gate = getOverlayFallbackConfig()
+      const overlayWallets = spendSource.wallets
+        .filter(wallet => wallet.overlaySelected)
+        .map(wallet => wallet.walletLabel)
+        .join(',')
+      const traceMode = process.env.BSV_LOG_LEVEL === 'debug' ? 'debug' : 'slow-only'
+      console.log(
+        `💸 Spend source: mode=${spendSource.mode} active=${spendSource.activeImplementation} gate=${gate.queueGateSource} ` +
+        `overlayLookup=${spendSource.overlayLookupConfigured ? 'on' : 'off'} overlaySubmit=${spendSource.overlaySubmitConfigured ? 'on' : 'off'} ` +
+        `overlayWallets=${overlayWallets || 'none'}`
+      )
+      console.log(
+        `📡 Broadcast config: fee=${Number(process.env.BSV_TX_FEE_RATE || 0.105)} sat/B ` +
+        `timeout=${Math.max(3000, Number(process.env.BSV_BROADCAST_TIMEOUT_MS || 15000))}ms ` +
+        `minConf=${Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS ?? 0)} ` +
+        `utxoPool=${process.env.BSV_ENABLE_UTXO_POOL === 'true' ? 'on' : 'off'} ` +
+        `dbLocks=${process.env.BSV_ENABLE_UTXO_DB_LOCKS === 'true' ? 'on' : 'off'} ` +
+        `trace=${traceMode}`
+      )
+    } catch {}
 
     workerManager.startAll()
     // Start UTXO maintainer first to prioritize split at boot

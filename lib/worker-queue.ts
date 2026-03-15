@@ -436,6 +436,7 @@ export class WorkerQueue {
           providerId: item.data.providerId,
           datasetId: item.data.datasetId,
           queueLane: item.data.queueLane,
+          traceId: item.id,
           payload,
         })
         wasBroadcast = true

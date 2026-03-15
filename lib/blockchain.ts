@@ -28,6 +28,7 @@ export interface BlockchainData {
   providerId?: string
   datasetId?: string
   queueLane?: QueueLane
+  traceId?: string
 }
 
 export interface TransactionLog {
@@ -54,6 +55,22 @@ type ConfirmationCheckHeapItem = {
   generation: number
 }
 
+type WriteTraceSummary = {
+  traceId: string
+  stream: string
+  totalMs: number
+  walletLookupMs?: number
+  walletIndex?: number
+  address?: string
+  spendableCount?: number
+  txBuildMs?: number
+  broadcastMs?: number
+  txLogMs?: number
+  acceptedVia?: string
+  txid?: string
+  error?: string
+}
+
 // Environment variables
 const BSV_PRIVATE_KEY = process.env.BSV_PRIVATE_KEY || process.env.BSV_WALLET_1_PRIVATE_KEY || process.env.BSV_WALLET_2_PRIVATE_KEY || process.env.BSV_WALLET_3_PRIVATE_KEY
 const BSV_FALLBACK_WIF = (bsvConfig?.wallets?.privateKeys && bsvConfig.wallets.privateKeys.length > 0) ? bsvConfig.wallets.privateKeys[0] : ''
@@ -77,6 +94,8 @@ const MIN_SPEND_CONF = Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS ?? 0)
 const REFRESH_THRESHOLD = Number(process.env.BSV_UTXO_REFRESH_THRESHOLD || 10)
 const SPEND_SOURCE_LIST_LIMIT = Math.max(100, Number(process.env.BSV_SPEND_SOURCE_LIST_LIMIT || 5000))
 const BROADCAST_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.BSV_BROADCAST_TIMEOUT_MS || 15000))
+const SLOW_WRITE_TO_CHAIN_MS = Math.max(1000, Number(process.env.BSV_SLOW_WRITE_TO_CHAIN_MS || 5000))
+const SLOW_UTXO_LOOKUP_MS = Math.max(250, Number(process.env.BSV_SLOW_UTXO_LOOKUP_MS || 2000))
 
 // Data credibility features (opt-in for now)
 const ENABLE_CREDIBILITY = process.env.GAIALOG_ENABLE_CREDIBILITY === 'true'
@@ -325,6 +344,97 @@ export class BlockchainService {
     const safe = msg.replace(/\s+/g, ' ').trim().slice(0, 120)
     const key = `${scope}:${safe || 'unknown'}`
     this.operationalErrors.set(key, (this.operationalErrors.get(key) || 0) + 1)
+  }
+
+  private shouldTraceTimings(): boolean {
+    return bsvConfig.logging.level === 'debug'
+  }
+
+  private compactLogValue(value: unknown, max = 120): string {
+    return String(value ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, max)
+  }
+
+  private shortenToken(value: string | null | undefined, keep = 12): string {
+    const safe = String(value || '')
+    if (!safe) return 'n/a'
+    return safe.length > keep ? `${safe.substring(0, keep)}...` : safe
+  }
+
+  private logUtxoLookupTrace(input: {
+    traceId?: string
+    walletIndex?: number
+    address: string
+    source: string
+    spendableCount: number
+    durationMs: number
+    note?: string
+  }): void {
+    if (!this.shouldTraceTimings() && input.durationMs < SLOW_UTXO_LOOKUP_MS) return
+
+    const parts = [
+      '⏱️ UTXO lookup',
+      input.traceId ? `trace=${input.traceId}` : '',
+      typeof input.walletIndex === 'number' ? `wallet=W${input.walletIndex + 1}` : '',
+      `addr=${this.shortenToken(input.address, 14)}`,
+      `source=${input.source}`,
+      `spendable=${Math.max(0, input.spendableCount)}`,
+      `total=${Math.round(input.durationMs)}ms`,
+    ].filter(Boolean)
+
+    if (input.note) {
+      parts.push(`note=${this.compactLogValue(input.note, 160)}`)
+    }
+
+    console.log(parts.join(' '))
+  }
+
+  private logBroadcastStep(traceId: string | undefined, channel: string, phase: string, durationMs?: number, note?: string): void {
+    if (!this.shouldTraceTimings()) return
+
+    const parts = [
+      '⏱️ broadcast',
+      traceId ? `trace=${traceId}` : '',
+      `channel=${channel}`,
+      `phase=${phase}`,
+    ].filter(Boolean)
+
+    if (typeof durationMs === 'number') {
+      parts.push(`ms=${Math.round(durationMs)}`)
+    }
+    if (note) {
+      parts.push(`note=${this.compactLogValue(note, 160)}`)
+    }
+
+    console.log(parts.join(' '))
+  }
+
+  private logWriteToChainSummary(summary: WriteTraceSummary): void {
+    const force = !!summary.error || summary.totalMs >= SLOW_WRITE_TO_CHAIN_MS
+    if (!this.shouldTraceTimings() && !force) return
+
+    const parts = [
+      `⏱️ writeToChain ${summary.error ? 'failed' : 'ok'}`,
+      `trace=${summary.traceId}`,
+      `stream=${summary.stream}`,
+      `total=${Math.round(summary.totalMs)}ms`,
+    ]
+
+    if (typeof summary.walletIndex === 'number') parts.push(`wallet=W${summary.walletIndex + 1}`)
+    if (summary.address) parts.push(`addr=${this.shortenToken(summary.address, 14)}`)
+    if (typeof summary.spendableCount === 'number') parts.push(`spendable=${summary.spendableCount}`)
+    if (typeof summary.walletLookupMs === 'number') parts.push(`walletPick=${Math.round(summary.walletLookupMs)}ms`)
+    if (typeof summary.txBuildMs === 'number') parts.push(`txBuild=${Math.round(summary.txBuildMs)}ms`)
+    if (typeof summary.broadcastMs === 'number') parts.push(`broadcast=${Math.round(summary.broadcastMs)}ms`)
+    if (typeof summary.txLogMs === 'number') parts.push(`txLog=${Math.round(summary.txLogMs)}ms`)
+    if (summary.acceptedVia) parts.push(`acceptedVia=${summary.acceptedVia}`)
+    if (summary.txid) parts.push(`txid=${this.shortenToken(summary.txid, 12)}`)
+    if (summary.error) parts.push(`error=${this.compactLogValue(summary.error, 180)}`)
+
+    const logger = summary.error ? console.warn : console.log
+    logger(parts.join(' '))
   }
 
   private detectBroadcastChannel(message: string): string {
@@ -614,7 +724,7 @@ export class BlockchainService {
     throw new Error('HEAP_PRESSURE_BACKOFF')
   }
 
-  private async getFirstWalletWithSpendableUtxos(): Promise<{ wif: string; index: number; address: string; utxos: any[] } | null> {
+  private async getFirstWalletWithSpendableUtxos(traceId?: string): Promise<{ wif: string; index: number; address: string; utxos: any[] } | null> {
     // Build list, starting from current rrIndex for fairness
     const list = this.wifsForSend && this.wifsForSend.length > 0
       ? this.wifsForSend
@@ -643,7 +753,7 @@ export class BlockchainService {
           continue
         }
 
-        const spendable = await this.getSpendableUtxos(addr, wif, pick)
+        const spendable = await this.getSpendableUtxos(addr, wif, pick, traceId)
         
         // Estimate balance from spendable UTXOs for diagnostics (avoid extra WoC calls)
         let balance: number | undefined
@@ -703,7 +813,7 @@ export class BlockchainService {
           try {
             const sdkKey = SDKPrivateKey.fromWif(wif)
             const addr = sdkKey.toPublicKey().toAddress().toString()
-            const spendable = await this.getSpendableUtxos(addr, wif, pick)
+            const spendable = await this.getSpendableUtxos(addr, wif, pick, traceId)
             
             if (spendable.length > 0) {
               this.rrIndex = (pick + 1) % list.length
@@ -759,8 +869,24 @@ export class BlockchainService {
   }
 
   async writeToChain(data: BlockchainData): Promise<string> {
+    const traceId = typeof data.traceId === 'string' && data.traceId.trim().length > 0
+      ? data.traceId.trim()
+      : `${data.stream}:${Date.now().toString(36)}`
+    const writeStartedAt = Date.now()
+    let walletLookupMs: number | undefined
+    let txBuildMs: number | undefined
+    let broadcastMs: number | undefined
+    let txLogMs: number | undefined
+    let selectedWalletIndex: number | undefined
+    let selectedWalletAddress = ''
+    let selectedSpendableCount: number | undefined
+    let acceptedVia: string | undefined
+    let acceptedTxid: string | undefined
     let fromAddress = '' // hoisted so outer catch can signal per-wallet backoff
     try {
+      if (this.shouldTraceTimings()) {
+        console.log(`⏱️ writeToChain start trace=${traceId} stream=${data.stream}`)
+      }
       // Check if blockchain is configured
       if (!BSV_PRIVATE_KEY && !BSV_FALLBACK_WIF) {
         console.warn('⚠️ Blockchain private key not configured, skipping write to chain')
@@ -768,9 +894,14 @@ export class BlockchainService {
       }
       this.enforceHeapGuard()
       // Pick a wallet that currently has spendable UTXOs (fair round-robin)
-      const picked = await this.getFirstWalletWithSpendableUtxos()
+      const walletLookupStartedAt = Date.now()
+      const picked = await this.getFirstWalletWithSpendableUtxos(traceId)
+      walletLookupMs = Date.now() - walletLookupStartedAt
       if (!picked) throw new Error('No UTXOs available across wallets')
       const { wif, index: walletIndexForLog, address: pickedAddress } = picked
+      selectedWalletIndex = walletIndexForLog
+      selectedWalletAddress = pickedAddress
+      selectedSpendableCount = Array.isArray(picked.utxos) ? picked.utxos.length : undefined
       fromAddress = pickedAddress
 
       // Proceed based on UTXO availability rather than blunt balance threshold
@@ -957,7 +1088,7 @@ export class BlockchainService {
       // Change outputs from recent TXs may now be visible to the indexer.
       if (!selectedUtxo) {
         await this.refreshUtxoCache(address, wif, true)
-        const freshUtxos = await this.getSpendableUtxos(address, wif, walletIndexForLog)
+        const freshUtxos = await this.getSpendableUtxos(address, wif, walletIndexForLog, traceId)
         const freshConfirmedOnly = freshUtxos.filter(isConfirmedUtxo)
         const freshPool = (preferConfirmed && freshConfirmedOnly.length > 0) ? freshConfirmedOnly : freshUtxos
         const freshCandidates = freshPool.length <= lowWater
@@ -1070,8 +1201,20 @@ export class BlockchainService {
           reservedKeys = bitcoreUtxos.map((i: any) => `${i.txId}:${i.outputIndex}`)
           this.markUtxosUsed(reservedKeys) // refresh TTL
         }
+        const buildStartedAt = Date.now()
         const normalHex = buildSerialized(1)
-        const { txid, acceptedVia } = await this.broadcastTransaction(normalHex, prevoutsForArc)
+        txBuildMs = Date.now() - buildStartedAt
+        const broadcastStartedAt = Date.now()
+        let broadcastResult: { txid: string; acceptedVia: string } | null = null
+        try {
+          broadcastResult = await this.broadcastTransaction(normalHex, prevoutsForArc, traceId)
+        } finally {
+          broadcastMs = Date.now() - broadcastStartedAt
+        }
+        if (!broadcastResult) throw new Error('Broadcast result missing')
+        const { txid, acceptedVia: acceptedViaResult } = broadcastResult
+        acceptedVia = acceptedViaResult
+        acceptedTxid = txid
 
         // Log transaction
         const transactionLog: TransactionLog = {
@@ -1156,6 +1299,7 @@ export class BlockchainService {
         // Persist to tx_log (pending on broadcast, will be confirmed later)
         try {
           if (process.env.GAIALOG_NO_DB !== 'true') {
+            const txLogStartedAt = Date.now()
             await upsertTxLog({
               txid,
               type: data.stream,
@@ -1168,6 +1312,7 @@ export class BlockchainService {
               retries: 0,
               error: null,
             })
+            txLogMs = Date.now() - txLogStartedAt
           }
         } catch (e) {
           // Non-fatal
@@ -1181,6 +1326,20 @@ export class BlockchainService {
         if (ENABLE_UTXO_DB_LOCKS) {
           try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys([inputKey]) } catch {}
         }
+        this.logWriteToChainSummary({
+          traceId,
+          stream: data.stream,
+          totalMs: Date.now() - writeStartedAt,
+          walletLookupMs,
+          walletIndex: selectedWalletIndex,
+          address: selectedWalletAddress || fromAddress,
+          spendableCount: selectedSpendableCount,
+          txBuildMs,
+          broadcastMs,
+          txLogMs,
+          acceptedVia,
+          txid: acceptedTxid,
+        })
         return txid
       } catch (innerErr) {
         const innerMsg = innerErr instanceof Error ? innerErr.message : String(innerErr)
@@ -1199,6 +1358,21 @@ export class BlockchainService {
     } catch (error) {
       // Suppress noisy logs for expected, transient availability issues
       const msg = error instanceof Error ? error.message : String(error)
+      this.logWriteToChainSummary({
+        traceId,
+        stream: data.stream,
+        totalMs: Date.now() - writeStartedAt,
+        walletLookupMs,
+        walletIndex: selectedWalletIndex,
+        address: selectedWalletAddress || fromAddress,
+        spendableCount: selectedSpendableCount,
+        txBuildMs,
+        broadcastMs,
+        txLogMs,
+        acceptedVia,
+        txid: acceptedTxid,
+        error: msg,
+      })
       const transient = /already reserved|No UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(msg)
       const failedProviderValue = (data as any)?.payload?.source || 'unknown'
       const failedProviderId = (data as any)?.providerId || (data as any)?.payload?.provider_id || resolveProviderIdFromSource(failedProviderValue) || undefined
@@ -1368,17 +1542,29 @@ export class BlockchainService {
     await cache.inFlight
   }
 
-  private async getSpendableUtxos(address: string, explicitWif?: string, walletIndex?: number): Promise<any[]> {
+  private async getSpendableUtxos(address: string, explicitWif?: string, walletIndex?: number, traceId?: string): Promise<any[]> {
+    const startedAt = Date.now()
+    const notes: string[] = []
     const resolvedWalletIndex = typeof walletIndex === 'number'
       ? walletIndex
       : getWalletIndexForAddress(address)
     if (resolvedWalletIndex != null) {
       try {
         const spendables = await this.getSpendableUtxosFromSpendSource(address, resolvedWalletIndex)
-        return this.filterLocallyUsedUtxos(address, spendables)
+        const filtered = this.filterLocallyUsedUtxos(address, spendables)
+        this.logUtxoLookupTrace({
+          traceId,
+          walletIndex: resolvedWalletIndex,
+          address,
+          source: 'spend-source',
+          spendableCount: filtered.length,
+          durationMs: Date.now() - startedAt,
+        })
+        return filtered
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        notes.push(`spend-source fallback=${message}`)
         if (bsvConfig.logging.level === 'debug') {
-          const message = error instanceof Error ? error.message : String(error)
           console.warn(`⚠️ Spend-source lookup failed for ${address.substring(0, 10)}...; falling back to legacy UTXO path: ${message}`)
         }
       }
@@ -1399,17 +1585,28 @@ export class BlockchainService {
       if (!useWif) throw new Error('No matching WIF found for address')
       const temp = new BSVWallet(useWif)
       const raw = await temp.getUTXOs()
-      return Array.isArray(raw)
+      const filtered = Array.isArray(raw)
         ? raw.filter((u: any) => {
             return (u.confirmations || 0) >= MIN_SPEND_CONF || (typeof u.height !== 'number') || u.height > 0
           })
         : []
+      this.logUtxoLookupTrace({
+        traceId,
+        walletIndex: resolvedWalletIndex ?? undefined,
+        address,
+        source: resolvedWalletIndex != null ? 'legacy-direct-fallback' : 'legacy-direct',
+        spendableCount: filtered.length,
+        durationMs: Date.now() - startedAt,
+        note: notes.join('; '),
+      })
+      return filtered
     }
     const now = Date.now()
     let cache = this.utxoCacheByAddress.get(address)
     if (!cache) {
       await this.refreshUtxoCache(address, explicitWif || '')
       cache = this.utxoCacheByAddress.get(address)!
+      notes.push('cold-cache-refresh')
     }
     // Best-effort prune expired used keys
     try {
@@ -1444,6 +1641,7 @@ export class BlockchainService {
       if (!matchWif) throw new Error('No matching WIF found for address')
       await this.refreshUtxoCache(address, matchWif)
       cache = this.utxoCacheByAddress.get(address)!
+      notes.push('ttl-refresh')
     }
     const used = cache.usedKeys
     const available = cache.utxos
@@ -1468,8 +1666,9 @@ export class BlockchainService {
         }
       }
       if (matchWif) await this.refreshUtxoCache(address, matchWif)
+      if (matchWif) notes.push('empty-refresh')
       const refreshed = this.utxoCacheByAddress.get(address)!
-      return refreshed.utxos
+      const filtered = refreshed.utxos
         .filter((u: any) => (u.confirmations || 0) >= MIN_SPEND_CONF || (typeof u.height !== 'number') || u.height > 0)
         .filter((u: any) => {
           const key = `${u.tx_hash}:${u.tx_pos}`
@@ -1478,7 +1677,26 @@ export class BlockchainService {
           if (exp <= now) { refreshed.usedKeys.delete(key); return true }
           return false
         })
+      this.logUtxoLookupTrace({
+        traceId,
+        walletIndex: resolvedWalletIndex ?? undefined,
+        address,
+        source: resolvedWalletIndex != null ? 'legacy-cache-fallback' : 'legacy-cache',
+        spendableCount: filtered.length,
+        durationMs: Date.now() - startedAt,
+        note: notes.join('; '),
+      })
+      return filtered
     }
+    this.logUtxoLookupTrace({
+      traceId,
+      walletIndex: resolvedWalletIndex ?? undefined,
+      address,
+      source: resolvedWalletIndex != null ? 'legacy-cache-fallback' : 'legacy-cache',
+      spendableCount: available.length,
+      durationMs: Date.now() - startedAt,
+      note: notes.join('; '),
+    })
     return available
   }
 
@@ -1626,7 +1844,8 @@ export class BlockchainService {
 
   private async broadcastTransaction(
     serializedTx: string,
-    prevouts?: Array<{ lockingScript: string; satoshis: number }>
+    prevouts?: Array<{ lockingScript: string; satoshis: number }>,
+    traceId?: string
   ): Promise<{ txid: string; acceptedVia: string }> {
     const errors: string[] = []
 
@@ -1649,7 +1868,10 @@ export class BlockchainService {
     try {
       if (this.isBroadcastChannelBackedOff('gorillapool_arc')) {
         errors.push('GorillaPool ARC skipped (ENDPOINT_BACKOFF)')
+        this.logBroadcastStep(traceId, 'gorillapool_arc', 'skipped', 0, 'ENDPOINT_BACKOFF')
       } else {
+      const gpStartedAt = Date.now()
+      this.logBroadcastStep(traceId, 'gorillapool_arc', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
       const gpHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
       const gpApiKey = process.env.BSV_GORILLAPOOL_API_KEY
       if (gpApiKey) gpHeaders['Authorization'] = `Bearer ${gpApiKey}`
@@ -1663,9 +1885,11 @@ export class BlockchainService {
       if (gpRes.ok) {
         const txid = this.parseArcResponse(gpText, 'GorillaPool')
         if (txid) {
+          this.logBroadcastStep(traceId, 'gorillapool_arc', 'accepted', Date.now() - gpStartedAt, `txid=${this.shortenToken(txid, 12)}`)
           this.clearBroadcastChannelBackoff('gorillapool_arc')
           return { txid, acceptedVia: 'gorillapool_arc' }
         }
+        this.logBroadcastStep(traceId, 'gorillapool_arc', 'rejected', Date.now() - gpStartedAt, 'ok-without-accepted-txid')
         errors.push(`GorillaPool ARC: rejected or unexpected response: ${gpText.substring(0, 200)}`)
       } else {
         if (bsvConfig.logging.level !== 'error') {
@@ -1679,8 +1903,11 @@ export class BlockchainService {
         // GorillaPool sometimes rejects extended-format metadata with 461.
         // Retry once without prevouts before failing over to TAAL/WoC.
         const gp461 = gpRes.status === 461 || /malformed|false\/empty top stack/i.test(gpText)
+        this.logBroadcastStep(traceId, 'gorillapool_arc', `http_${gpRes.status}`, Date.now() - gpStartedAt, gp461 ? 'compat-retry' : undefined)
         if (useExtended && gp461) {
           try {
+            const gpCompatStartedAt = Date.now()
+            this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
             const gpCompatRes = await this.fetchWithTimeout(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
               method: 'POST',
               headers: gpHeaders,
@@ -1690,14 +1917,17 @@ export class BlockchainService {
             if (gpCompatRes.ok) {
               const txid = this.parseArcResponse(gpCompatText, 'GorillaPool')
               if (txid) {
+                this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'accepted', Date.now() - gpCompatStartedAt, `txid=${this.shortenToken(txid, 12)}`)
                 if (bsvConfig.logging.level !== 'error') {
                   console.warn('⚠️  ARC (GorillaPool): accepted after rawTx compatibility retry (without extended inputs)')
                 }
                 this.clearBroadcastChannelBackoff('gorillapool_arc')
                 return { txid, acceptedVia: 'gorillapool_arc' }
               }
+              this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'rejected', Date.now() - gpCompatStartedAt, 'ok-without-accepted-txid')
               errors.push(`GorillaPool ARC compatibility retry: unexpected response: ${gpCompatText.substring(0, 200)}`)
             } else {
+              this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', `http_${gpCompatRes.status}`, Date.now() - gpCompatStartedAt)
               if (bsvConfig.logging.level !== 'error') {
                 console.warn(`⚠️  ARC (GorillaPool compat) ${gpCompatRes.status}: ${gpCompatText.substring(0, 150)}`)
               }
@@ -1709,6 +1939,7 @@ export class BlockchainService {
               errors.push(`GorillaPool ARC compatibility retry failed (${gpCompatRes.status}): ${gpCompatText.substring(0, 300)}`)
             }
           } catch (compatErr) {
+            this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'error', undefined, compatErr instanceof Error ? compatErr.message : String(compatErr))
             this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, compatErr instanceof Error ? compatErr.message : String(compatErr))
             errors.push(`GorillaPool ARC compatibility retry error: ${compatErr instanceof Error ? compatErr.message : String(compatErr)}`)
           }
@@ -1718,6 +1949,7 @@ export class BlockchainService {
       }
       }
     } catch (e) {
+      this.logBroadcastStep(traceId, 'gorillapool_arc', 'error', undefined, e instanceof Error ? e.message : String(e))
       this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, e instanceof Error ? e.message : String(e))
       errors.push(`GorillaPool ARC error: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -1726,7 +1958,10 @@ export class BlockchainService {
     try {
       if (this.isBroadcastChannelBackedOff('taal_arc')) {
         errors.push('TAAL ARC skipped (ENDPOINT_BACKOFF)')
+        this.logBroadcastStep(traceId, 'taal_arc', 'skipped', 0, 'ENDPOINT_BACKOFF')
       } else {
+      const taalStartedAt = Date.now()
+      this.logBroadcastStep(traceId, 'taal_arc', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
       const arcKey = process.env.BSV_ARC_API_KEY
       const taalHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
       if (arcKey) taalHeaders['Authorization'] = `Bearer ${arcKey}`
@@ -1740,11 +1975,14 @@ export class BlockchainService {
       if (arcRes.ok) {
         const txid = this.parseArcResponse(arcText, 'TAAL')
         if (txid) {
+          this.logBroadcastStep(traceId, 'taal_arc', 'accepted', Date.now() - taalStartedAt, `txid=${this.shortenToken(txid, 12)}`)
           this.clearBroadcastChannelBackoff('taal_arc')
           return { txid, acceptedVia: 'taal_arc' }
         }
+        this.logBroadcastStep(traceId, 'taal_arc', 'rejected', Date.now() - taalStartedAt, 'ok-without-accepted-txid')
         errors.push(`TAAL ARC: rejected or unexpected response: ${arcText.substring(0, 200)}`)
       } else {
+        this.logBroadcastStep(traceId, 'taal_arc', `http_${arcRes.status}`, Date.now() - taalStartedAt)
         if (bsvConfig.logging.level !== 'error') {
           console.warn(`⚠️  ARC (TAAL) ${arcRes.status}: ${arcText.substring(0, 150)}`)
         }
@@ -1757,6 +1995,7 @@ export class BlockchainService {
       }
       }
     } catch (e) {
+      this.logBroadcastStep(traceId, 'taal_arc', 'error', undefined, e instanceof Error ? e.message : String(e))
       this.noteBroadcastChannelBackoff('taal_arc', 30000, e instanceof Error ? e.message : String(e))
       errors.push(`TAAL ARC error: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -1768,7 +2007,10 @@ export class BlockchainService {
     try {
       if (this.isBroadcastChannelBackedOff('whatsonchain')) {
         errors.push('WoC broadcast skipped (ENDPOINT_BACKOFF)')
+        this.logBroadcastStep(traceId, 'whatsonchain', 'skipped', 0, 'ENDPOINT_BACKOFF')
       } else {
+      const wocStartedAt = Date.now()
+      this.logBroadcastStep(traceId, 'whatsonchain', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
       const wocNetwork = WOC_NETWORK
       const wocHeaders = this.buildWhatsOnChainHeaders(true)
 
@@ -1782,12 +2024,15 @@ export class BlockchainService {
         // WoC returns the txid as a plain string (with quotes)
         const txid = wocText.replace(/"/g, '').trim()
         if (/^[0-9a-fA-F]{64}$/.test(txid)) {
+          this.logBroadcastStep(traceId, 'whatsonchain', 'accepted', Date.now() - wocStartedAt, `txid=${this.shortenToken(txid, 12)}`)
           console.log(`📡 WoC broadcast accepted: txid=${txid.substring(0, 12)}...`)
           this.clearBroadcastChannelBackoff('whatsonchain')
           return { txid, acceptedVia: 'whatsonchain' }
         }
+        this.logBroadcastStep(traceId, 'whatsonchain', 'rejected', Date.now() - wocStartedAt, 'ok-without-accepted-txid')
         errors.push(`WoC returned unexpected response: ${wocText.substring(0, 200)}`)
       } else {
+        this.logBroadcastStep(traceId, 'whatsonchain', `http_${wocRes.status}`, Date.now() - wocStartedAt)
         if (bsvConfig.logging.level !== 'error') {
           console.warn(`⚠️  WoC broadcast ${wocRes.status}: ${wocText.substring(0, 150)}`)
         }
@@ -1800,6 +2045,7 @@ export class BlockchainService {
       }
       }
     } catch (e) {
+      this.logBroadcastStep(traceId, 'whatsonchain', 'error', undefined, e instanceof Error ? e.message : String(e))
       this.noteBroadcastChannelBackoff('whatsonchain', 30000, e instanceof Error ? e.message : String(e))
       errors.push(`WoC broadcast error: ${e instanceof Error ? e.message : String(e)}`)
     }
