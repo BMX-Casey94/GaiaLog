@@ -8,6 +8,7 @@ type GetUnspentOptions = {
 const NET = bsvConfig.network === 'mainnet' ? 'main' : 'test'
 const UTXO_FETCH_BACKOFF_BASE_MS = Number(process.env.BSV_UTXO_FETCH_BACKOFF_BASE_MS || 250)
 const UTXO_FETCH_MAX_RETRIES = Number(process.env.BSV_UTXO_FETCH_MAX_RETRIES || 4)
+const UTXO_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.BSV_UTXO_FETCH_TIMEOUT_MS || 15000))
 const UTXO_CACHE_TTL_MS = Math.max(1000, Number(process.env.BSV_UTXO_CACHE_TTL_MS || 10000))
 const UTXO_STALE_TTL_MS = Math.max(5000, Number(process.env.BSV_UTXO_STALE_TTL_MS || 120000))
 const UTXO_DEGRADED_STALE_TTL_MS = Math.max(UTXO_STALE_TTL_MS, Number(process.env.BSV_UTXO_DEGRADED_STALE_TTL_MS || 15 * 60 * 1000))
@@ -56,7 +57,9 @@ async function fetchWithRetry(url: string, headers: HeadersMap = {}, maxRetries 
   let attempt = 0
   while (true) {
     try {
-      const res = await fetch(url, { headers })
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(new Error(`UTXO_FETCH_TIMEOUT:${UTXO_FETCH_TIMEOUT_MS}`)), UTXO_FETCH_TIMEOUT_MS)
+      const res = await fetch(url, { headers, signal: controller.signal }).finally(() => clearTimeout(timeout))
       if (res.ok) return res
       const status = res.status
       const body = await res.text().catch(() => '')

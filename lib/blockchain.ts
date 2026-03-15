@@ -76,6 +76,7 @@ const DUST_LIMIT = 1
 const MIN_SPEND_CONF = Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS ?? 0)
 const REFRESH_THRESHOLD = Number(process.env.BSV_UTXO_REFRESH_THRESHOLD || 10)
 const SPEND_SOURCE_LIST_LIMIT = Math.max(100, Number(process.env.BSV_SPEND_SOURCE_LIST_LIMIT || 5000))
+const BROADCAST_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.BSV_BROADCAST_TIMEOUT_MS || 15000))
 
 // Data credibility features (opt-in for now)
 const ENABLE_CREDIBILITY = process.env.GAIALOG_ENABLE_CREDIBILITY === 'true'
@@ -1643,7 +1644,7 @@ export class BlockchainService {
       const gpApiKey = process.env.BSV_GORILLAPOOL_API_KEY
       if (gpApiKey) gpHeaders['Authorization'] = `Bearer ${gpApiKey}`
 
-      const gpRes = await fetch(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
+      const gpRes = await this.fetchWithTimeout(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
         method: 'POST',
         headers: gpHeaders,
         body: JSON.stringify(useExtended ? arcBodyExtended : arcBodyRaw)
@@ -1670,7 +1671,7 @@ export class BlockchainService {
         const gp461 = gpRes.status === 461 || /malformed|false\/empty top stack/i.test(gpText)
         if (useExtended && gp461) {
           try {
-            const gpCompatRes = await fetch(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
+            const gpCompatRes = await this.fetchWithTimeout(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
               method: 'POST',
               headers: gpHeaders,
               body: JSON.stringify(arcBodyRaw)
@@ -1720,7 +1721,7 @@ export class BlockchainService {
       const taalHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
       if (arcKey) taalHeaders['Authorization'] = `Bearer ${arcKey}`
 
-      const arcRes = await fetch(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
+      const arcRes = await this.fetchWithTimeout(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
         method: 'POST',
         headers: taalHeaders,
         body: JSON.stringify(useExtended ? arcBodyExtended : arcBodyRaw)
@@ -1761,7 +1762,7 @@ export class BlockchainService {
       const wocNetwork = WOC_NETWORK
       const wocHeaders = this.buildWhatsOnChainHeaders(true)
 
-      const wocRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNetwork}/tx/raw`, {
+      const wocRes = await this.fetchWithTimeout(`https://api.whatsonchain.com/v1/bsv/${wocNetwork}/tx/raw`, {
         method: 'POST',
         headers: wocHeaders,
         body: JSON.stringify({ txhex: serializedTx })
@@ -1806,11 +1807,26 @@ export class BlockchainService {
     if (isRateLimited) {
       throw new Error(`BROADCAST_RATE_LIMITED\n${allErrors}`)
     }
-    const isEndpointUnavailable = /fetch failed|ENDPOINT_BACKOFF|ECONN|ENOTFOUND|ETIMEDOUT|TIMED OUT|NETWORK/i.test(allErrors)
+    const isEndpointUnavailable = /BROADCAST_TIMEOUT|fetch failed|ENDPOINT_BACKOFF|ECONN|ENOTFOUND|ETIMEDOUT|TIMED OUT|NETWORK/i.test(allErrors)
     if (isEndpointUnavailable) {
       throw new Error(`BROADCAST_ENDPOINT_UNAVAILABLE\n${allErrors}`)
     }
     throw new Error(`All broadcast methods failed:\n${allErrors}`)
+  }
+
+  private async fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number = BROADCAST_FETCH_TIMEOUT_MS): Promise<Response> {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      return await fetch(url, { ...init, signal: controller.signal })
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(`BROADCAST_TIMEOUT:${timeoutMs}`)
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+    }
   }
 
   private p2pkhLockingScriptHexFromWif(wif: string): string {

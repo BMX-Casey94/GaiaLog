@@ -104,6 +104,7 @@ module.exports = {
         BSV_HEAP_GUARD_ENABLED: process.env.BSV_HEAP_GUARD_ENABLED ?? 'false',
         BSV_HEAP_GUARD_HIGH_WATERMARK: process.env.BSV_HEAP_GUARD_HIGH_WATERMARK || '0.98',
         BSV_HEAP_GUARD_PAUSE_MS: process.env.BSV_HEAP_GUARD_PAUSE_MS || '10000',
+        BSV_ENABLE_UTXO_DB_LOCKS: process.env.BSV_ENABLE_UTXO_DB_LOCKS ?? 'false',
         BSV_SPEND_SOURCE_MODE: process.env.BSV_SPEND_SOURCE_MODE || 'legacy',
       },
       max_memory_restart: '8G',

@@ -59,6 +59,7 @@ export class WorkerQueue {
   private lastServedNormalLane: 'throughput' | 'coverage' = 'coverage'
   private backpressureLogAt = new Map<string, number>()
   private isProcessing = false
+  private isProcessQueueRunning = false
   private processingInterval: NodeJS.Timeout | null = null
   private cleanupInterval: NodeJS.Timeout | null = null
   private stats = {
@@ -297,70 +298,83 @@ export class WorkerQueue {
   }
 
   private async processQueue(): Promise<void> {
-    const totalItems = this.highPriorityQueue.length + this.normalPriorityQueue.length
-    // Skip processing if no items in queue
-    if (totalItems === 0) {
-      return
-    }
-
-    if (!bsvTransactionService.isReady()) {
-      if (this.shouldLogQueueSkip('txServiceNotReady')) {
-        console.warn(`🔍 [queue-debug] Skipping processQueue: bsvTransactionService not ready (items=${totalItems})`)
+    if (this.isProcessQueueRunning) {
+      const totalItems = this.highPriorityQueue.length + this.normalPriorityQueue.length
+      if (totalItems > 0 && this.shouldLogQueueSkip('tickAlreadyRunning')) {
+        console.warn(`🔍 [queue-debug] Skipping processQueue: previous tick still running (items=${totalItems})`)
       }
       return
     }
 
-    // Gate by confirmed UTXOs per wallet to avoid stalling on unconfirmed change
-    const nowTs = Date.now()
-    if (nowTs - this.lastUtxoGateCheckedAt > 30000) { // check every 30s
-      this.lastUtxoGateCheckedAt = nowTs
-      try {
-        this.lastUtxoGateOk = await this.hasSufficientConfirmedUtxos()
-      } catch (e) {
-        this.lastUtxoGateOk = true // don't hard-stop on errors
+    this.isProcessQueueRunning = true
+    try {
+      const totalItems = this.highPriorityQueue.length + this.normalPriorityQueue.length
+      // Skip processing if no items in queue
+      if (totalItems === 0) {
+        return
       }
-    }
-    if (!this.lastUtxoGateOk) {
-      if (this.shouldLogQueueSkip('utxoGatePaused')) {
-        const gate = this.lastGateInfo
-        console.warn(`🔍 [queue-debug] Skipping processQueue: UTXO gate paused (items=${totalItems}, okWallets=${gate.okWallets}/${gate.totalWallets}, minConf=${gate.minConfirmed}/${gate.minRequired})`)
+
+      if (!bsvTransactionService.isReady()) {
+        if (this.shouldLogQueueSkip('txServiceNotReady')) {
+          console.warn(`🔍 [queue-debug] Skipping processQueue: bsvTransactionService not ready (items=${totalItems})`)
+        }
+        return
       }
-      return
-    }
 
-    const maxItemsPerBatch = Math.min(
-      bsvConfig.queue.batchSize,
-      bsvConfig.queue.maxTxPerSecond
-    )
+      // Gate by confirmed UTXOs per wallet to avoid stalling on unconfirmed change
+      const nowTs = Date.now()
+      if (nowTs - this.lastUtxoGateCheckedAt > 30000) { // check every 30s
+        this.lastUtxoGateCheckedAt = nowTs
+        try {
+          this.lastUtxoGateOk = await this.hasSufficientConfirmedUtxos()
+        } catch (e) {
+          this.lastUtxoGateOk = true // don't hard-stop on errors
+        }
+      }
+      if (!this.lastUtxoGateOk) {
+        if (this.shouldLogQueueSkip('utxoGatePaused')) {
+          const gate = this.lastGateInfo
+          console.warn(`🔍 [queue-debug] Skipping processQueue: UTXO gate paused (items=${totalItems}, okWallets=${gate.okWallets}/${gate.totalWallets}, minConf=${gate.minConfirmed}/${gate.minRequired})`)
+        }
+        return
+      }
 
-    let processedCount = 0
-    const batchStartTime = Date.now()
+      const maxItemsPerBatch = Math.min(
+        bsvConfig.queue.batchSize,
+        bsvConfig.queue.maxTxPerSecond
+      )
 
-    // Process high priority items first
-    while (this.highPriorityQueue.length > 0 && processedCount < maxItemsPerBatch) {
-      const item = this.takeNextItem(this.highPriorityQueue, 'high')
-      if (!item) break
-      markQueueItemProcessing(item.id).catch(() => {})
-      await this.processItem(item)
-      processedCount++
-    }
+      let processedCount = 0
+      const batchStartTime = Date.now()
 
-    // Then process normal priority items
-    while (this.normalPriorityQueue.length > 0 && processedCount < maxItemsPerBatch) {
-      const item = this.takeNextItem(this.normalPriorityQueue, 'normal')
-      if (!item) break
-      markQueueItemProcessing(item.id).catch(() => {})
-      await this.processItem(item)
-      processedCount++
-    }
+      // Process high priority items first
+      while (this.highPriorityQueue.length > 0 && processedCount < maxItemsPerBatch) {
+        const item = this.takeNextItem(this.highPriorityQueue, 'high')
+        if (!item) break
+        markQueueItemProcessing(item.id).catch(() => {})
+        await this.processItem(item)
+        processedCount++
+      }
 
-    // Rate limiting: ensure we don't exceed max transactions per second
-    const batchDuration = Date.now() - batchStartTime
-    const minBatchDuration = (1000 / bsvConfig.queue.maxTxPerSecond) * processedCount
-    
-    if (batchDuration < minBatchDuration) {
-      const delay = minBatchDuration - batchDuration
-      await new Promise(resolve => setTimeout(resolve, delay))
+      // Then process normal priority items
+      while (this.normalPriorityQueue.length > 0 && processedCount < maxItemsPerBatch) {
+        const item = this.takeNextItem(this.normalPriorityQueue, 'normal')
+        if (!item) break
+        markQueueItemProcessing(item.id).catch(() => {})
+        await this.processItem(item)
+        processedCount++
+      }
+
+      // Rate limiting: ensure we don't exceed max transactions per second
+      const batchDuration = Date.now() - batchStartTime
+      const minBatchDuration = (1000 / bsvConfig.queue.maxTxPerSecond) * processedCount
+      
+      if (batchDuration < minBatchDuration) {
+        const delay = minBatchDuration - batchDuration
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    } finally {
+      this.isProcessQueueRunning = false
     }
   }
 
