@@ -27,6 +27,9 @@
  *   kill_timeout gives the SIGINT handler 8 seconds to drain gracefully before SIGKILL.
  */
 
+// Load .env so overlay/worker vars are passed to PM2 processes
+require('dotenv').config({ path: require('path').join(__dirname, '.env') })
+
 module.exports = {
   apps: [
     {
@@ -68,6 +71,9 @@ module.exports = {
         GAIALOG_WORKER_PROCESS: '0',
         GAIALOG_SINGLE_WRITER_MODE: 'run-workers',
         GAIALOG_MUTATOR_ROLE: 'secondary',
+        GAIALOG_OVERLAY_RATE_LIMIT_MAX: process.env.GAIALOG_OVERLAY_RATE_LIMIT_MAX || '20000',
+        GAIALOG_OVERLAY_AUDIT_HMAC_SECRET: process.env.GAIALOG_OVERLAY_AUDIT_HMAC_SECRET,
+        GAIALOG_OVERLAY_SERVER_IDENTITY_WIF: process.env.GAIALOG_OVERLAY_SERVER_IDENTITY_WIF,
       },
       restart_delay: 5000,
       max_restarts: 50,
@@ -93,6 +99,8 @@ module.exports = {
         GAIALOG_WORKER_PROCESS: '1',
         GAIALOG_SINGLE_WRITER_MODE: 'run-workers',
         GAIALOG_MUTATOR_ROLE: 'primary',
+        BSV_OVERLAY_AUTH_MODE: process.env.BSV_OVERLAY_AUTH_MODE || 'brc104',
+        BSV_OVERLAY_CLIENT_IDENTITY_WIF: process.env.BSV_OVERLAY_CLIENT_IDENTITY_WIF,
       },
       max_memory_restart: '5G',
       // Recycle the worker process every 30 minutes to prevent event-loop stalls.
