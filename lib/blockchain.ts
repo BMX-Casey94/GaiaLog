@@ -63,8 +63,8 @@ const WOC_NETWORK = (process.env.BSV_NETWORK === 'mainnet') ? 'main' : 'test'
 const GORILLAPOOL_ARC_ENDPOINT = (process.env.BSV_GORILLAPOOL_ARC_ENDPOINT || 'https://arc.gorillapool.io').replace(/\/$/, '')
 const TAAL_ARC_ENDPOINT = (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com').replace(/\/$/, '')
 // GorillaPool/TAAL ARC minimum: 100 sat/kB (0.1 sat/byte)
-// Default to 0.15 sat/byte (150 sat/kB) for comfortable margin above the 100 sat/kB floor
-const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.15)
+// Default to 0.105 sat/byte (105 sat/kB) — 5% margin above ARC floor
+const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.105)
 // BSV has no dust limit — 1 sat is the minimum viable output
 const DUST_LIMIT = 1
 // UTXO spend policy: default allows all UTXOs (including unconfirmed).
@@ -1022,19 +1022,29 @@ export class BlockchainService {
       })
       const opReturnScript = (bsv as any).Script.fromHex(scriptHex)
 
-      // Create transaction using library helpers for fee/change handling
+      // Create transaction using library helpers for fee/change handling.
+      // feePerKb MUST be set BEFORE .change() — bitcore-lib calculates the
+      // change output at .change() time using the currently-set fee rate.
       const buildSerialized = (feeMultiplier: number): string => {
+        const feePerKb = Math.ceil(FEE_RATE_SAT_PER_BYTE * 1000 * feeMultiplier)
         const tx = new (bsv as any).Transaction()
           .from(bitcoreUtxos)
           .addOutput(new bsv.Transaction.Output({
             script: opReturnScript,
             satoshis: useTrueReturn ? 1 : 0,
           }))
+          .feePerKb(feePerKb)
           .change(address)
-          .feePerKb(FEE_RATE_SAT_PER_BYTE * 1000 * feeMultiplier)
         const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
         tx.sign(signingKey)
-        return tx.serialize()
+        const serialized = tx.serialize()
+        const inputSats = bitcoreUtxos.reduce((s: number, u: any) => s + (u.satoshis || 0), 0)
+        const outputSats = tx.outputs.reduce((s: number, o: any) => s + (o.satoshis || o._satoshis || 0), 0)
+        const actualFee = inputSats - outputSats
+        if (actualFee < 2) {
+          console.warn(`⚠️  TX fee sanity check: fee=${actualFee} sats, feePerKb=${feePerKb}, txSize=${serialized.length / 2} bytes, input=${inputSats}`)
+        }
+        return serialized
       }
 
       // Build prevouts for ARC Extended Format (order must match inputs)
@@ -1887,8 +1897,8 @@ export class BlockchainService {
       const tx = new (bsv as any).Transaction()
         .from(selected)
         .to(toAddress, amountSats)
+        .feePerKb(Math.ceil(feePerKb))
         .change(fromAddress)
-        .feePerKb(feePerKb)
 
       const signingKey = (bsv as any).PrivateKey.fromWIF((this.wallet as any)['wif'])
       tx.sign(signingKey)

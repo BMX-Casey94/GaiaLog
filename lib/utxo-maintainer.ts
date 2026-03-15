@@ -30,8 +30,8 @@ const SPLIT_BATCH = Number(process.env.BSV_UTXO_SPLIT_BATCH || Math.min(SPLIT_BA
 const SPLIT_OUTPUT_SATS = Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 2000)
 const MIN_CONF = Number(process.env.BSV_UTXO_MIN_CONFIRMATIONS || 1)
 const INTERVAL_MS = Number(process.env.BSV_UTXO_MAINTAINER_INTERVAL_MS || 30000) // 30s for high-throughput
-// GorillaPool/TAAL ARC minimum: 100 sat/kB. Default 0.15 sat/byte (150 sat/kB) for safety margin.
-const FEE_RATE = Number((process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE) || 0.15)
+// GorillaPool/TAAL ARC minimum: 100 sat/kB. Default 0.105 sat/byte (105 sat/kB) for 5% margin.
+const FEE_RATE = Number((process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE) || 0.105)
 const SPLIT_FEE_RATE = Number(process.env.BSV_UTXO_SPLIT_FEE_RATE_SAT_PER_BYTE || FEE_RATE)
 // BSV has no protocol-enforced dust limit (unlike BTC). 1 sat is the minimum viable output.
 const DUST_LIMIT = 1
@@ -365,7 +365,7 @@ async function doSplit(
   }
   const tx = new (bsv as any).Transaction().from([input])
   for (let i = 0; i < outputCount; i++) tx.to(address, SPLIT_OUTPUT_SATS)
-  tx.change(address).feePerKb(SPLIT_FEE_RATE * 1000)
+  tx.feePerKb(Math.ceil(SPLIT_FEE_RATE * 1000)).change(address)
   const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
   tx.sign(signingKey)
   const raw = tx.serialize()
