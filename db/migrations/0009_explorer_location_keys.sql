@@ -9,20 +9,26 @@ CREATE TABLE IF NOT EXISTS explorer_location_keys (
   last_seen timestamptz NOT NULL DEFAULT now()
 );
 
--- Backfill from existing explorer rows.
-INSERT INTO explorer_location_keys (normalized_location, first_seen, last_seen)
-SELECT
-  lower(btrim(location)) AS normalized_location,
-  min("timestamp") AS first_seen,
-  max("timestamp") AS last_seen
-FROM explorer_readings
-WHERE location IS NOT NULL
-  AND btrim(location) <> ''
-GROUP BY lower(btrim(location))
-ON CONFLICT (normalized_location) DO UPDATE
-SET
-  first_seen = LEAST(explorer_location_keys.first_seen, EXCLUDED.first_seen),
-  last_seen = GREATEST(explorer_location_keys.last_seen, EXCLUDED.last_seen);
+-- Backfill from existing explorer rows (only if explorer_readings exists).
+-- Fresh DBs may not have explorer_readings; overlay_explorer_readings is the replacement.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'explorer_readings') THEN
+    INSERT INTO explorer_location_keys (normalized_location, first_seen, last_seen)
+    SELECT
+      lower(btrim(location)) AS normalized_location,
+      min("timestamp") AS first_seen,
+      max("timestamp") AS last_seen
+    FROM explorer_readings
+    WHERE location IS NOT NULL
+      AND btrim(location) <> ''
+    GROUP BY lower(btrim(location))
+    ON CONFLICT (normalized_location) DO UPDATE
+    SET
+      first_seen = LEAST(explorer_location_keys.first_seen, EXCLUDED.first_seen),
+      last_seen = GREATEST(explorer_location_keys.last_seen, EXCLUDED.last_seen);
+  END IF;
+END $$;
 
 CREATE OR REPLACE FUNCTION upsert_explorer_location_key()
 RETURNS trigger
@@ -48,11 +54,16 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS trg_explorer_location_key_upsert ON explorer_readings;
-
-CREATE TRIGGER trg_explorer_location_key_upsert
-AFTER INSERT OR UPDATE OF location, "timestamp" ON explorer_readings
-FOR EACH ROW
-EXECUTE FUNCTION upsert_explorer_location_key();
+-- Attach trigger only if explorer_readings exists (legacy path)
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'explorer_readings') THEN
+    DROP TRIGGER IF EXISTS trg_explorer_location_key_upsert ON explorer_readings;
+    CREATE TRIGGER trg_explorer_location_key_upsert
+    AFTER INSERT OR UPDATE OF location, "timestamp" ON explorer_readings
+    FOR EACH ROW
+    EXECUTE FUNCTION upsert_explorer_location_key();
+  END IF;
+END $$;
 
 COMMIT;
