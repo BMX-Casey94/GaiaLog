@@ -13,14 +13,21 @@ import { APP_NAME, SCHEMA_VERSION } from './constants'
 import { dataValidator, qualityScorer } from './validation'
 import { createCredibilityBuilder } from './pipeline-integrity'
 import type { CredibilityMetadata } from './types/credibility'
-// Explorer store – feed new broadcasts for the /explorer page (Supabase-backed)
-import { addReading, type StoredReading } from './supabase-explorer'
+// Explorer store – routed through the read-source switcher (legacy / dual / overlay)
+import { addReading, canAttemptExplorerWrite, type StoredReading } from './explorer-read-source'
+import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress, type SpendableOutput } from './spend-source'
+import { QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
+import { throughputObservability } from './throughput-observability'
 
 // Types
 export interface BlockchainData {
   stream: string
   timestamp: number
   payload: any
+  family?: string
+  providerId?: string
+  datasetId?: string
+  queueLane?: QueueLane
 }
 
 export interface TransactionLog {
@@ -30,6 +37,21 @@ export interface TransactionLog {
   payload: any
   status: 'pending' | 'confirmed' | 'failed'
   error?: string
+}
+
+type ConfirmationCheckState = {
+  txid: string
+  streamType: string
+  attempts: number
+  nextCheckAt: number
+  generation: number
+  firstScheduledAt: number
+}
+
+type ConfirmationCheckHeapItem = {
+  txid: string
+  nextCheckAt: number
+  generation: number
 }
 
 // Environment variables
@@ -53,6 +75,7 @@ const DUST_LIMIT = 1
 // Override with BSV_MIN_SPEND_CONFIRMATIONS=1 (or higher) if desired.
 const MIN_SPEND_CONF = Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS ?? 0)
 const REFRESH_THRESHOLD = Number(process.env.BSV_UTXO_REFRESH_THRESHOLD || 10)
+const SPEND_SOURCE_LIST_LIMIT = Math.max(100, Number(process.env.BSV_SPEND_SOURCE_LIST_LIMIT || 5000))
 
 // Data credibility features (opt-in for now)
 const ENABLE_CREDIBILITY = process.env.GAIALOG_ENABLE_CREDIBILITY === 'true'
@@ -70,6 +93,15 @@ const UTXO_USED_KEY_TTL_MS = Number(process.env.BSV_UTXO_USED_KEY_TTL_MS || 30 *
 const LOG_SUMMARY_INTERVAL_MS = Math.max(60000, Number(process.env.BSV_LOG_SUMMARY_INTERVAL_MS || 30 * 60 * 1000)) // 30 min
 const MAX_IN_MEMORY_TX_LOG = Math.max(100, Number(process.env.BSV_MAX_IN_MEMORY_TX_LOG || 500))
 const MAX_CONFIRMATION_CHECK_ATTEMPTS = Math.max(1, Number(process.env.BSV_CONFIRMATION_MAX_ATTEMPTS || 60))
+const CONFIRMATION_INITIAL_DELAY_MS = Math.max(30000, Number(process.env.BSV_CONFIRMATION_INITIAL_DELAY_MS || 90 * 1000))
+const CONFIRMATION_RETRY_BASE_DELAY_MS = Math.max(60000, Number(process.env.BSV_CONFIRMATION_RETRY_BASE_DELAY_MS || 5 * 60 * 1000))
+const CONFIRMATION_ERROR_DELAY_MS = Math.max(CONFIRMATION_RETRY_BASE_DELAY_MS, Number(process.env.BSV_CONFIRMATION_ERROR_DELAY_MS || 10 * 60 * 1000))
+const CONFIRMATION_MAX_RETRY_DELAY_MS = Math.max(CONFIRMATION_ERROR_DELAY_MS, Number(process.env.BSV_CONFIRMATION_MAX_RETRY_DELAY_MS || 30 * 60 * 1000))
+const CONFIRMATION_SCHEDULER_INTERVAL_MS = Math.max(250, Number(process.env.BSV_CONFIRMATION_SCHEDULER_INTERVAL_MS || 1000))
+const CONFIRMATION_MAX_CONCURRENCY = Math.max(1, Number(process.env.BSV_CONFIRMATION_MAX_CONCURRENCY || 2))
+const CONFIRMATION_MAX_PER_TICK = Math.max(1, Number(process.env.BSV_CONFIRMATION_MAX_PER_TICK || (WHATSONCHAIN_API_KEY ? 4 : 2)))
+const CONFIRMATION_MAX_TRACKED_TXIDS = Math.max(1000, Number(process.env.BSV_CONFIRMATION_MAX_TRACKED_TXIDS || (WHATSONCHAIN_API_KEY ? 50000 : 15000)))
+const CONFIRMATION_MAX_TRACK_MS = Math.max(CONFIRMATION_RETRY_BASE_DELAY_MS, Number(process.env.BSV_CONFIRMATION_MAX_TRACK_MS || 6 * 60 * 60 * 1000))
 const HEAP_GUARD_ENABLED = process.env.BSV_HEAP_GUARD_ENABLED !== 'false'
 const HEAP_GUARD_HIGH_WATERMARK = Math.min(0.98, Math.max(0.5, Number(process.env.BSV_HEAP_GUARD_HIGH_WATERMARK || 0.82)))
 const HEAP_GUARD_PAUSE_MS = Math.max(5000, Number(process.env.BSV_HEAP_GUARD_PAUSE_MS || 30000))
@@ -199,14 +231,19 @@ export class BlockchainService {
     inFlight: Promise<void> | null
   }> = new Map()
   // Transaction status aggregation to reduce log noise and memory pressure
-  private txStatusBatch: { confirmed: number; pending: number; notFound: number; retryLimitReached: number } =
-    { confirmed: 0, pending: 0, notFound: 0, retryLimitReached: 0 }
+  private txStatusBatch: { confirmed: number; pending: number; notFound: number; retryLimitReached: number; skipped: number } =
+    { confirmed: 0, pending: 0, notFound: 0, retryLimitReached: 0, skipped: 0 }
   private summaryIntervalId: NodeJS.Timeout | null = null
-  private confirmationAttemptsByTxid: Map<string, number> = new Map()
+  private confirmationSchedulerId: NodeJS.Timeout | null = null
+  private pendingConfirmationByTxid: Map<string, ConfirmationCheckState> = new Map()
+  private pendingConfirmationHeap: ConfirmationCheckHeapItem[] = []
+  private confirmationChecksInFlight = 0
   private operationalStats: { broadcastsOk: number; broadcastsFailed: number; utxoRefreshes: number; rawUtxosFetched: number; heapBackoffs: number } =
     { broadcastsOk: 0, broadcastsFailed: 0, utxoRefreshes: 0, rawUtxosFetched: 0, heapBackoffs: 0 }
   private operationalErrors: Map<string, number> = new Map()
   private heapBackoffUntilMs = 0
+  private broadcastBackoffUntilByChannel: Map<'gorillapool_arc' | 'taal_arc' | 'whatsonchain', number> = new Map()
+  private broadcastBackoffLogAtByChannel: Map<'gorillapool_arc' | 'taal_arc' | 'whatsonchain', number> = new Map()
 
   constructor() {
     try {
@@ -230,6 +267,7 @@ export class BlockchainService {
       
       // Start interval-based operational summary logging
       this.startSummaryLogging()
+      this.startConfirmationScheduler()
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
       this.lastInitError = msg
@@ -260,7 +298,7 @@ export class BlockchainService {
 
       console.log('📊 Blockchain 30m summary:')
       console.log(`   ✅ Broadcasts: ${stats.broadcastsOk} success, ${stats.broadcastsFailed} failed`)
-      console.log(`   🧾 Confirmation checks: ${tx.confirmed} confirmed, ${tx.pending} pending, ${tx.notFound} not-found, ${tx.retryLimitReached} retry-limit`)
+      console.log(`   🧾 Confirmation checks: ${tx.confirmed} confirmed, ${tx.pending} pending, ${tx.notFound} not-found, ${tx.retryLimitReached} retry-limit, ${tx.skipped} skipped, ${this.pendingConfirmationByTxid.size} queued`)
       console.log(`   🔁 UTXO refresh: ${stats.utxoRefreshes} refreshes, ${stats.rawUtxosFetched} raw UTXO(s) fetched`)
       if (stats.heapBackoffs > 0) {
         console.log(`   🛑 Heap guard: ${stats.heapBackoffs} temporary backoff event(s)`)
@@ -275,7 +313,7 @@ export class BlockchainService {
         console.log(`   ⚠️  Errors: ${totalErrors} total (${topErrors})`)
       }
 
-      this.txStatusBatch = { confirmed: 0, pending: 0, notFound: 0, retryLimitReached: 0 }
+      this.txStatusBatch = { confirmed: 0, pending: 0, notFound: 0, retryLimitReached: 0, skipped: 0 }
       this.operationalStats = { broadcastsOk: 0, broadcastsFailed: 0, utxoRefreshes: 0, rawUtxosFetched: 0, heapBackoffs: 0 }
       this.operationalErrors.clear()
     }, LOG_SUMMARY_INTERVAL_MS)
@@ -286,6 +324,250 @@ export class BlockchainService {
     const safe = msg.replace(/\s+/g, ' ').trim().slice(0, 120)
     const key = `${scope}:${safe || 'unknown'}`
     this.operationalErrors.set(key, (this.operationalErrors.get(key) || 0) + 1)
+  }
+
+  private detectBroadcastChannel(message: string): string {
+    const safe = String(message || '').toUpperCase()
+    if (safe.includes('GORILLAPOOL')) return 'gorillapool_arc'
+    if (safe.includes('TAAL')) return 'taal_arc'
+    if (safe.includes('WHATSONCHAIN') || safe.includes('WOC')) return 'whatsonchain'
+    return 'unknown'
+  }
+
+  private isBroadcastChannelBackedOff(channel: 'gorillapool_arc' | 'taal_arc' | 'whatsonchain'): boolean {
+    const until = this.broadcastBackoffUntilByChannel.get(channel) || 0
+    if (until <= Date.now()) {
+      this.broadcastBackoffUntilByChannel.delete(channel)
+      return false
+    }
+    return true
+  }
+
+  private clearBroadcastChannelBackoff(channel: 'gorillapool_arc' | 'taal_arc' | 'whatsonchain'): void {
+    this.broadcastBackoffUntilByChannel.delete(channel)
+  }
+
+  private noteBroadcastChannelBackoff(
+    channel: 'gorillapool_arc' | 'taal_arc' | 'whatsonchain',
+    durationMs: number,
+    reason: string,
+  ): void {
+    const until = Date.now() + Math.max(1000, durationMs)
+    this.broadcastBackoffUntilByChannel.set(channel, until)
+    const lastLog = this.broadcastBackoffLogAtByChannel.get(channel) || 0
+    if ((Date.now() - lastLog) > 15000) {
+      const label = channel === 'gorillapool_arc' ? 'GorillaPool ARC' : channel === 'taal_arc' ? 'TAAL ARC' : 'WoC'
+      console.warn(`⏸️  ${label} backoff for ${Math.round(durationMs / 1000)}s: ${reason}`)
+      this.broadcastBackoffLogAtByChannel.set(channel, Date.now())
+    }
+  }
+
+  private buildWhatsOnChainHeaders(includeJsonContentType: boolean = false): Record<string, string> {
+    const headers: Record<string, string> = {}
+    if (includeJsonContentType) headers['Content-Type'] = 'application/json'
+    if (WHATSONCHAIN_API_KEY) {
+      if (WHATSONCHAIN_API_KEY.startsWith('mainnet_') || WHATSONCHAIN_API_KEY.startsWith('testnet_')) {
+        headers['Authorization'] = WHATSONCHAIN_API_KEY
+      } else {
+        headers['woc-api-key'] = WHATSONCHAIN_API_KEY
+      }
+    }
+    return headers
+  }
+
+  private jitterDelay(delayMs: number): number {
+    const spread = delayMs * 0.2
+    return Math.max(1000, Math.round(delayMs + ((Math.random() * 2 - 1) * spread)))
+  }
+
+  private calculateConfirmationRetryDelay(attempts: number, kind: 'pending' | 'not-found' | 'error'): number {
+    const baseDelay = kind === 'error' ? CONFIRMATION_ERROR_DELAY_MS : CONFIRMATION_RETRY_BASE_DELAY_MS
+    const exponent = Math.max(0, attempts - 1)
+    return Math.min(CONFIRMATION_MAX_RETRY_DELAY_MS, baseDelay * Math.pow(2, exponent))
+  }
+
+  private startConfirmationScheduler(): void {
+    if (this.confirmationSchedulerId) return
+    this.confirmationSchedulerId = setInterval(() => {
+      this.processConfirmationChecks().catch((error) => this.recordOperationalError('confirmation-scheduler', error))
+    }, CONFIRMATION_SCHEDULER_INTERVAL_MS)
+  }
+
+  private enqueueConfirmationCheck(txid: string, streamType: string): void {
+    const existing = this.pendingConfirmationByTxid.get(txid)
+    if (!existing && this.pendingConfirmationByTxid.size >= CONFIRMATION_MAX_TRACKED_TXIDS) {
+      this.txStatusBatch.skipped += 1
+      this.recordOperationalError('confirmation-check', 'queue-capacity-reached')
+      return
+    }
+
+    const next: ConfirmationCheckState = {
+      txid,
+      streamType,
+      attempts: existing?.attempts || 0,
+      nextCheckAt: Date.now() + this.jitterDelay(CONFIRMATION_INITIAL_DELAY_MS),
+      generation: (existing?.generation || 0) + 1,
+      firstScheduledAt: existing?.firstScheduledAt || Date.now(),
+    }
+    this.pendingConfirmationByTxid.set(txid, next)
+    this.pushPendingConfirmation(next)
+  }
+
+  private rescheduleConfirmationCheck(state: ConfirmationCheckState, attempts: number, kind: 'pending' | 'not-found' | 'error'): void {
+    const next: ConfirmationCheckState = {
+      txid: state.txid,
+      streamType: state.streamType,
+      attempts,
+      nextCheckAt: Date.now() + this.jitterDelay(this.calculateConfirmationRetryDelay(attempts, kind)),
+      generation: state.generation + 1,
+      firstScheduledAt: state.firstScheduledAt,
+    }
+    this.pendingConfirmationByTxid.set(state.txid, next)
+    this.pushPendingConfirmation(next)
+  }
+
+  private pushPendingConfirmation(state: ConfirmationCheckState): void {
+    const heapItem: ConfirmationCheckHeapItem = {
+      txid: state.txid,
+      nextCheckAt: state.nextCheckAt,
+      generation: state.generation,
+    }
+    this.pendingConfirmationHeap.push(heapItem)
+    let idx = this.pendingConfirmationHeap.length - 1
+    while (idx > 0) {
+      const parent = Math.floor((idx - 1) / 2)
+      if (this.pendingConfirmationHeap[parent].nextCheckAt <= this.pendingConfirmationHeap[idx].nextCheckAt) break
+      const tmp = this.pendingConfirmationHeap[parent]
+      this.pendingConfirmationHeap[parent] = this.pendingConfirmationHeap[idx]
+      this.pendingConfirmationHeap[idx] = tmp
+      idx = parent
+    }
+  }
+
+  private peekPendingConfirmation(): ConfirmationCheckHeapItem | null {
+    return this.pendingConfirmationHeap.length > 0 ? this.pendingConfirmationHeap[0] : null
+  }
+
+  private popPendingConfirmation(): ConfirmationCheckHeapItem | null {
+    if (this.pendingConfirmationHeap.length === 0) return null
+    const first = this.pendingConfirmationHeap[0]
+    const last = this.pendingConfirmationHeap.pop()!
+    if (this.pendingConfirmationHeap.length > 0) {
+      this.pendingConfirmationHeap[0] = last
+      let idx = 0
+      while (true) {
+        const left = idx * 2 + 1
+        const right = idx * 2 + 2
+        let smallest = idx
+        if (left < this.pendingConfirmationHeap.length && this.pendingConfirmationHeap[left].nextCheckAt < this.pendingConfirmationHeap[smallest].nextCheckAt) {
+          smallest = left
+        }
+        if (right < this.pendingConfirmationHeap.length && this.pendingConfirmationHeap[right].nextCheckAt < this.pendingConfirmationHeap[smallest].nextCheckAt) {
+          smallest = right
+        }
+        if (smallest === idx) break
+        const tmp = this.pendingConfirmationHeap[idx]
+        this.pendingConfirmationHeap[idx] = this.pendingConfirmationHeap[smallest]
+        this.pendingConfirmationHeap[smallest] = tmp
+        idx = smallest
+      }
+    }
+    return first
+  }
+
+  private async processConfirmationChecks(): Promise<void> {
+    if (this.confirmationChecksInFlight >= CONFIRMATION_MAX_CONCURRENCY) return
+    if (this.isBroadcastChannelBackedOff('whatsonchain')) return
+
+    let launched = 0
+    while (launched < CONFIRMATION_MAX_PER_TICK && this.confirmationChecksInFlight < CONFIRMATION_MAX_CONCURRENCY) {
+      const next = this.peekPendingConfirmation()
+      if (!next || next.nextCheckAt > Date.now()) break
+
+      const item = this.popPendingConfirmation()
+      if (!item) break
+
+      const state = this.pendingConfirmationByTxid.get(item.txid)
+      if (!state || state.generation !== item.generation) continue
+
+      this.confirmationChecksInFlight += 1
+      launched += 1
+      void this.runConfirmationCheck(state).finally(() => {
+        this.confirmationChecksInFlight = Math.max(0, this.confirmationChecksInFlight - 1)
+      })
+    }
+  }
+
+  private async runConfirmationCheck(state: ConfirmationCheckState): Promise<void> {
+    const current = this.pendingConfirmationByTxid.get(state.txid)
+    if (!current || current.generation !== state.generation) return
+
+    if (current.attempts >= MAX_CONFIRMATION_CHECK_ATTEMPTS || (Date.now() - current.firstScheduledAt) >= CONFIRMATION_MAX_TRACK_MS) {
+      this.txStatusBatch.retryLimitReached += 1
+      this.recordOperationalError('confirmation-check', current.attempts >= MAX_CONFIRMATION_CHECK_ATTEMPTS ? 'max-attempts-reached' : 'max-track-age-reached')
+      this.pendingConfirmationByTxid.delete(current.txid)
+      return
+    }
+
+    const attemptNumber = current.attempts + 1
+    const network = WOC_NETWORK
+    const wocUrl = `https://api.whatsonchain.com/v1/bsv/${network}/tx/${current.txid}`
+    const headers = this.buildWhatsOnChainHeaders()
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 10000)
+
+    try {
+      const response = await fetch(wocUrl, { headers, signal: controller.signal })
+      if (response.ok) {
+        const txData = await response.json()
+        const confirmations = txData.confirmations || 0
+
+        if (confirmations > 0) {
+          await upsertTxLog({
+            txid: current.txid,
+            type: current.streamType,
+            provider: 'auto-confirmed',
+            collected_at: new Date(),
+            status: 'confirmed',
+            onchain_at: new Date(),
+            fee_sats: null,
+            wallet_index: null,
+            retries: null,
+            error: null,
+          })
+          throughputObservability.recordConfirmed(current.txid, { family: current.streamType })
+          this.txStatusBatch.confirmed += 1
+          this.pendingConfirmationByTxid.delete(current.txid)
+        } else {
+          this.txStatusBatch.pending += 1
+          this.rescheduleConfirmationCheck(current, attemptNumber, 'pending')
+        }
+        return
+      }
+
+      if (response.status === 404) {
+        this.txStatusBatch.notFound += 1
+        this.rescheduleConfirmationCheck(current, attemptNumber, 'not-found')
+        return
+      }
+
+      if (response.status === 429) {
+        this.noteBroadcastChannelBackoff('whatsonchain', WHATSONCHAIN_API_KEY ? 60000 : 120000, 'confirmation HTTP 429')
+      } else if (response.status >= 500) {
+        this.noteBroadcastChannelBackoff('whatsonchain', 30000, `confirmation HTTP ${response.status}`)
+      }
+      this.recordOperationalError('confirmation-check', `HTTP ${response.status}`)
+      this.rescheduleConfirmationCheck(current, attemptNumber, 'error')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (/fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|ABORT|NETWORK|TIMED OUT/i.test(message.toUpperCase())) {
+        this.noteBroadcastChannelBackoff('whatsonchain', 30000, `confirmation ${message}`)
+      }
+      this.recordOperationalError('confirmation-check', error)
+      this.rescheduleConfirmationCheck(current, attemptNumber, 'error')
+    } finally {
+      clearTimeout(timeoutId)
+    }
   }
 
   private appendTransactionLog(entry: TransactionLog): void {
@@ -360,7 +642,7 @@ export class BlockchainService {
           continue
         }
 
-        const spendable = await this.getSpendableUtxos(addr, wif)
+        const spendable = await this.getSpendableUtxos(addr, wif, pick)
         
         // Estimate balance from spendable UTXOs for diagnostics (avoid extra WoC calls)
         let balance: number | undefined
@@ -420,7 +702,7 @@ export class BlockchainService {
           try {
             const sdkKey = SDKPrivateKey.fromWif(wif)
             const addr = sdkKey.toPublicKey().toAddress().toString()
-            const spendable = await this.getSpendableUtxos(addr, wif)
+            const spendable = await this.getSpendableUtxos(addr, wif, pick)
             
             if (spendable.length > 0) {
               this.rrIndex = (pick + 1) % list.length
@@ -538,7 +820,13 @@ export class BlockchainService {
         }
       } catch {}
 
-      const providerValue = (data as any)?.payload?.source || 'unknown'
+      const rawProviderValue = (data as any)?.payload?.source || null
+      const providerIdValue = (data as any)?.providerId || (data as any)?.payload?.provider_id || resolveProviderIdFromSource(rawProviderValue) || undefined
+      const datasetIdValue = (data as any)?.datasetId || (data as any)?.payload?.dataset_id || undefined
+      const providerValue = resolveSourceLabel(providerIdValue, datasetIdValue, rawProviderValue)
+      const queueLaneValue = (data as any)?.queueLane === 'throughput' || (data as any)?.queueLane === 'coverage'
+        ? (data as any).queueLane
+        : undefined
       
       // Build credibility metadata if enabled
       let credibilityMeta: CredibilityMetadata | undefined
@@ -586,8 +874,10 @@ export class BlockchainService {
         timestamp: data.timestamp,
         payload: payloadWithAscii,
       }
+      if (providerIdValue) base.provider_id = providerIdValue
+      if (datasetIdValue) base.dataset_id = datasetIdValue
       // Omit provider for advanced_metrics payloads (per request)
-      if (data.stream !== 'advanced_metrics') {
+      if (data.stream !== 'advanced_metrics' && providerValue !== 'unknown') {
         base.provider = providerValue
       }
       // Add credibility metadata if generated
@@ -615,6 +905,12 @@ export class BlockchainService {
         const h = typeof u?.height === 'number' ? u.height : null
         return conf > 0 || (h != null && h > 0)
       }
+      let isSplitInputHeld: ((address: string, utxoKey: string) => boolean) | null = null
+      try {
+        const mod = await import('./utxo-maintainer')
+        isSplitInputHeld = mod.isWalletSplitInputHeld
+      } catch {}
+
       const confirmedOnly = utxos.filter(isConfirmedUtxo)
       const selectionPool = (preferConfirmed && confirmedOnly.length > 0) ? confirmedOnly : utxos
 
@@ -629,6 +925,7 @@ export class BlockchainService {
       let inputKey = ''
       for (const u of candidates) {
         const key = `${u.tx_hash}:${u.tx_pos}`
+        if (isSplitInputHeld && isSplitInputHeld(address, key)) continue
         if (ENABLE_UTXO_DB_LOCKS) {
           try {
             const { reserveUtxoKeys } = await import('./utxo-locks')
@@ -659,7 +956,7 @@ export class BlockchainService {
       // Change outputs from recent TXs may now be visible to the indexer.
       if (!selectedUtxo) {
         await this.refreshUtxoCache(address, wif, true)
-        const freshUtxos = await this.getSpendableUtxos(address, wif)
+        const freshUtxos = await this.getSpendableUtxos(address, wif, walletIndexForLog)
         const freshConfirmedOnly = freshUtxos.filter(isConfirmedUtxo)
         const freshPool = (preferConfirmed && freshConfirmedOnly.length > 0) ? freshConfirmedOnly : freshUtxos
         const freshCandidates = freshPool.length <= lowWater
@@ -667,6 +964,7 @@ export class BlockchainService {
           : [...freshPool].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
         for (const u of freshCandidates) {
           const key = `${u.tx_hash}:${u.tx_pos}`
+          if (isSplitInputHeld && isSplitInputHeld(address, key)) continue
           const addrCache = this.utxoCacheByAddress.get(address)
           const alreadyUsed = addrCache?.usedKeys?.get(key)
           if (alreadyUsed && alreadyUsed > Date.now()) continue
@@ -695,11 +993,11 @@ export class BlockchainService {
       const useTrueReturn = process.env.BSV_OPRETURN_TRUE_RETURN === 'true'
       const { buildOpFalseOpReturnWithTag } = await import('./opreturn')
       const extras: (Buffer | string)[] = []
-      let payloadBytes = Buffer.from(opReturnData, 'utf8')
+      let payloadBytes: Buffer = Buffer.from(opReturnData, 'utf8')
       try {
         if (useGzip) {
           const { gzipSync } = await import('zlib')
-          payloadBytes = gzipSync(payloadBytes)
+          payloadBytes = Buffer.from(gzipSync(payloadBytes))
         }
       } catch {}
       // Compute SHA-256 over the embedded bytes (compressed if enabled)
@@ -762,72 +1060,122 @@ export class BlockchainService {
           this.markUtxosUsed(reservedKeys) // refresh TTL
         }
         const normalHex = buildSerialized(1)
-        const txid = await this.broadcastTransaction(normalHex, prevoutsForArc)
+        const { txid, acceptedVia } = await this.broadcastTransaction(normalHex, prevoutsForArc)
 
         // Log transaction
-      const transactionLog: TransactionLog = {
-        txid,
-        stream: data.stream,
-        timestamp: data.timestamp,
-        payload: this.compactPayloadForLog(data.payload),
-        status: 'pending'
-      }
-
-      this.appendTransactionLog(transactionLog)
-      this.operationalStats.broadcastsOk += 1
-
-      // ── Feed reading to /explorer store (zero API calls) ──
-      try {
-        const pl: any = payloadWithAscii ?? data.payload ?? {}
-        const explorerReading: StoredReading = {
+        const transactionLog: TransactionLog = {
           txid,
-          dataType: data.stream,
-          location: pl.location || pl.location_ascii || pl.station_name || pl.city || null,
-          lat: pl.coordinates?.lat ?? pl.coordinates?.latitude ?? pl.latitude ?? null,
-          lon: pl.coordinates?.lon ?? pl.coordinates?.longitude ?? pl.longitude ?? null,
+          stream: data.stream,
           timestamp: data.timestamp,
-          metrics: pl,
-          provider: (data as any)?.payload?.source || null,
-          blockHeight: 0, // Will be set when confirmed
-          blockTime: null,
+          payload: this.compactPayloadForLog(data.payload),
+          status: 'pending'
         }
-        addReading(explorerReading)
-      } catch {
-        // Non-fatal – explorer store is secondary
-      }
 
-      // Persist to tx_log (pending on broadcast, will be confirmed later)
-      try {
-        if (process.env.GAIALOG_NO_DB !== 'true') {
-          await upsertTxLog({
-            txid,
-            type: data.stream,
-            provider: (data as any)?.payload?.source || 'unknown',
-            collected_at: new Date(data.timestamp),
-            status: 'pending',
-            onchain_at: new Date(),
-            fee_sats: null,
-            wallet_index: walletIndexForLog,
-            retries: 0,
-            error: null,
+        this.appendTransactionLog(transactionLog)
+        this.operationalStats.broadcastsOk += 1
+        throughputObservability.recordBroadcastAccepted({
+          family: data.family || data.stream,
+          providerId: providerIdValue,
+          datasetId: datasetIdValue,
+          queueLane: queueLaneValue,
+          channel: acceptedVia,
+          txid,
+        })
+
+        // Feed accepted transactions into the spend-source admission path.
+        // In legacy mode this is a no-op; overlay mode can admit the outputs
+        // immediately without waiting for external indexers to converge.
+        try {
+          const spendSource = getSpendSourceForWallet(walletIndexForLog)
+          const treasuryTopic = getTreasuryTopicForWallet(walletIndexForLog)
+          void spendSource.submitAcceptedTx({
+            clientRequestId: txid,
+            topics: [treasuryTopic],
+            rawTxEnvelope: {
+              txid,
+              rawTx: normalHex,
+              acceptedVia,
+              prevouts: prevoutsForArc,
+              broadcastedAt: new Date().toISOString(),
+            },
+          }).catch((submitErr) => {
+            const msg = submitErr instanceof Error ? submitErr.message : String(submitErr)
+            console.warn(`⚠️ Spend-source submit failed for ${txid.substring(0, 12)}...: ${msg}`)
           })
+        } catch {
+          // Non-fatal – on-chain acceptance already succeeded.
         }
-      } catch (e) {
-        // Non-fatal
-      }
 
-      // Schedule confirmation check after a delay to update status
-      this.scheduleConfirmationCheck(txid, data.stream).catch(() => {})
+        // ── Feed reading to /explorer store (zero API calls) ──
+        try {
+          if (canAttemptExplorerWrite()) {
+            const pl: any = payloadWithAscii ?? data.payload ?? {}
+            const explorerReading: StoredReading = {
+              txid,
+              dataType: data.stream,
+              location: pl.location || pl.location_ascii || pl.station_name || pl.city || null,
+              lat: pl.coordinates?.lat ?? pl.coordinates?.latitude ?? pl.latitude ?? null,
+              lon: pl.coordinates?.lon ?? pl.coordinates?.longitude ?? pl.longitude ?? null,
+              timestamp: data.timestamp,
+              metrics: pl,
+              provider: (data as any)?.payload?.source || null,
+              blockHeight: 0, // Will be set when confirmed
+              blockTime: null,
+            }
+            void addReading(explorerReading, { providerId: providerIdValue, datasetId: datasetIdValue })
+              .then((inserted) => {
+                if (!inserted) return
+                throughputObservability.recordExplorerIndexed({
+                  family: data.family || data.stream,
+                  providerId: providerIdValue,
+                  datasetId: datasetIdValue,
+                  queueLane: queueLaneValue,
+                  channel: acceptedVia,
+                  txid,
+                })
+              })
+              .catch(() => {
+                // Non-fatal – explorer store is secondary
+              })
+          }
+        } catch {
+          // Non-fatal – explorer store is secondary
+        }
 
-      this.broadcastCountSinceLastSample++
-      // Release global reservation after successful broadcast
-      if (ENABLE_UTXO_DB_LOCKS) {
-        try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys([inputKey]) } catch {}
-      }
-      return txid
+        // Persist to tx_log (pending on broadcast, will be confirmed later)
+        try {
+          if (process.env.GAIALOG_NO_DB !== 'true') {
+            await upsertTxLog({
+              txid,
+              type: data.stream,
+              provider: (data as any)?.payload?.source || 'unknown',
+              collected_at: new Date(data.timestamp),
+              status: 'pending',
+              onchain_at: new Date(),
+              fee_sats: null,
+              wallet_index: walletIndexForLog,
+              retries: 0,
+              error: null,
+            })
+          }
+        } catch (e) {
+          // Non-fatal
+        }
+
+        // Queue a best-effort confirmation check without adding a new timer per TX
+        this.enqueueConfirmationCheck(txid, data.stream)
+
+        this.broadcastCountSinceLastSample++
+        // Release global reservation after successful broadcast
+        if (ENABLE_UTXO_DB_LOCKS) {
+          try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys([inputKey]) } catch {}
+        }
+        return txid
       } catch (innerErr) {
+        const innerMsg = innerErr instanceof Error ? innerErr.message : String(innerErr)
+        const preserveUsedReservation = /txn-mempool-conflict|DOUBLE_SPEND|MEMPOOL_CHAIN_LIMIT|Missing input|Missing inputs/i.test(innerMsg)
         // On failure, release reserved UTXOs back to pool
-        if (ENABLE_UTXO_POOL && reservedKeys.length > 0) {
+        if (ENABLE_UTXO_POOL && reservedKeys.length > 0 && !preserveUsedReservation) {
           this.releaseUtxos(reservedKeys)
         }
         // Release global reservation as well
@@ -841,8 +1189,22 @@ export class BlockchainService {
       // Suppress noisy logs for expected, transient availability issues
       const msg = error instanceof Error ? error.message : String(error)
       const transient = /already reserved|No UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(msg)
+      const failedProviderValue = (data as any)?.payload?.source || 'unknown'
+      const failedProviderId = (data as any)?.providerId || (data as any)?.payload?.provider_id || resolveProviderIdFromSource(failedProviderValue) || undefined
+      const failedDatasetId = (data as any)?.datasetId || (data as any)?.payload?.dataset_id || undefined
+      const failedQueueLane = (data as any)?.queueLane === 'throughput' || (data as any)?.queueLane === 'coverage'
+        ? (data as any).queueLane
+        : undefined
       this.operationalStats.broadcastsFailed += 1
       this.recordOperationalError('writeToChain', msg)
+      throughputObservability.recordBroadcastFailed({
+        family: data.family || data.stream,
+        providerId: failedProviderId,
+        datasetId: failedDatasetId,
+        queueLane: failedQueueLane,
+        channel: this.detectBroadcastChannel(msg),
+        error: msg,
+      })
 
       // Signal per-wallet mempool-chain backoff so round-robin skips this wallet
       if (msg.includes('MEMPOOL_CHAIN_LIMIT') && fromAddress) {
@@ -892,12 +1254,74 @@ export class BlockchainService {
     }
   }
 
-  private async refreshUtxoCache(address: string, wif: string, force = false): Promise<void> {
+  private ensureAddressCache(address: string): {
+    fetchedAt: number
+    utxos: any[]
+    usedKeys: Map<string, number>
+    inFlight: Promise<void> | null
+  } {
     let cache = this.utxoCacheByAddress.get(address)
     if (!cache) {
       cache = { fetchedAt: 0, utxos: [], usedKeys: new Map<string, number>(), inFlight: null }
       this.utxoCacheByAddress.set(address, cache)
     }
+    return cache
+  }
+
+  private filterLocallyUsedUtxos(address: string, utxos: any[]): any[] {
+    const now = Date.now()
+    const cache = this.ensureAddressCache(address)
+    try {
+      for (const [key, exp] of cache.usedKeys.entries()) {
+        if (exp <= now) cache.usedKeys.delete(key)
+      }
+    } catch {}
+    return (Array.isArray(utxos) ? utxos : []).filter((u: any) => {
+      const key = `${u.tx_hash}:${u.tx_pos}`
+      const exp = cache.usedKeys.get(key)
+      if (!exp) return true
+      if (exp <= now) {
+        cache.usedKeys.delete(key)
+        return true
+      }
+      return false
+    })
+  }
+
+  private mapSpendSourceOutputToUtxo(output: SpendableOutput, fallbackAddress: string): any {
+    const confirmed = output.confirmed
+    return {
+      tx_hash: output.txid,
+      tx_pos: output.vout,
+      value: output.satoshis,
+      address: output.address || fallbackAddress,
+      script: output.outputScript,
+      rawTx: output.rawTx,
+      proof: output.proof,
+      confirmations: confirmed ? Math.max(1, MIN_SPEND_CONF || 1) : 0,
+      height: confirmed ? 1 : 0,
+      admittedAt: output.admittedAt,
+      spendSource: output.source,
+      spendTopic: output.topic,
+    }
+  }
+
+  private async getSpendableUtxosFromSpendSource(address: string, walletIndex: number): Promise<any[]> {
+    const topic = getTreasuryTopicForWallet(walletIndex)
+    const spendSource = getSpendSourceForWallet(walletIndex)
+    const outputs = await spendSource.listSpendable({
+      topic,
+      limit: SPEND_SOURCE_LIST_LIMIT,
+      order: 'asc',
+      minSatoshis: 0,
+      excludeReserved: false,
+      confirmedOnly: MIN_SPEND_CONF > 0,
+    })
+    return outputs.map(output => this.mapSpendSourceOutputToUtxo(output, address))
+  }
+
+  private async refreshUtxoCache(address: string, wif: string, force = false): Promise<void> {
+    let cache = this.ensureAddressCache(address)
     if (cache.inFlight) {
       await cache.inFlight
       if (!force) return
@@ -933,7 +1357,22 @@ export class BlockchainService {
     await cache.inFlight
   }
 
-  private async getSpendableUtxos(address: string, explicitWif?: string): Promise<any[]> {
+  private async getSpendableUtxos(address: string, explicitWif?: string, walletIndex?: number): Promise<any[]> {
+    const resolvedWalletIndex = typeof walletIndex === 'number'
+      ? walletIndex
+      : getWalletIndexForAddress(address)
+    if (resolvedWalletIndex != null) {
+      try {
+        const spendables = await this.getSpendableUtxosFromSpendSource(address, resolvedWalletIndex)
+        return this.filterLocallyUsedUtxos(address, spendables)
+      } catch (error) {
+        if (bsvConfig.logging.level === 'debug') {
+          const message = error instanceof Error ? error.message : String(error)
+          console.warn(`⚠️ Spend-source lookup failed for ${address.substring(0, 10)}...; falling back to legacy UTXO path: ${message}`)
+        }
+      }
+    }
+
     if (!ENABLE_UTXO_POOL) {
       // No caching; fetch directly via a temporary wallet created from the matching or explicit WIF
       let useWif = explicitWif || ''
@@ -1120,6 +1559,8 @@ export class BlockchainService {
     'ACCEPTED',
     'STORED',
     'RECEIVED',
+    'REQUESTED_BY_NETWORK',
+    'SENT_TO_NETWORK',
     'ANNOUNCED_TO_NETWORK',
     'SEEN_IN_ORPHAN_MEMPOOL',
   ])
@@ -1175,7 +1616,7 @@ export class BlockchainService {
   private async broadcastTransaction(
     serializedTx: string,
     prevouts?: Array<{ lockingScript: string; satoshis: number }>
-  ): Promise<string> {
+  ): Promise<{ txid: string; acceptedVia: string }> {
     const errors: string[] = []
 
     // Build ARC request bodies:
@@ -1195,6 +1636,9 @@ export class BlockchainService {
 
     // Method 1: GorillaPool ARC (primary) — public access, no API key required
     try {
+      if (this.isBroadcastChannelBackedOff('gorillapool_arc')) {
+        errors.push('GorillaPool ARC skipped (ENDPOINT_BACKOFF)')
+      } else {
       const gpHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
       const gpApiKey = process.env.BSV_GORILLAPOOL_API_KEY
       if (gpApiKey) gpHeaders['Authorization'] = `Bearer ${gpApiKey}`
@@ -1207,11 +1651,19 @@ export class BlockchainService {
       const gpText = await gpRes.text().catch(() => '')
       if (gpRes.ok) {
         const txid = this.parseArcResponse(gpText, 'GorillaPool')
-        if (txid) return txid
+        if (txid) {
+          this.clearBroadcastChannelBackoff('gorillapool_arc')
+          return { txid, acceptedVia: 'gorillapool_arc' }
+        }
         errors.push(`GorillaPool ARC: rejected or unexpected response: ${gpText.substring(0, 200)}`)
       } else {
         if (bsvConfig.logging.level !== 'error') {
           console.warn(`⚠️  ARC (GorillaPool) ${gpRes.status}: ${gpText.substring(0, 150)}`)
+        }
+        if (gpRes.status === 429) {
+          this.noteBroadcastChannelBackoff('gorillapool_arc', 60000, 'HTTP 429')
+        } else if (gpRes.status >= 500) {
+          this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, `HTTP ${gpRes.status}`)
         }
         // GorillaPool sometimes rejects extended-format metadata with 461.
         // Retry once without prevouts before failing over to TAAL/WoC.
@@ -1230,28 +1682,40 @@ export class BlockchainService {
                 if (bsvConfig.logging.level !== 'error') {
                   console.warn('⚠️  ARC (GorillaPool): accepted after rawTx compatibility retry (without extended inputs)')
                 }
-                return txid
+                this.clearBroadcastChannelBackoff('gorillapool_arc')
+                return { txid, acceptedVia: 'gorillapool_arc' }
               }
               errors.push(`GorillaPool ARC compatibility retry: unexpected response: ${gpCompatText.substring(0, 200)}`)
             } else {
               if (bsvConfig.logging.level !== 'error') {
                 console.warn(`⚠️  ARC (GorillaPool compat) ${gpCompatRes.status}: ${gpCompatText.substring(0, 150)}`)
               }
+              if (gpCompatRes.status === 429) {
+                this.noteBroadcastChannelBackoff('gorillapool_arc', 60000, 'HTTP 429')
+              } else if (gpCompatRes.status >= 500) {
+                this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, `HTTP ${gpCompatRes.status}`)
+              }
               errors.push(`GorillaPool ARC compatibility retry failed (${gpCompatRes.status}): ${gpCompatText.substring(0, 300)}`)
             }
           } catch (compatErr) {
+            this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, compatErr instanceof Error ? compatErr.message : String(compatErr))
             errors.push(`GorillaPool ARC compatibility retry error: ${compatErr instanceof Error ? compatErr.message : String(compatErr)}`)
           }
         } else {
           errors.push(`GorillaPool ARC failed (${gpRes.status}): ${gpText.substring(0, 300)}`)
         }
       }
+      }
     } catch (e) {
+      this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, e instanceof Error ? e.message : String(e))
       errors.push(`GorillaPool ARC error: ${e instanceof Error ? e.message : String(e)}`)
     }
 
     // Method 2: TAAL ARC (fallback)
     try {
+      if (this.isBroadcastChannelBackedOff('taal_arc')) {
+        errors.push('TAAL ARC skipped (ENDPOINT_BACKOFF)')
+      } else {
       const arcKey = process.env.BSV_ARC_API_KEY
       const taalHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
       if (arcKey) taalHeaders['Authorization'] = `Bearer ${arcKey}`
@@ -1264,15 +1728,25 @@ export class BlockchainService {
       const arcText = await arcRes.text().catch(() => '')
       if (arcRes.ok) {
         const txid = this.parseArcResponse(arcText, 'TAAL')
-        if (txid) return txid
+        if (txid) {
+          this.clearBroadcastChannelBackoff('taal_arc')
+          return { txid, acceptedVia: 'taal_arc' }
+        }
         errors.push(`TAAL ARC: rejected or unexpected response: ${arcText.substring(0, 200)}`)
       } else {
         if (bsvConfig.logging.level !== 'error') {
           console.warn(`⚠️  ARC (TAAL) ${arcRes.status}: ${arcText.substring(0, 150)}`)
         }
+        if (arcRes.status === 429) {
+          this.noteBroadcastChannelBackoff('taal_arc', 60000, 'HTTP 429')
+        } else if (arcRes.status >= 500) {
+          this.noteBroadcastChannelBackoff('taal_arc', 30000, `HTTP ${arcRes.status}`)
+        }
         errors.push(`TAAL ARC failed (${arcRes.status}): ${arcText.substring(0, 300)}`)
       }
+      }
     } catch (e) {
+      this.noteBroadcastChannelBackoff('taal_arc', 30000, e instanceof Error ? e.message : String(e))
       errors.push(`TAAL ARC error: ${e instanceof Error ? e.message : String(e)}`)
     }
 
@@ -1281,9 +1755,11 @@ export class BlockchainService {
     // double-spend conflict memory — this unblocks UTXOs that ARC
     // incorrectly flags as DOUBLE_SPEND_ATTEMPTED due to stale conflicts.
     try {
+      if (this.isBroadcastChannelBackedOff('whatsonchain')) {
+        errors.push('WoC broadcast skipped (ENDPOINT_BACKOFF)')
+      } else {
       const wocNetwork = WOC_NETWORK
-      const wocHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
-      if (WHATSONCHAIN_API_KEY) wocHeaders['woc-api-key'] = WHATSONCHAIN_API_KEY
+      const wocHeaders = this.buildWhatsOnChainHeaders(true)
 
       const wocRes = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNetwork}/tx/raw`, {
         method: 'POST',
@@ -1296,16 +1772,24 @@ export class BlockchainService {
         const txid = wocText.replace(/"/g, '').trim()
         if (/^[0-9a-fA-F]{64}$/.test(txid)) {
           console.log(`📡 WoC broadcast accepted: txid=${txid.substring(0, 12)}...`)
-          return txid
+          this.clearBroadcastChannelBackoff('whatsonchain')
+          return { txid, acceptedVia: 'whatsonchain' }
         }
         errors.push(`WoC returned unexpected response: ${wocText.substring(0, 200)}`)
       } else {
         if (bsvConfig.logging.level !== 'error') {
           console.warn(`⚠️  WoC broadcast ${wocRes.status}: ${wocText.substring(0, 150)}`)
         }
+        if (wocRes.status === 429) {
+          this.noteBroadcastChannelBackoff('whatsonchain', WHATSONCHAIN_API_KEY ? 60000 : 120000, 'HTTP 429')
+        } else if (wocRes.status >= 500) {
+          this.noteBroadcastChannelBackoff('whatsonchain', 30000, `HTTP ${wocRes.status}`)
+        }
         errors.push(`WoC broadcast failed (${wocRes.status}): ${wocText.substring(0, 300)}`)
       }
+      }
     } catch (e) {
+      this.noteBroadcastChannelBackoff('whatsonchain', 30000, e instanceof Error ? e.message : String(e))
       errors.push(`WoC broadcast error: ${e instanceof Error ? e.message : String(e)}`)
     }
 
@@ -1318,67 +1802,15 @@ export class BlockchainService {
       console.warn(`⏳ Mempool chain too long — waiting for next block to shorten the unconfirmed ancestor chain. Will retry automatically.`)
       throw new Error('MEMPOOL_CHAIN_LIMIT')
     }
+    const isRateLimited = /429|TOO MANY REQUESTS|RATE LIMIT/i.test(allErrors)
+    if (isRateLimited) {
+      throw new Error(`BROADCAST_RATE_LIMITED\n${allErrors}`)
+    }
+    const isEndpointUnavailable = /fetch failed|ENDPOINT_BACKOFF|ECONN|ENOTFOUND|ETIMEDOUT|TIMED OUT|NETWORK/i.test(allErrors)
+    if (isEndpointUnavailable) {
+      throw new Error(`BROADCAST_ENDPOINT_UNAVAILABLE\n${allErrors}`)
+    }
     throw new Error(`All broadcast methods failed:\n${allErrors}`)
-  }
-
-  private async scheduleConfirmationCheck(txid: string, streamType: string): Promise<void> {
-    // Wait 60 seconds for transaction to propagate and get indexed (increased from 30s)
-    setTimeout(async () => {
-      try {
-        const previousAttempts = this.confirmationAttemptsByTxid.get(txid) || 0
-        if (previousAttempts >= MAX_CONFIRMATION_CHECK_ATTEMPTS) {
-          this.txStatusBatch.retryLimitReached += 1
-          this.recordOperationalError('confirmation-check', 'max-attempts-reached')
-          this.confirmationAttemptsByTxid.delete(txid)
-          return
-        }
-        this.confirmationAttemptsByTxid.set(txid, previousAttempts + 1)
-
-        const network = WOC_NETWORK
-        const wocUrl = `https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`
-        const headers: Record<string, string> = {}
-        if (WHATSONCHAIN_API_KEY) {
-          headers['woc-api-key'] = WHATSONCHAIN_API_KEY
-        }
-        
-        const response = await fetch(wocUrl, { headers })
-        
-        if (response.ok) {
-          const txData = await response.json()
-          const confirmations = txData.confirmations || 0
-          
-          // Update status to confirmed if it has at least 1 confirmation
-          if (confirmations > 0) {
-            await upsertTxLog({
-              txid,
-              type: streamType,
-              provider: 'auto-confirmed',
-              collected_at: new Date(),
-              status: 'confirmed',
-              onchain_at: new Date(),
-              fee_sats: null,
-              wallet_index: null,
-              retries: null,
-              error: null,
-            })
-            this.txStatusBatch.confirmed += 1
-            this.confirmationAttemptsByTxid.delete(txid)
-          } else {
-            // Still in mempool, check again later.
-            this.txStatusBatch.pending += 1
-            setTimeout(() => this.scheduleConfirmationCheck(txid, streamType).catch(() => {}), 120000)
-          }
-        } else if (response.status === 404) {
-          // Transaction not found - might have been rejected or not yet indexed
-          this.txStatusBatch.notFound += 1
-          // Check again after 2 minutes.
-          setTimeout(() => this.scheduleConfirmationCheck(txid, streamType).catch(() => {}), 120000)
-        }
-      } catch (error) {
-        // Silently fail - confirmation checking is best-effort
-        this.recordOperationalError('confirmation-check', error)
-      }
-    }, 60000) // Initial check after 60 seconds (increased from 30s)
   }
 
   private p2pkhLockingScriptHexFromWif(wif: string): string {
@@ -1458,7 +1890,7 @@ export class BlockchainService {
         if (!scriptHex) scriptHex = p2pkhScriptDefault
         return { lockingScript: scriptHex, satoshis: sats }
       }) : []
-      const txid = await this.broadcastTransaction(tx.serialize(), prevoutsForArc)
+      const { txid } = await this.broadcastTransaction(tx.serialize(), prevoutsForArc)
       return txid
     } catch (error) {
       console.error('sendToAddress error:', error)
@@ -1486,7 +1918,8 @@ export class BlockchainService {
   async verifyTransaction(txid: string): Promise<boolean> {
     try {
       const response = await fetch(
-        `https://api.whatsonchain.com/v1/bsv/${WOC_NETWORK}/tx/${txid}/raw`
+        `https://api.whatsonchain.com/v1/bsv/${WOC_NETWORK}/tx/${txid}/raw`,
+        { headers: this.buildWhatsOnChainHeaders() }
       )
 
       return response.ok
@@ -1502,7 +1935,12 @@ export class BlockchainService {
       clearInterval(this.summaryIntervalId)
       this.summaryIntervalId = null
     }
-    this.confirmationAttemptsByTxid.clear()
+    if (this.confirmationSchedulerId) {
+      clearInterval(this.confirmationSchedulerId)
+      this.confirmationSchedulerId = null
+    }
+    this.pendingConfirmationByTxid.clear()
+    this.pendingConfirmationHeap = []
   }
 }
 

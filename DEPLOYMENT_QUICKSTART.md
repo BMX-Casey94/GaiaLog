@@ -1,163 +1,128 @@
-# GaiaLog Deployment Quick Start Guide
+# GaiaLog Deployment Quick Start
 
-## 🚀 Deploy to Vercel in 3 Steps
+This project now assumes a split production topology:
 
-### Step 1: Set Environment Variables in Vercel
+- `Vercel`: stateless frontend and read APIs
+- `VPS`: dedicated single-writer worker and overlay host
+- `Postgres / Supabase`: shared system of record
 
-Go to your Vercel project → Settings → Environment Variables and add:
+Use `VERCEL_VPS_SPLIT_DEPLOYMENT.md` as the canonical architecture reference.
 
-```bash
-# Database (Required)
-DATABASE_URL=your_postgres_connection_string
-SUPABASE_DB_URL=your_supabase_direct_url
+## 1. Configure Vercel
 
-# BSV Blockchain (Required for blockchain features)
-BSV_PRIVATE_KEY=your_primary_wallet_private_key
-BSV_ARC_API_KEY=your_arc_api_key
-BSV_NETWORK=testnet
+Use `env.vercel.template` as the source of truth for Vercel environment variables.
 
-# Optional: Additional wallets for load distribution
-BSV_WALLET_1_PRIVATE_KEY=your_wallet_1_private_key
-BSV_WALLET_2_PRIVATE_KEY=your_wallet_2_private_key
-BSV_WALLET_3_PRIVATE_KEY=your_wallet_3_private_key
+Key points:
 
-# External APIs (Required for data collection)
-WAQI_API_KEY=your_waqi_api_key
-WEATHER_API_KEY=your_weather_api_key
-```
+- Set `GAIALOG_WORKER_PROCESS=0`
+- Set `GAIALOG_SINGLE_WRITER_MODE=run-workers`
+- Keep `GAIALOG_NO_DB=false`
+- Keep `BSV_ENABLE_UTXO_DB_LOCKS=true`
+- Do not place wallet private keys or ARC credentials in Vercel
 
-### Step 2: Deploy
+Vercel should contain read-side configuration only:
+
+- Postgres / Supabase connection settings
+- public-facing Supabase values
+- admin UI secrets
+- optional read-only overlay lookup settings when explorer migrates to overlay
+
+## 2. Configure the VPS
+
+Use `env.vps.template` as the source of truth for the VPS worker environment.
+
+Key points:
+
+- Set `GAIALOG_WORKER_PROCESS=1`
+- Set `GAIALOG_SINGLE_WRITER_MODE=run-workers`
+- Keep `GAIALOG_NO_DB=false`
+- Keep `BSV_ENABLE_UTXO_DB_LOCKS=true`
+- Keep all wallet WIFs, ARC credentials, provider API keys, and overlay submit credentials on the VPS only
+
+The VPS is where you run:
+
+- `scripts/run-workers.ts`
+- queue mutation
+- UTXO maintenance
+- ARC broadcasting
+- overlay lookup and submit endpoints
+
+## 3. Deploy
+
+### Vercel
+
+Deploy the Next.js app normally:
 
 ```bash
 vercel --prod
 ```
 
-Or push to your connected Git repository (GitHub, GitLab, Bitbucket).
+Or push to the connected Git remote and let Vercel build automatically.
 
-### Step 3: Verify Workers Are Running
+### VPS
 
-After deployment completes (usually 2-3 minutes), check:
+Run the long-lived services on the VPS:
 
 ```bash
-curl https://your-app-name.vercel.app/api/workers/status
+pm2 start ecosystem.config.cjs
+pm2 save
 ```
 
-Expected response:
-```json
-{
-  "success": true,
-  "status": {
-    "initialized": true,
-    "workersRunning": 4,
-    "totalWorkers": 4
-  }
-}
-```
+Or for a simpler non-PM2 run:
 
-## ✅ That's It!
-
-Your workers will **automatically start** and begin:
-- Collecting environmental data (air quality, weather, seismic, water levels)
-- Processing blockchain transactions
-- Maintaining UTXO pools
-
-## 📊 What Happens Automatically
-
-### On Deployment:
-1. ✅ App builds and deploys to Vercel
-2. ✅ First request triggers auto-initialization
-3. ✅ All 4 environmental workers start
-4. ✅ Blockchain transaction queue begins processing
-5. ✅ UTXO maintainer starts splitting UTXOs
-6. ✅ Vercel cron job pings every 10 minutes to keep workers active
-
-### No Manual Steps Required!
-
-Previously, you had to:
-- ❌ Manually call `/api/bsv/init` after every deployment
-- ❌ Remember to restart workers
-- ❌ Set up external cron jobs
-
-Now:
-- ✅ Everything starts automatically
-- ✅ Workers stay running via built-in cron
-- ✅ Zero maintenance required
-
-## 🔍 Monitoring
-
-### Check Worker Status Anytime:
 ```bash
-curl https://your-app-name.vercel.app/api/workers/status
+npm run workers
 ```
 
-### View Live Logs:
+## 4. Verify
+
+### Vercel
+
+The public web runtime should be read-only. A status check should show a web role rather than an active writer:
+
 ```bash
-vercel logs --follow
+curl https://your-app.vercel.app/api/workers/status
 ```
 
-### Admin Dashboard:
-Navigate to `https://your-app-name.vercel.app/admin` (requires authentication)
+Expected characteristics:
 
-## 🆘 Troubleshooting
+- `runtimeControl.role` is `web`
+- `runtimeControl.workerProcessEnabled` is `false`
+- no worker bootstrap attempt is required for normal operation
 
-### Workers Not Starting?
+### VPS
 
-**Quick Fix:**
+Check PM2 status and logs:
+
 ```bash
-curl -X POST https://your-app-name.vercel.app/api/warmup
+pm2 status
+pm2 logs gaialog-workers
 ```
 
-This manually triggers initialization.
+Expected characteristics:
 
-**Check Logs:**
-```bash
-vercel logs
-```
+- worker process is running
+- queue processing is active
+- UTXO maintainer is active
+- spend-source status matches your rollout mode
 
-Look for:
-- ✅ `Worker auto-initialization completed successfully`
-- ❌ Error messages about missing environment variables
+## 5. Rollout Notes
 
-### Need Help?
+- Keep `BSV_SPEND_SOURCE_MODE=shadow` on the VPS until parity is healthy
+- Keep `BSV_SPEND_SOURCE_LEGACY_FALLBACK_ENABLED=true` during rollout
+- Use `BSV_OVERLAY_CANARY_WALLET` when you begin canary promotion
+- Keep `BSV_EXPECTED_TX_PER_DAY=2000000` until the admission-driven splitter replaces the legacy auto-sizing path
 
-1. Check `WORKER_AUTO_INITIALIZATION.md` for detailed documentation
-2. Review Vercel logs: `vercel logs --follow`
-3. Verify environment variables in Vercel dashboard
+## 6. Do Not Do This On Vercel
 
-## 🔐 Security Notes
+- do not put `BSV_PRIVATE_KEY` or `BSV_WALLET_*_PRIVATE_KEY` in Vercel
+- do not put `BSV_ARC_API_KEY` in Vercel
+- do not run worker cron jobs from Vercel
+- do not expose privileged overlay submit credentials publicly
 
-- Environment variables are encrypted by Vercel
-- Never commit `.env` files to Git
-- Use test wallets for development/staging
-- Use production wallets only for production deployment
+## Additional Reading
 
-## 💰 Cost Estimate
-
-**Vercel:**
-- Free tier: Likely sufficient for testing
-- Pro tier: Recommended for production (£16/month)
-
-**External APIs:**
-- Most have free tiers for moderate usage
-- Monitor your usage in provider dashboards
-
-## 🎯 Next Steps
-
-After deployment:
-
-1. ✅ Visit your app: `https://your-app-name.vercel.app`
-2. ✅ Check workers: `https://your-app-name.vercel.app/api/workers/status`
-3. ✅ View admin dashboard: `https://your-app-name.vercel.app/admin`
-4. ✅ Monitor Vercel logs for any issues
-
-## 📚 Additional Resources
-
-- **Full Documentation:** `WORKER_AUTO_INITIALIZATION.md`
-- **Environment Variables:** `env.template`
-- **Vercel Dashboard:** https://vercel.com/dashboard
-- **Architecture:** `BLOCKCHAIN_INTEGRATION.md`
-
----
-
-**Questions?** Check the full documentation in `WORKER_AUTO_INITIALIZATION.md`
-
+- `VERCEL_VPS_SPLIT_DEPLOYMENT.md`
+- `env.vercel.template`
+- `env.vps.template`
+- `env.template`

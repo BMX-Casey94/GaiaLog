@@ -7,7 +7,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { getIndexStats, getUniqueLocationCountFast } from '@/lib/supabase-explorer'
+import { getIndexStats, getUniqueLocationCountFast } from '@/lib/explorer-read-source'
 
 export const dynamic = 'force-dynamic'
 
@@ -39,7 +39,7 @@ let lastKnownIndexStats: IndexStats | null = null
 let cachedPayload: { data: ExplorerStatsPayload; ts: number } | null = null
 let refreshInFlight: Promise<void> | null = null
 
-const STATS_CACHE_TTL_MS = Math.max(5000, Number(process.env.EXPLORER_STATS_CACHE_TTL_MS || 15000))
+const STATS_CACHE_TTL_MS = Math.max(5000, Number(process.env.EXPLORER_STATS_CACHE_TTL_MS || 30000))
 const INDEX_TIMEOUT_MS = Math.max(1000, Number(process.env.EXPLORER_INDEX_TIMEOUT_MS || 2500))
 const LOCATION_TIMEOUT_MS = Math.max(500, Number(process.env.EXPLORER_LOCATION_TIMEOUT_MS || 1200))
 

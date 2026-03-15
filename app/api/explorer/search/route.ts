@@ -16,7 +16,8 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { searchReadings, getAggregates, type SearchParams } from '@/lib/supabase-explorer'
+import { searchReadings, getAggregates, type SearchParams } from '@/lib/explorer-read-source'
+import { normaliseDataFamily } from '@/lib/stream-registry'
 
 export const dynamic = 'force-dynamic'
 
@@ -35,13 +36,8 @@ export async function GET(request: NextRequest) {
     const q = searchParams.get('q')
     if (q) params.q = q
 
-    const dataType = searchParams.get('type')
-    if (
-      dataType &&
-      ['air_quality', 'water_levels', 'seismic_activity', 'advanced_metrics'].includes(dataType)
-    ) {
-      params.dataType = dataType
-    }
+    const dataType = normaliseDataFamily(searchParams.get('type'))
+    if (dataType) params.dataType = dataType
 
     const from = searchParams.get('from')
     if (from) {

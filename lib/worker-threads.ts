@@ -3,16 +3,21 @@ import { BSVTransactionData } from './bsv-transaction-service'
 import { bsvConfig } from './bsv-config'
 import {
   collectAirQualityDataBatch,
+  collectEMSCLatestEvents,
+  collectNdbcLatestObservations,
   collectSeismicDataBatch,
+  collectSensorCommunityDataBatch,
   collectWaterLevelDataBatch,
 } from './data-collector'
 import { TOP_100_CITIES } from './city-seeds'
 import { dedupeStore } from './stores'
 import { fetchJsonWithRetry } from './provider-fetch'
 import { insertAdvanced, insertAirQuality, insertWaterLevel, insertSeismic, calculateSourceHash, getOwmStationsPage, getStationsByProviderPage, readCursor, writeCursor, hasAirQualityTxId, hasWaterLevelTxId, hasSeismicTxId, hasSeismicEventTxId, hasAdvancedTxId, getSeismicByEventId } from './repositories'
-import { providerConfigs } from './provider-registry'
+import { datasetConfigs, providerConfigs } from './provider-registry'
 import { cursorStore } from './stores'
 import { blockchainService } from './blockchain'
+import { DataFamily, DatasetId, mapWorkerTypeToFamily, ProviderId, QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
+import { throughputObservability } from './throughput-observability'
 
 export interface WorkerStats {
   workerId: string
@@ -26,12 +31,17 @@ export interface WorkerStats {
 }
 
 export interface EnvironmentalData {
-  type: 'air-quality' | 'weather' | 'seismic' | 'water-level' | 'advanced'
+  type: 'air-quality' | 'weather' | 'seismic' | 'water-level' | 'advanced' | 'geomagnetism' | 'volcanic' | 'space-weather' | 'upper-atmosphere'
   timestamp: number
   location: string
   measurement: any
   source: string
   priority: 'high' | 'normal'
+  family?: DataFamily
+  providerId?: ProviderId
+  datasetId?: DatasetId
+  queueLane?: QueueLane
+  maxInFlight?: number
   eventId?: string
   coordinates?: { lat: number; lon: number }
   stationId?: string
@@ -89,23 +99,66 @@ export abstract class BaseWorker {
     }
   }
 
+  private recordCollectionBatch(data: EnvironmentalData[]): void {
+    if (!Array.isArray(data) || data.length === 0) return
+    const grouped = new Map<string, { family: DataFamily; providerId?: ProviderId; datasetId?: DatasetId; queueLane?: QueueLane; count: number }>()
+    for (const item of data) {
+      const family = item.family || mapWorkerTypeToFamily(item.type)
+      const providerId = item.providerId || resolveProviderIdFromSource(item.source) || undefined
+      const datasetId = item.datasetId
+      const queueLane = item.queueLane
+      const key = [family, providerId || 'unknown', datasetId || '-', queueLane || 'unknown'].join('|')
+      const existing = grouped.get(key)
+      if (existing) {
+        existing.count += 1
+      } else {
+        grouped.set(key, { family, providerId, datasetId, queueLane, count: 1 })
+      }
+    }
+    for (const entry of grouped.values()) {
+      throughputObservability.recordProviderBatch({
+        family: entry.family,
+        providerId: entry.providerId,
+        datasetId: entry.datasetId,
+        queueLane: entry.queueLane,
+      }, entry.count, 1)
+    }
+  }
+
   protected abstract getIntervalMs(): number
   protected abstract collectData(): Promise<EnvironmentalData[]>
 
   private async run(): Promise<void> {
     const startTime = Date.now()
+    const cycleStats = {
+      submitted: 0,
+      queued: 0,
+      duplicateDropped: 0,
+      alreadyOnChainDropped: 0,
+      backpressured: 0,
+    }
+    const metaForItem = (item: EnvironmentalData) => ({
+      family: item.family || mapWorkerTypeToFamily(item.type),
+      providerId: item.providerId || resolveProviderIdFromSource(item.source) || undefined,
+      datasetId: item.datasetId,
+      queueLane: item.queueLane,
+    })
     
     try {
       console.log(`📡 ${this.workerId}: Collecting environmental data...`)
       
       const data = await this.collectData()
+      this.recordCollectionBatch(data)
       
       for (const item of data) {
+        const itemMeta = metaForItem(item)
         const idempotencyKey = (item.type === 'seismic' && item.eventId)
           ? `seismic:${item.eventId}`
           : `${item.type}:${item.source}:${item.location}:${item.timestamp}`
         const isNew = await dedupeStore.add(idempotencyKey)
         if (!isNew) {
+          cycleStats.duplicateDropped++
+          throughputObservability.recordDuplicateDropped(itemMeta)
           continue
         }
 
@@ -120,6 +173,8 @@ export abstract class BaseWorker {
               // Skip if already on-chain
               try {
                 if (await hasAirQualityTxId(unifiedHash)) {
+                  cycleStats.alreadyOnChainDropped++
+                  throughputObservability.recordAlreadyOnChainDropped(itemMeta)
                   if (bsvConfig.logging.level === 'debug') {
                     console.log(`⏭️  Skipping air-quality - already on-chain (${unifiedHash.slice(0, 12)}...)`)
                   }
@@ -158,6 +213,8 @@ export abstract class BaseWorker {
               // Skip if already on-chain
               try {
                 if (await hasWaterLevelTxId(unifiedHash)) {
+                  cycleStats.alreadyOnChainDropped++
+                  throughputObservability.recordAlreadyOnChainDropped(itemMeta)
                   if (bsvConfig.logging.level === 'debug') {
                     console.log(`⏭️  Skipping water-level - already on-chain (${unifiedHash.slice(0, 12)}...)`)
                   }
@@ -194,6 +251,8 @@ export abstract class BaseWorker {
                 const alreadyByHash = await hasSeismicTxId(unifiedHash)
                 const alreadyByEvent = item.eventId ? await hasSeismicEventTxId(item.eventId) : false
                 if (alreadyByHash || alreadyByEvent) {
+                  cycleStats.alreadyOnChainDropped++
+                  throughputObservability.recordAlreadyOnChainDropped(itemMeta)
                   if (bsvConfig.logging.level === 'debug') {
                     console.log(`⏭️  Skipping seismic ${item.eventId || 'unknown'} - already on-chain`)
                   }
@@ -220,6 +279,8 @@ export abstract class BaseWorker {
               // Skip if already on-chain
               try {
                 if (await hasAdvancedTxId(unifiedHash)) {
+                  cycleStats.alreadyOnChainDropped++
+                  throughputObservability.recordAlreadyOnChainDropped(itemMeta)
                   if (bsvConfig.logging.level === 'debug') {
                     console.log(`⏭️  Skipping advanced-metrics - already on-chain (${unifiedHash.slice(0, 12)}...)`)
                   }
@@ -241,7 +302,15 @@ export abstract class BaseWorker {
           timestamp: item.timestamp,
           location: item.location,
           measurement: item.measurement,
-          source_hash: unifiedHash
+          source_hash: unifiedHash,
+          family: item.family || mapWorkerTypeToFamily(item.type),
+          providerId: item.providerId || resolveProviderIdFromSource(item.source) || undefined,
+          datasetId: item.datasetId,
+          sourceLabel: resolveSourceLabel(item.providerId, item.datasetId, item.source),
+          queueLane: item.queueLane,
+          maxInFlight: item.maxInFlight,
+          coordinates: item.coordinates,
+          stationId: item.stationId,
         }
 
         // Check if we should bypass queue for direct broadcasting
@@ -258,10 +327,17 @@ export abstract class BaseWorker {
             const txid = await blockchainService.writeToChain({
               stream,
               timestamp: item.timestamp,
+              family: bsvData.family,
+              providerId: bsvData.providerId,
+              datasetId: bsvData.datasetId,
+              queueLane: bsvData.queueLane,
               payload: {
                 location: item.location,
                 timestamp: new Date(item.timestamp).toISOString(),
-                source: item.source,
+                source: resolveSourceLabel(bsvData.providerId, bsvData.datasetId, item.source),
+                provider_id: bsvData.providerId,
+                dataset_id: bsvData.datasetId,
+                family: bsvData.family,
                 ...item.measurement,
                 source_hash: unifiedHash
               }
@@ -271,27 +347,42 @@ export abstract class BaseWorker {
               console.log(`✅ ${this.workerId}: Direct broadcast ${item.type} - ${txid}`)
             }
             this.stats.totalTransactions++
+            cycleStats.submitted++
           } catch (e) {
             const eMsg = e instanceof Error ? e.message : String(e)
             const isTransient = /MEMPOOL_CHAIN_LIMIT|No reservable UTXO|No UTXOs available|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(eMsg)
             // Reliability guard: never drop a reading on direct-broadcast failure.
             // Route to queue so retry/backoff/idempotency logic can recover safely.
             const queueId = workerQueue.addToQueue(bsvData, item.priority)
-            this.stats.totalTransactions++
+            if (queueId) {
+              this.stats.totalTransactions++
+              cycleStats.queued++
+            } else {
+              cycleStats.backpressured++
+            }
 
             if (isTransient) {
               if (bsvConfig.logging.level !== 'error') {
-                console.warn(`⏳ ${this.workerId}: direct broadcast transient failure, queued for retry (${queueId}) - ${eMsg.split('\n')[0].substring(0, 140)}`)
+                console.warn(queueId
+                  ? `⏳ ${this.workerId}: direct broadcast transient failure, queued for retry (${queueId}) - ${eMsg.split('\n')[0].substring(0, 140)}`
+                  : `⏸️ ${this.workerId}: direct broadcast transient failure but queue is backpressured for ${bsvData.datasetId || bsvData.providerId || 'source'}`
+                )
               }
             } else {
-              console.error(`❌ ${this.workerId}: Direct broadcast failed, queued for retry (${queueId}):`, e)
+              if (queueId) console.error(`❌ ${this.workerId}: Direct broadcast failed, queued for retry (${queueId}):`, e)
+              else console.error(`❌ ${this.workerId}: Direct broadcast failed but queue is backpressured:`, e)
             }
           }
         } else {
           // Normal queue path (when Supabase is stable)
           const queueId = workerQueue.addToQueue(bsvData, item.priority)
-          this.stats.totalTransactions++
-          if (bsvConfig.logging.level === 'debug') {
+          if (queueId) {
+            this.stats.totalTransactions++
+            cycleStats.queued++
+          } else {
+            cycleStats.backpressured++
+          }
+          if (queueId && bsvConfig.logging.level === 'debug') {
             console.log(`📥 ${this.workerId}: Queued ${item.type} data (${item.priority} priority): ${queueId}`)
           }
         }
@@ -308,7 +399,11 @@ export abstract class BaseWorker {
       }
 
       if (bsvConfig.logging.level !== 'error') {
-        console.log(`✅ ${this.workerId}: Processed ${data.length} data points in ${processingTime}ms`)
+        console.log(
+          `✅ ${this.workerId}: Processed ${data.length} data points in ${processingTime}ms ` +
+          `(submitted=${cycleStats.submitted}, queued=${cycleStats.queued}, duplicate=${cycleStats.duplicateDropped}, ` +
+          `already_on_chain=${cycleStats.alreadyOnChainDropped}, backpressured=${cycleStats.backpressured})`
+        )
       }
 
     } catch (error) {
@@ -327,7 +422,9 @@ export abstract class BaseWorker {
     // Stable hash: type + canonical JSON(measurement) + rounded timestamp(ISO minute) + location
     const rounded = new Date(Math.floor((data.timestamp) / 60000) * 60000).toISOString()
     const canonical = JSON.stringify(data.measurement, Object.keys(data.measurement).sort())
-    const sourceString = `${data.type}|${rounded}|${data.location}|${canonical}`
+    const providerKey = data.providerId || resolveProviderIdFromSource(data.source) || 'unknown'
+    const datasetKey = data.datasetId || 'default'
+    const sourceString = `${data.type}|${providerKey}|${datasetKey}|${data.source}|${rounded}|${data.location}|${canonical}`
     return Buffer.from(sourceString).toString('base64').substring(0, 32)
   }
 }
@@ -339,11 +436,12 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
   }
 
   protected getIntervalMs(): number {
-    const envMs = Number(process.env.WAQI_WORKER_INTERVAL_MS)
-    return Number.isFinite(envMs) && envMs > 0 ? envMs : 30 * 60 * 1000
+    return datasetConfigs.waqi_station_feed?.cadence.intervalMs || 30 * 60 * 1000
   }
 
   protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.waqi_station_feed
+    if (!config?.enabled) return []
     const data: EnvironmentalData[] = []
     try {
       // Ensure WAQI station index is being discovered and persisted
@@ -500,7 +598,12 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
           location: item.location,
           measurement,
           source: item.source,
-          priority: 'normal',
+          priority: config.defaultPriority,
+          family: 'air_quality',
+          providerId: 'waqi',
+          datasetId: 'waqi_station_feed',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
           coordinates: (item as any)?.coordinates,
           stationId: (item as any)?.station_id,
         })
@@ -519,11 +622,12 @@ export class NOAAWorker extends BaseWorker {
   }
 
   protected getIntervalMs(): number {
-    const envMs = Number(process.env.NOAA_WORKER_INTERVAL_MS)
-    return Number.isFinite(envMs) && envMs > 0 ? envMs : 60 * 60 * 1000
+    return datasetConfigs.noaa_coops_water_levels?.cadence.intervalMs || 60 * 60 * 1000
   }
 
   protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.noaa_coops_water_levels
+    if (!config?.enabled) return []
     const data: EnvironmentalData[] = []
     try {
       // First run: always use a small batch (50) so data appears quickly on startup.
@@ -531,7 +635,7 @@ export class NOAAWorker extends BaseWorker {
       const flagKey = '__NOAA_ONEOFF_DONE__'
       const done = (global as any)[flagKey] === true
       const configured = Number(process.env.NOAA_STATION_BATCH_SIZE)
-      const fullBatch = Number.isFinite(configured) && configured > 0 ? configured : 150
+      const fullBatch = Number.isFinite(configured) && configured > 0 ? configured : config.chunkSize
       const limit = done ? fullBatch : Math.min(50, fullBatch)
       if (!done) {
         console.log(`🌊 NOAA-Weather: First run – using fast-start batch of ${limit} stations (full batch: ${fullBatch})`)
@@ -555,17 +659,138 @@ export class NOAAWorker extends BaseWorker {
         if (item.current_speed_ms != null) measurement.current_speed_ms = item.current_speed_ms
         if (item.current_direction_deg != null) measurement.current_direction_deg = item.current_direction_deg
         if (item.wave_height_m != null) measurement.wave_height_m = item.wave_height_m
+        if ((item as any).pressure_hpa != null) measurement.pressure_hpa = (item as any).pressure_hpa
+        if ((item as any).air_temperature_c != null) measurement.air_temperature_c = (item as any).air_temperature_c
+        if ((item as any).dew_point_c != null) measurement.dew_point_c = (item as any).dew_point_c
+        if ((item as any).visibility_nmi != null) measurement.visibility_nmi = (item as any).visibility_nmi
         data.push({
           type: 'water-level',
           timestamp: Date.parse(item.timestamp) || Date.now(),
           location: item.location,
           measurement,
           source: item.source,
-          priority: 'normal',
+          priority: config.defaultPriority,
+          family: 'water_levels',
+          providerId: 'noaa',
+          datasetId: 'noaa_coops_water_levels',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: (item as any)?.coordinates,
+          stationId: item.station_id,
         })
       }
     } catch (error) {
       console.error('Error fetching NOAA data:', error)
+    }
+    return data
+  }
+}
+
+export class SensorCommunityWorker extends BaseWorker {
+  constructor() {
+    super('SensorCommunity-AirQuality')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.sensor_community_air_quality?.cadence.intervalMs || 5 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.sensor_community_air_quality
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectSensorCommunityDataBatch(config.chunkSize)
+      for (const item of batch) {
+        data.push({
+          type: 'air-quality',
+          timestamp: Date.parse(item.timestamp) || Date.now(),
+          location: item.location,
+          measurement: {
+            aqi: item.aqi,
+            pm25: item.pm25,
+            pm10: item.pm10,
+            co: item.co,
+            no2: item.no2,
+            o3: item.o3,
+            ...(item.temperature != null ? { temperature_c: item.temperature } : {}),
+            ...(item.humidity != null ? { humidity_pct: item.humidity } : {}),
+            ...(item.pressure != null ? { pressure_mb: item.pressure } : {}),
+          },
+          source: item.source,
+          priority: config.defaultPriority,
+          family: 'air_quality',
+          providerId: 'sensor_community',
+          datasetId: 'sensor_community_air_quality',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: item.coordinates,
+          stationId: item.station_id,
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching Sensor.Community data:', error)
+    }
+    return data
+  }
+}
+
+export class NOAANdbcWorker extends BaseWorker {
+  constructor() {
+    super('NOAA-NDBC')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.noaa_ndbc_latest_obs?.cadence.intervalMs || 5 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.noaa_ndbc_latest_obs
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectNdbcLatestObservations(config.chunkSize)
+      for (const item of batch) {
+        const measurement: Record<string, unknown> = {
+          station_id: item.station_id,
+        }
+        if (item.sea_level != null) measurement.sea_level = item.sea_level
+        if (item.river_level != null) measurement.river_level = item.river_level
+        if (item.wave_height_m != null) measurement.wave_height_m = item.wave_height_m
+        if (item.tide_height != null) measurement.tide_height = item.tide_height
+        if (item.water_temperature_c != null) measurement.water_temperature_c = item.water_temperature_c
+        if (item.air_temperature_c != null) measurement.air_temperature_c = item.air_temperature_c
+        if (item.dew_point_c != null) measurement.dew_point_c = item.dew_point_c
+        if (item.pressure_hpa != null) measurement.pressure_hpa = item.pressure_hpa
+        if (item.pressure_tendency_hpa != null) measurement.pressure_tendency_hpa = item.pressure_tendency_hpa
+        if (item.wind_speed_kph != null) measurement.wind_speed_kph = item.wind_speed_kph
+        if (item.gust_kph != null) measurement.gust_kph = item.gust_kph
+        if (item.wind_direction_deg != null) measurement.wind_direction_deg = item.wind_direction_deg
+        if (item.wave_period_s != null) measurement.wave_period_s = item.wave_period_s
+        if (item.average_wave_period_s != null) measurement.average_wave_period_s = item.average_wave_period_s
+        if (item.mean_wave_direction_deg != null) measurement.mean_wave_direction_deg = item.mean_wave_direction_deg
+        if (item.visibility_nmi != null) measurement.visibility_nmi = item.visibility_nmi
+
+        data.push({
+          type: 'water-level',
+          timestamp: Date.parse(item.timestamp) || Date.now(),
+          location: item.location,
+          measurement,
+          source: item.source,
+          priority: config.defaultPriority,
+          family: 'water_levels',
+          providerId: 'noaa_ndbc',
+          datasetId: 'noaa_ndbc_latest_obs',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: item.coordinates,
+          stationId: item.station_id,
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching NOAA NDBC data:', error)
     }
     return data
   }
@@ -583,12 +808,13 @@ export class USGSWorker extends BaseWorker {
     if (burstUntil && Date.now() < burstUntil) {
       return 5 * 60 * 1000 // 5 minutes during burst
     }
-    const envMs = Number(process.env.USGS_WORKER_INTERVAL_MS)
-    const base = Number.isFinite(envMs) && envMs > 0 ? envMs : 15 * 60 * 1000
+    const base = datasetConfigs.usgs_earthquakes?.cadence.intervalMs || 15 * 60 * 1000
     return base
   }
 
   protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.usgs_earthquakes
+    if (!config?.enabled) return []
     const data: EnvironmentalData[] = []
     try {
       // Read collection window and magnitude threshold from environment, with sensible defaults
@@ -612,8 +838,14 @@ export class USGSWorker extends BaseWorker {
           location: item.location,
           measurement,
           source: item.source,
-          priority: item.magnitude >= 4 ? 'high' : 'normal',
+          priority: item.magnitude >= 4 ? 'high' : config.defaultPriority,
+          family: 'seismic_activity',
+          providerId: 'usgs',
+          datasetId: 'usgs_earthquakes',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
           eventId: item.event_id,
+          coordinates: item.coordinates,
         })
       }
 
@@ -628,6 +860,160 @@ export class USGSWorker extends BaseWorker {
   }
 }
 
+export class EMSCRealtimeWorker extends BaseWorker {
+  private socket: any | null = null
+  private socketConnecting = false
+  private bufferedEvents: EnvironmentalData[] = []
+  private lastSocketEventAt = 0
+
+  constructor() {
+    super('EMSC-Realtime')
+  }
+
+  public start(): void {
+    void this.ensureSocket()
+    super.start()
+  }
+
+  public stop(): void {
+    try {
+      this.socket?.removeAllListeners?.()
+      this.socket?.close?.()
+    } catch {}
+    this.socket = null
+    this.socketConnecting = false
+    super.stop()
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.emsc_realtime_events?.cadence.intervalMs || 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.emsc_realtime_events
+    if (!config?.enabled) return []
+
+    await this.ensureSocket()
+
+    if (this.bufferedEvents.length > 0) {
+      const drained = this.bufferedEvents.splice(0, config.chunkSize)
+      return drained
+    }
+
+    if (this.lastSocketEventAt > 0 && (Date.now() - this.lastSocketEventAt) < 5 * 60 * 1000) {
+      return []
+    }
+
+    const fallbackWindowMinutes = Number(process.env.EMSC_FALLBACK_WINDOW_MINUTES || 15)
+    const fallback = await collectEMSCLatestEvents(fallbackWindowMinutes, config.chunkSize)
+    return fallback.map(item => ({
+      type: 'seismic',
+      timestamp: Date.parse(item.timestamp) || Date.now(),
+      location: item.location,
+      measurement: {
+        magnitude: item.magnitude,
+        depth: item.depth,
+        latitude: item.coordinates.lat,
+        longitude: item.coordinates.lon,
+      },
+      source: item.source,
+      priority: item.magnitude >= 4 ? 'high' : config.defaultPriority,
+      family: 'seismic_activity',
+      providerId: 'emsc',
+      datasetId: 'emsc_realtime_events',
+      queueLane: config.queueLane,
+      maxInFlight: config.maxInFlight,
+      eventId: item.event_id,
+      coordinates: item.coordinates,
+    }))
+  }
+
+  private async ensureSocket(): Promise<void> {
+    const config = datasetConfigs.emsc_realtime_events
+    if (!config?.enabled) return
+    if (this.socketConnecting) return
+    const readyState = this.socket?.readyState
+    if (readyState === 0 || readyState === 1) return
+
+    this.socketConnecting = true
+    try {
+      const WebSocketCtor = require('ws')
+      const endpoint = process.env.EMSC_WEBSOCKET_URL || 'wss://www.seismicportal.eu/standing_order/websocket'
+      const ws = new WebSocketCtor(endpoint, { handshakeTimeout: 15000 })
+      this.socket = ws
+
+      ws.on('open', () => {
+        this.socketConnecting = false
+        try { console.log('🌋 EMSC: WebSocket connected') } catch {}
+      })
+
+      ws.on('message', async (message: Buffer | string) => {
+        try {
+          const parsed = JSON.parse(String(message))
+          const properties = parsed?.data?.properties || {}
+          const geometry = parsed?.data?.geometry?.coordinates || []
+          const eventId = String(properties?.unid || properties?.source_id || '')
+          if (!eventId) return
+          const dedupeKey = `emsc:ws:${eventId}:${properties?.time || ''}`
+          if (!(await dedupeStore.add(dedupeKey))) return
+
+          const item: EnvironmentalData = {
+            type: 'seismic',
+            timestamp: Date.parse(properties?.time || '') || Date.now(),
+            location: String(properties?.flynn_region || 'Unknown region'),
+            measurement: {
+              magnitude: Number(properties?.mag ?? 0),
+              depth: Number(properties?.depth ?? 0),
+              latitude: Number(properties?.lat ?? geometry?.[1] ?? 0),
+              longitude: Number(properties?.lon ?? geometry?.[0] ?? 0),
+              action: parsed?.action || 'insert',
+            },
+            source: 'EMSC',
+            priority: Number(properties?.mag ?? 0) >= 4 ? 'high' : config.defaultPriority,
+            family: 'seismic_activity',
+            providerId: 'emsc',
+            datasetId: 'emsc_realtime_events',
+            queueLane: config.queueLane,
+            maxInFlight: config.maxInFlight,
+            eventId,
+            coordinates: {
+              lat: Number(properties?.lat ?? geometry?.[1] ?? 0),
+              lon: Number(properties?.lon ?? geometry?.[0] ?? 0),
+            },
+          }
+
+          this.lastSocketEventAt = Date.now()
+          this.bufferedEvents.push(item)
+          const maxBuffered = config.maxInFlight
+          if (this.bufferedEvents.length > maxBuffered) {
+            this.bufferedEvents.splice(0, this.bufferedEvents.length - maxBuffered)
+          }
+        } catch (error) {
+          if (bsvConfig.logging.level === 'debug') {
+            console.warn('EMSC WebSocket parse error:', error)
+          }
+        }
+      })
+
+      ws.on('close', () => {
+        this.socket = null
+        this.socketConnecting = false
+        try { console.warn('⚠️ EMSC: WebSocket disconnected, will reconnect on next cycle') } catch {}
+      })
+
+      ws.on('error', (error: Error) => {
+        this.socket = null
+        this.socketConnecting = false
+        console.warn('⚠️ EMSC WebSocket error:', error.message)
+      })
+    } catch (error) {
+      this.socket = null
+      this.socketConnecting = false
+      console.warn('⚠️ Unable to initialise EMSC WebSocket:', error)
+    }
+  }
+}
+
 // Worker 4: Advanced Metrics (WeatherAPI primary, OWM fallback)
 export class AdvancedMetricsWorker extends BaseWorker {
   constructor() {
@@ -635,11 +1021,13 @@ export class AdvancedMetricsWorker extends BaseWorker {
   }
 
   protected getIntervalMs(): number {
-    const envMs = Number(process.env.ADVANCED_WORKER_INTERVAL_MS)
-    return Number.isFinite(envMs) && envMs > 0 ? envMs : 60 * 60 * 1000
+    const weatherConfig = datasetConfigs.weatherapi_advanced_metrics
+    const owmConfig = datasetConfigs.owm_advanced_metrics
+    return weatherConfig?.cadence.intervalMs || owmConfig?.cadence.intervalMs || 60 * 60 * 1000
   }
 
   protected async collectData(): Promise<EnvironmentalData[]> {
+    if (!datasetConfigs.weatherapi_advanced_metrics?.enabled && !datasetConfigs.owm_advanced_metrics?.enabled) return []
     const items: EnvironmentalData[] = []
     try {
       // Pull OWM stations by allowed countries (if configured), rotate with cursor
@@ -684,6 +1072,9 @@ export class AdvancedMetricsWorker extends BaseWorker {
         const results = await Promise.all(slice.map(async (city) => {
           const data = await this.fetchAdvancedForCity(city!)
           if (!data) return null
+          const datasetConfig = data.datasetId === 'owm_advanced_metrics'
+            ? datasetConfigs.owm_advanced_metrics
+            : datasetConfigs.weatherapi_advanced_metrics
           // Persist to DB only if enabled
           if (process.env.GAIALOG_NO_DB !== 'true') {
             try {
@@ -724,7 +1115,13 @@ export class AdvancedMetricsWorker extends BaseWorker {
               wind_deg: data.wind_deg,
             },
             source: data.source,
-            priority: 'normal',
+            priority: datasetConfig?.defaultPriority || 'normal',
+            family: 'advanced_metrics',
+            providerId: data.providerId,
+            datasetId: data.datasetId,
+            queueLane: datasetConfig?.queueLane,
+            maxInFlight: datasetConfig?.maxInFlight,
+            coordinates: data.coordinates,
           } as EnvironmentalData
         }))
         for (const r of results) if (r) items.push(r)
@@ -737,9 +1134,13 @@ export class AdvancedMetricsWorker extends BaseWorker {
 
   private async fetchAdvancedForCity(city: string): Promise<any | null> {
     if (!city || typeof city !== 'string' || city.trim().length < 2) return null
+    const coordMatch = city.trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/)
+    const coordQuery = coordMatch
+      ? { lat: Number(coordMatch[1]), lon: Number(coordMatch[2]) }
+      : null
     // WeatherAPI primary
     try {
-      if (process.env.WEATHERAPI_KEY) {
+      if (datasetConfigs.weatherapi_advanced_metrics?.enabled && process.env.WEATHERAPI_KEY) {
         const url = `https://api.weatherapi.com/v1/current.json?key=${process.env.WEATHERAPI_KEY}&q=${encodeURIComponent(city)}&aqi=no`
         const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'weatherapi' })
         const uv = data.current?.uv ?? 0
@@ -762,6 +1163,8 @@ export class AdvancedMetricsWorker extends BaseWorker {
           pressure_mb: data.current?.pressure_mb ?? undefined,
           wind_kph: data.current?.wind_kph ?? undefined,
           wind_deg: data.current?.wind_degree ?? undefined,
+          providerId: 'weatherapi',
+          datasetId: 'weatherapi_advanced_metrics',
           coordinates: (typeof data?.location?.lat === 'number' && typeof data?.location?.lon === 'number')
             ? { lat: data.location.lat, lon: data.location.lon } : undefined,
         }
@@ -777,13 +1180,15 @@ export class AdvancedMetricsWorker extends BaseWorker {
     }
     // OWM fallback (15‑min cache handled inside provider)
     try {
-      if (process.env.OWM_API_KEY) {
-        // Geocode
-        const geo = await fetchJsonWithRetry<any>(
-          `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(city)}&limit=1&appid=${process.env.OWM_API_KEY}`,
-          { retries: 2, providerId: 'owm' }
-        )
-        const first = Array.isArray(geo) ? geo[0] : null
+      if (datasetConfigs.owm_advanced_metrics?.enabled && process.env.OWM_API_KEY) {
+        let first: any = coordQuery ? { lat: coordQuery.lat, lon: coordQuery.lon, name: city } : null
+        if (!first) {
+          const geo = await fetchJsonWithRetry<any>(
+            `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(city)}&limit=1&appid=${process.env.OWM_API_KEY}`,
+            { retries: 2, providerId: 'owm' }
+          )
+          first = Array.isArray(geo) ? geo[0] : null
+        }
         if (!first?.lat || !first?.lon) return null
         const oc = await fetchJsonWithRetry<any>(
           `https://api.openweathermap.org/data/3.0/onecall?lat=${first.lat}&lon=${first.lon}&exclude=minutely,hourly,daily,alerts&units=metric&appid=${process.env.OWM_API_KEY}`,
@@ -802,9 +1207,17 @@ export class AdvancedMetricsWorker extends BaseWorker {
           soil_moisture: soil,
           wildfire_risk: wildfire,
           environmental_quality_score: eqs,
-          location: city,
+          location: first.name || city,
           timestamp: ts,
           source: 'OWM-derived metrics',
+          temperature_c: curr.temp ?? undefined,
+          humidity_pct: curr.humidity ?? undefined,
+          pressure_mb: curr.pressure ?? undefined,
+          wind_kph: windKph || undefined,
+          wind_deg: curr.wind_deg ?? undefined,
+          providerId: 'owm',
+          datasetId: 'owm_advanced_metrics',
+          coordinates: { lat: first.lat, lon: first.lon },
         }
       }
     } catch (e) {
@@ -844,16 +1257,22 @@ export class WorkerManager {
     try {
       const waqiWorker = new WAQIEnvironmentalWorker()
       const noaaWorker = new NOAAWorker()
+      const sensorCommunityWorker = new SensorCommunityWorker()
+      const noaaNdbcWorker = new NOAANdbcWorker()
       const usgsWorker = new USGSWorker()
+      const emscWorker = new EMSCRealtimeWorker()
       const advWorker = new AdvancedMetricsWorker()
 
       this.workers.set('waqi-environmental', waqiWorker)
       this.workers.set('noaa-weather', noaaWorker)
+      this.workers.set('sensor-community-air-quality', sensorCommunityWorker)
+      this.workers.set('noaa-ndbc', noaaNdbcWorker)
       this.workers.set('usgs-seismic', usgsWorker)
+      this.workers.set('emsc-realtime', emscWorker)
       this.workers.set('advanced-metrics', advWorker)
 
       this.isInitialized = true
-      try { console.log('✅ Worker Manager initialized with 4 workers') } catch {}
+      try { console.log(`✅ Worker Manager initialized with ${this.workers.size} workers`) } catch {}
     } catch (error) {
       console.error('❌ Failed to initialize Worker Manager:', error)
       this.isInitialized = false

@@ -25,7 +25,8 @@ dotenv.config({ path: path.join(process.cwd(), '.env.local') })
 dotenv.config({ path: path.join(process.cwd(), '.env') })
 
 import { JungleBusClient, ControlMessageStatusCode } from '@gorillapool/js-junglebus'
-import { addReadingsBatch, getIndexStats, type StoredReading } from '../lib/supabase-explorer'
+import { addReadingsBatch, type StoredReading } from '../lib/explorer-read-source'
+import { getIndexStats } from '../lib/supabase-explorer'
 
 // ── Configuration ────────────────────────────────────────────────────────────
 

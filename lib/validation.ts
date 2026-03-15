@@ -269,6 +269,42 @@ export class DataValidator {
     return this.buildResult(errors, warnings)
   }
 
+  validateGeomagnetism(data: Record<string, unknown>): ValidationResult {
+    return this.validateGenericScientificData(
+      data,
+      VALIDATION_RANGES.geomagnetism,
+      ['x', 'y', 'z', 'h', 'f', 'd'],
+      true,
+    )
+  }
+
+  validateVolcanicActivity(data: Record<string, unknown>): ValidationResult {
+    return this.validateGenericScientificData(
+      data,
+      VALIDATION_RANGES.volcanic_activity,
+      ['alert_level', 'eruption_probability', 'gas_flux'],
+      false,
+    )
+  }
+
+  validateSpaceWeather(data: Record<string, unknown>): ValidationResult {
+    return this.validateGenericScientificData(
+      data,
+      VALIDATION_RANGES.space_weather,
+      ['speed', 'density', 'temperature', 'bz', 'bt'],
+      false,
+    )
+  }
+
+  validateUpperAtmosphere(data: Record<string, unknown>): ValidationResult {
+    return this.validateGenericScientificData(
+      data,
+      VALIDATION_RANGES.upper_atmosphere,
+      ['temperature_c', 'humidity_pct', 'wind_kph', 'pressure_mb', 'altitude_m'],
+      true,
+    )
+  }
+
   /**
    * Validate data based on stream type
    */
@@ -283,6 +319,14 @@ export class DataValidator {
         return this.validateSeismic(data)
       case 'advanced_metrics':
         return this.validateAdvancedMetrics(data)
+      case 'geomagnetism':
+        return this.validateGeomagnetism(data)
+      case 'volcanic_activity':
+        return this.validateVolcanicActivity(data)
+      case 'space_weather':
+        return this.validateSpaceWeather(data)
+      case 'upper_atmosphere':
+        return this.validateUpperAtmosphere(data)
       default:
         // Unknown stream type - return passed with warning
         return this.buildResult([], [{
@@ -393,6 +437,48 @@ export class DataValidator {
         severity: 'warning'
       })
     }
+  }
+
+  private validateGenericScientificData(
+    data: Record<string, unknown>,
+    ranges: Record<string, { min: number; max: number; warnMin?: number; warnMax?: number }>,
+    numericFields: string[],
+    requireCoordinates: boolean,
+  ): ValidationResult {
+    const errors: ValidationError[] = []
+    const warnings: ValidationError[] = []
+
+    if (!data.location) {
+      errors.push({ field: 'location', message: 'Location is required', severity: 'error' })
+    }
+    if (!data.timestamp) {
+      errors.push({ field: 'timestamp', message: 'Timestamp is required', severity: 'error' })
+    }
+
+    for (const field of numericFields) {
+      const value = this.toNumber(data[field])
+      if (value !== null && ranges[field]) {
+        this.validateRange(field, value, ranges[field], errors, warnings)
+      }
+    }
+
+    const coords = data.coordinates as { lat?: number; lon?: number } | undefined
+    if (requireCoordinates) {
+      if (!coords || coords.lat === undefined || coords.lon === undefined) {
+        errors.push({ field: 'coordinates', message: 'Coordinates are required', severity: 'error' })
+      }
+    }
+    if (coords) {
+      if (coords.lat !== undefined && ranges.latitude) {
+        this.validateRange('latitude', coords.lat, ranges.latitude, errors, warnings)
+      }
+      if (coords.lon !== undefined && ranges.longitude) {
+        this.validateRange('longitude', coords.lon, ranges.longitude, errors, warnings)
+      }
+    }
+
+    this.validateTimestamp(data.timestamp, errors, warnings)
+    return this.buildResult(errors, warnings)
   }
 
   private buildResult(errors: ValidationError[], warnings: ValidationError[]): ValidationResult {

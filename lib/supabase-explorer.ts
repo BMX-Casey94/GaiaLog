@@ -11,6 +11,8 @@
  */
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
+import { query as dbQuery } from './db'
+import { getDataFamilyFilterValues, normaliseDataFamily } from './stream-registry'
 
 // ─── Types (same interface as the old explorer-store) ────────────────────────
 
@@ -69,8 +71,166 @@ let _client: SupabaseClient | null = null
 let _unfilteredAggregateCache: { value: AggregateResult; expiresAt: number } | null = null
 const AGGREGATE_CACHE_TTL_MS = 30000
 const AGGREGATE_SCAN_PAGE_SIZE = 1000
+const SEARCH_METRIC_KEYS = [
+  'provider_id',
+  'air_quality_index',
+  'aqi',
+  'fine_particulate_matter_pm25',
+  'pm25',
+  'coarse_particulate_matter_pm10',
+  'pm10',
+  'carbon_monoxide',
+  'co',
+  'nitrogen_dioxide',
+  'no2',
+  'ozone',
+  'o3',
+  'river_level',
+  'sea_level',
+  'level',
+  'tide_height',
+  'wave_height_m',
+  'water_temperature_c',
+  'air_temperature_c',
+  'salinity_psu',
+  'pressure_hpa',
+  'magnitude',
+  'depth',
+  'depth_km',
+  'latitude',
+  'lat',
+  'longitude',
+  'lon',
+  'uv_index',
+  'soil_moisture_pct',
+  'soil_moisture',
+  'wildfire_risk',
+  'environmental_quality_score',
+  'environmental_score',
+  'temperature_c',
+  'humidity_pct',
+  'x',
+  'y',
+  'z',
+  'h',
+  'f',
+  'd',
+  'alert_level',
+  'aviation_color_code',
+  'eruption_probability',
+  'gas_flux',
+  'speed',
+  'density',
+  'temperature',
+  'bz',
+  'bt',
+  'altitude_m',
+  'wind_kph',
+  'pressure_mb',
+] as const
+const SEARCH_METRICS_SQL = SEARCH_METRIC_KEYS
+  .map(key => `'${key}', metrics ->> '${key}'`)
+  .join(', ')
+const LOCATION_SUGGESTION_SCAN_LIMIT = Math.max(100, Number(process.env.EXPLORER_LOCATION_SAMPLE_LIMIT || 400))
+const SEARCH_CACHE_TTL_MS = Math.max(1000, Number(process.env.EXPLORER_SEARCH_CACHE_TTL_MS || 15000))
+const LOCATION_CACHE_TTL_MS = Math.max(1000, Number(process.env.EXPLORER_LOCATION_CACHE_TTL_MS || 60000))
+const SEARCH_CACHE_MAX_ENTRIES = Math.max(16, Number(process.env.EXPLORER_SEARCH_CACHE_MAX_ENTRIES || 128))
+const LOCATION_CACHE_MAX_ENTRIES = Math.max(16, Number(process.env.EXPLORER_LOCATION_CACHE_MAX_ENTRIES || 256))
 let _locationKeysTableAvailable: boolean | null = null
 let _locationKeysRetryAfterMs = 0
+let _writeBackoffUntilMs = 0
+let _writeErrorLogAt = 0
+let _suppressedWriteErrors = 0
+const WRITE_BACKOFF_MS = Number(process.env.EXPLORER_WRITE_BACKOFF_MS || 30000)
+const WRITE_ERROR_LOG_INTERVAL_MS = 15000
+const _searchResultCache = new Map<string, { value: SearchResult; expiresAt: number }>()
+const _searchResultInFlight = new Map<string, Promise<SearchResult>>()
+const _locationSuggestionCache = new Map<string, { value: LocationSuggestion[]; expiresAt: number }>()
+const _locationSuggestionInFlight = new Map<string, Promise<LocationSuggestion[]>>()
+
+function explorerWritesDisabledByEnv(): boolean {
+  return process.env.GAIALOG_DISABLE_EXPLORER_WRITES === 'true'
+}
+
+function shouldBackoffWrite(message: string): boolean {
+  return /fetch failed|network|timed out|timeout|ECONN|ENOTFOUND|502|522|bad gateway|upstream request timeout|connection pool|statement timeout/i.test(message)
+}
+
+export function canAttemptExplorerWrite(): boolean {
+  if (explorerWritesDisabledByEnv()) return false
+  return _writeBackoffUntilMs <= Date.now()
+}
+
+function logWriteError(message: string): void {
+  const now = Date.now()
+  if ((now - _writeErrorLogAt) > WRITE_ERROR_LOG_INTERVAL_MS) {
+    const suffix = _suppressedWriteErrors > 0 ? ` (suppressed ${_suppressedWriteErrors} similar errors)` : ''
+    console.error(`Explorer addReading error: ${message}${suffix}`)
+    _writeErrorLogAt = now
+    _suppressedWriteErrors = 0
+  } else {
+    _suppressedWriteErrors++
+  }
+}
+
+function pruneExpiredCacheEntries<T>(cache: Map<string, { value: T; expiresAt: number }>): void {
+  const now = Date.now()
+  for (const [key, entry] of cache.entries()) {
+    if (entry.expiresAt <= now) cache.delete(key)
+  }
+}
+
+function getCachedValue<T>(cache: Map<string, { value: T; expiresAt: number }>, key: string): T | null {
+  const entry = cache.get(key)
+  if (!entry) return null
+  if (entry.expiresAt <= Date.now()) {
+    cache.delete(key)
+    return null
+  }
+  return entry.value
+}
+
+function setCachedValue<T>(
+  cache: Map<string, { value: T; expiresAt: number }>,
+  key: string,
+  value: T,
+  ttlMs: number,
+  maxEntries: number,
+): void {
+  pruneExpiredCacheEntries(cache)
+  while (cache.size >= maxEntries) {
+    const oldestKey = cache.keys().next().value
+    if (!oldestKey) break
+    cache.delete(oldestKey)
+  }
+  cache.set(key, {
+    value,
+    expiresAt: Date.now() + ttlMs,
+  })
+}
+
+function normaliseCacheText(value: string | undefined): string {
+  return String(value || '').trim().toLowerCase()
+}
+
+function buildSearchCacheKey(params: SearchParams, page: number, pageSize: number): string {
+  return JSON.stringify({
+    q: normaliseCacheText(params.q),
+    dataType: params.dataType || '',
+    from: params.from || null,
+    to: params.to || null,
+    page,
+    pageSize,
+  })
+}
+
+function buildLocationSuggestionCacheKey(searchText: string, dataType: string | undefined, limit: number): string {
+  return JSON.stringify({
+    q: normaliseCacheText(searchText),
+    dataType: dataType || '',
+    limit,
+  })
+}
 
 function getClient(): SupabaseClient {
   if (_client) return _client
@@ -99,6 +259,7 @@ function getClient(): SupabaseClient {
  * Returns true if inserted, false if duplicate.
  */
 export async function addReading(reading: StoredReading): Promise<boolean> {
+  if (!canAttemptExplorerWrite()) return false
   const sb = getClient()
 
   const { error } = await sb.from('explorer_readings').upsert(
@@ -118,9 +279,14 @@ export async function addReading(reading: StoredReading): Promise<boolean> {
   )
 
   if (error) {
-    console.error('Explorer addReading error:', error.message)
+    const message = String(error.message || error)
+    if (shouldBackoffWrite(message)) {
+      _writeBackoffUntilMs = Date.now() + WRITE_BACKOFF_MS
+    }
+    logWriteError(message)
     return false
   }
+  _writeBackoffUntilMs = 0
   _unfilteredAggregateCache = null
   return true
 }
@@ -131,6 +297,7 @@ export async function addReading(reading: StoredReading): Promise<boolean> {
  */
 export async function addReadingsBatch(readings: StoredReading[]): Promise<number> {
   if (readings.length === 0) return 0
+  if (!canAttemptExplorerWrite()) return 0
 
   const sb = getClient()
   const BATCH_SIZE = 500 // Supabase REST limit per request
@@ -156,13 +323,19 @@ export async function addReadingsBatch(readings: StoredReading[]): Promise<numbe
       .upsert(batch, { onConflict: 'txid', ignoreDuplicates: true, count: 'exact' })
 
     if (error) {
-      console.error(`Explorer batch insert error (offset ${i}):`, error.message)
+      const message = `batch offset ${i}: ${String(error.message || error)}`
+      if (shouldBackoffWrite(message)) {
+        _writeBackoffUntilMs = Date.now() + WRITE_BACKOFF_MS
+      }
+      logWriteError(message)
+      return inserted
     } else {
       inserted += count ?? batch.length
     }
   }
 
   if (inserted > 0) {
+    _writeBackoffUntilMs = 0
     _unfilteredAggregateCache = null
   }
 
@@ -175,56 +348,95 @@ export async function addReadingsBatch(readings: StoredReading[]): Promise<numbe
  * Search readings with filters, pagination, and full-text location search.
  */
 export async function searchReadings(params: SearchParams): Promise<SearchResult> {
-  const sb = getClient()
   const page = params.page || 1
   const pageSize = Math.min(params.pageSize || 50, 500)
   const offset = (page - 1) * pageSize
+  const cacheKey = buildSearchCacheKey(params, page, pageSize)
+  const cached = getCachedValue(_searchResultCache, cacheKey)
+  if (cached) return cached
 
-  // Build query
-  let query = sb
-    .from('explorer_readings')
-    .select('*', { count: 'exact' })
+  const inFlight = _searchResultInFlight.get(cacheKey)
+  if (inFlight) return inFlight
 
-  // Location text search (uses pg_trgm gin index)
-  if (params.q && params.q.trim()) {
-    query = query.ilike('location', `%${params.q.trim()}%`)
-  }
+  const request = (async () => {
+    const whereParts: string[] = []
+    const sqlParams: any[] = []
 
-  // Data type filter
-  if (params.dataType) {
-    query = query.eq('data_type', params.dataType)
-  }
+    if (params.q && params.q.trim()) {
+      sqlParams.push(`%${params.q.trim()}%`)
+      whereParts.push(`location ILIKE $${sqlParams.length}`)
+    }
 
-  // Date range
-  if (params.from) {
-    query = query.gte('timestamp', new Date(params.from).toISOString())
-  }
-  if (params.to) {
-    query = query.lte('timestamp', new Date(params.to).toISOString())
-  }
+    if (params.dataType) {
+      sqlParams.push(params.dataType)
+      whereParts.push(`data_type = $${sqlParams.length}`)
+    }
 
-  // Order and paginate
-  query = query
-    .order('timestamp', { ascending: false })
-    .range(offset, offset + pageSize - 1)
+    if (params.from) {
+      sqlParams.push(new Date(params.from).toISOString())
+      whereParts.push(`"timestamp" >= $${sqlParams.length}`)
+    }
 
-  const { data, error, count } = await query
+    if (params.to) {
+      sqlParams.push(new Date(params.to).toISOString())
+      whereParts.push(`"timestamp" <= $${sqlParams.length}`)
+    }
 
-  if (error) {
-    console.error('Explorer search error:', error.message)
-    return { items: [], total: 0, page, pageSize, hasMore: false }
-  }
+    const whereSql = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : ''
+    sqlParams.push(pageSize, offset)
+    const limitParam = `$${sqlParams.length - 1}`
+    const offsetParam = `$${sqlParams.length}`
 
-  const total = count ?? 0
-  const items: StoredReading[] = (data || []).map(rowToReading)
+    const resultRows = await dbQuery<any>(
+      `SELECT
+         txid,
+         data_type,
+         location,
+         lat,
+         lon,
+         "timestamp",
+         provider,
+         block_height,
+         block_time,
+         jsonb_strip_nulls(jsonb_build_object(${SEARCH_METRICS_SQL})) AS metrics,
+         COUNT(*) OVER()::bigint AS total_count
+       FROM explorer_readings
+       ${whereSql}
+       ORDER BY "timestamp" DESC
+       LIMIT ${limitParam}
+       OFFSET ${offsetParam}`,
+      sqlParams,
+    )
 
-  return {
-    items,
-    total,
-    page,
-    pageSize,
-    hasMore: offset + items.length < total,
-  }
+    const rows = resultRows.rows || []
+    let total = rows.length > 0 ? Number(rows[0].total_count || 0) : 0
+    if (rows.length === 0 && offset > 0) {
+      const countResult = await dbQuery<{ total: string }>(
+        `SELECT COUNT(*)::bigint AS total
+         FROM explorer_readings
+         ${whereSql}`,
+        sqlParams.slice(0, sqlParams.length - 2),
+      )
+      total = Number(countResult.rows?.[0]?.total || 0)
+    }
+    const items: StoredReading[] = rows.map(rowToReading)
+
+    const result = {
+      items,
+      total,
+      page,
+      pageSize,
+      hasMore: offset + items.length < total,
+    }
+
+    setCachedValue(_searchResultCache, cacheKey, result, SEARCH_CACHE_TTL_MS, SEARCH_CACHE_MAX_ENTRIES)
+    return result
+  })().finally(() => {
+    _searchResultInFlight.delete(cacheKey)
+  })
+
+  _searchResultInFlight.set(cacheKey, request)
+  return request
 }
 
 /**
@@ -278,89 +490,117 @@ export async function getLocationSuggestions(
   dataType?: string,
   limit: number = 20
 ): Promise<LocationSuggestion[]> {
-  const sb = getClient()
+  const trimmedSearchText = searchText.trim()
+  if (trimmedSearchText.length < 2) return []
 
-  // Build a raw aggregation query via RPC or inline SQL
-  // Since Supabase JS doesn't support GROUP BY natively, we use an RPC
-  // Fallback: fetch distinct locations with ILIKE
-  let query = sb
-    .from('explorer_readings')
-    .select('location, data_type, lat, lon, timestamp')
-    .not('location', 'is', null)
+  const cacheKey = buildLocationSuggestionCacheKey(trimmedSearchText, dataType, limit)
+  const cached = getCachedValue(_locationSuggestionCache, cacheKey)
+  if (cached) return cached
 
-  if (searchText && searchText.trim()) {
-    query = query.ilike('location', `%${searchText.trim()}%`)
-  }
+  const inFlight = _locationSuggestionInFlight.get(cacheKey)
+  if (inFlight) return inFlight
 
-  if (dataType) {
-    query = query.eq('data_type', dataType)
-  }
+  const request = (async () => {
+    const sb = getClient()
 
-  // Fetch a reasonable sample to aggregate client-side
-  // (For millions of rows, an RPC function would be better – but this
-  //  is fast enough for autocomplete with the pg_trgm index filtering)
-  query = query
-    .order('timestamp', { ascending: false })
-    .limit(5000)
+    // Build a raw aggregation query via RPC or inline SQL
+    // Since Supabase JS doesn't support GROUP BY natively, we use an RPC
+    // Fallback: fetch distinct locations with ILIKE
+    let query = sb
+      .from('explorer_readings')
+      .select('location, data_type, lat, lon, timestamp')
+      .not('location', 'is', null)
 
-  const { data, error } = await query
+    query = query.ilike('location', `%${trimmedSearchText}%`)
 
-  if (error || !data) {
-    console.error('Explorer locations error:', error?.message)
-    return []
-  }
-
-  // Aggregate client-side
-  const statsMap = new Map<string, {
-    location: string
-    dataType: string
-    count: number
-    lastTs: number
-    latSum: number
-    lonSum: number
-    coordCount: number
-  }>()
-
-  for (const row of data) {
-    const loc = row.location as string
-    const dt = row.data_type as string
-    const key = `${loc.toLowerCase()}|${dt}`
-
-    const existing = statsMap.get(key)
-    const ts = new Date(row.timestamp).getTime()
-
-    if (existing) {
-      existing.count++
-      if (ts > existing.lastTs) existing.lastTs = ts
-      if (row.lat != null && row.lon != null) {
-        existing.latSum += row.lat
-        existing.lonSum += row.lon
-        existing.coordCount++
-      }
-    } else {
-      statsMap.set(key, {
-        location: loc,
-        dataType: dt,
-        count: 1,
-        lastTs: ts,
-        latSum: row.lat ?? 0,
-        lonSum: row.lon ?? 0,
-        coordCount: (row.lat != null && row.lon != null) ? 1 : 0,
-      })
+    const dataTypeValues = getDataFamilyFilterValues(dataType)
+    if (dataTypeValues.length === 1) {
+      query = query.eq('data_type', dataTypeValues[0])
+    } else if (dataTypeValues.length > 1) {
+      query = query.in('data_type', dataTypeValues)
     }
-  }
 
-  return Array.from(statsMap.values())
-    .map(s => ({
-      location: s.location,
-      dataType: s.dataType,
-      readingCount: s.count,
-      lastReading: s.lastTs,
-      avgLat: s.coordCount > 0 ? s.latSum / s.coordCount : null,
-      avgLon: s.coordCount > 0 ? s.lonSum / s.coordCount : null,
-    }))
-    .sort((a, b) => b.readingCount - a.readingCount)
-    .slice(0, limit)
+    // Fetch a reasonable sample to aggregate client-side
+    // (For millions of rows, an RPC function would be better – but this
+    //  is fast enough for autocomplete with the pg_trgm index filtering)
+    query = query
+      .order('timestamp', { ascending: false })
+      .limit(LOCATION_SUGGESTION_SCAN_LIMIT)
+
+    const { data, error } = await query
+
+    if (error || !data) {
+      console.error('Explorer locations error:', error?.message)
+      return []
+    }
+
+    // Aggregate client-side
+    const statsMap = new Map<string, {
+      location: string
+      dataType: string
+      count: number
+      lastTs: number
+      latSum: number
+      lonSum: number
+      coordCount: number
+    }>()
+
+    for (const row of data) {
+      const loc = row.location as string
+      const dtRaw = row.data_type as string
+      const dt = normaliseDataFamily(dtRaw) || dtRaw
+      const key = `${loc.toLowerCase()}|${dt}`
+
+      const existing = statsMap.get(key)
+      const ts = new Date(row.timestamp).getTime()
+
+      if (existing) {
+        existing.count++
+        if (ts > existing.lastTs) existing.lastTs = ts
+        if (row.lat != null && row.lon != null) {
+          existing.latSum += row.lat
+          existing.lonSum += row.lon
+          existing.coordCount++
+        }
+      } else {
+        statsMap.set(key, {
+          location: loc,
+          dataType: dt,
+          count: 1,
+          lastTs: ts,
+          latSum: row.lat ?? 0,
+          lonSum: row.lon ?? 0,
+          coordCount: (row.lat != null && row.lon != null) ? 1 : 0,
+        })
+      }
+    }
+
+    const result = Array.from(statsMap.values())
+      .map(s => ({
+        location: s.location,
+        dataType: s.dataType,
+        readingCount: s.count,
+        lastReading: s.lastTs,
+        avgLat: s.coordCount > 0 ? s.latSum / s.coordCount : null,
+        avgLon: s.coordCount > 0 ? s.lonSum / s.coordCount : null,
+      }))
+      .sort((a, b) => b.readingCount - a.readingCount)
+      .slice(0, limit)
+
+    setCachedValue(
+      _locationSuggestionCache,
+      cacheKey,
+      result,
+      LOCATION_CACHE_TTL_MS,
+      LOCATION_CACHE_MAX_ENTRIES,
+    )
+    return result
+  })().finally(() => {
+    _locationSuggestionInFlight.delete(cacheKey)
+  })
+
+  _locationSuggestionInFlight.set(cacheKey, request)
+  return request
 }
 
 /**
@@ -441,7 +681,9 @@ async function computeAggregatesDeterministic(params?: SearchParams): Promise<Ag
     }
 
     for (const row of data) {
-      const dataType = typeof row.data_type === 'string' ? row.data_type : ''
+      const dataType = typeof row.data_type === 'string'
+        ? (normaliseDataFamily(row.data_type) || row.data_type)
+        : ''
       if (dataType) {
         byType[dataType] = (byType[dataType] || 0) + 1
       }
@@ -485,8 +727,11 @@ function applySearchFilters(query: any, params?: SearchParams): any {
     query = query.ilike('location', `%${params.q.trim()}%`)
   }
 
-  if (params.dataType) {
-    query = query.eq('data_type', params.dataType)
+  const dataTypeValues = getDataFamilyFilterValues(params.dataType)
+  if (dataTypeValues.length === 1) {
+    query = query.eq('data_type', dataTypeValues[0])
+  } else if (dataTypeValues.length > 1) {
+    query = query.in('data_type', dataTypeValues)
   }
 
   if (params.from) {
@@ -518,7 +763,7 @@ export async function getIndexStats(): Promise<{
 
   const { count } = await sb
     .from('explorer_readings')
-    .select('*', { count: 'exact', head: true })
+    .select('txid', { count: 'planned', head: true })
 
   const { data: lastBlockRow } = await sb
     .from('explorer_readings')
@@ -538,14 +783,22 @@ export async function getIndexStats(): Promise<{
 
 /** Convert a Supabase row to our StoredReading interface */
 function rowToReading(row: any): StoredReading {
+  const dataType = typeof row.data_type === 'string'
+    ? (normaliseDataFamily(row.data_type) || row.data_type)
+    : row.data_type
+  const metrics = row.metrics && typeof row.metrics === 'object' ? { ...row.metrics } : {}
+  if (metrics.lat == null && row.lat != null) metrics.lat = row.lat
+  if (metrics.lon == null && row.lon != null) metrics.lon = row.lon
+  if (metrics.latitude == null && row.lat != null) metrics.latitude = row.lat
+  if (metrics.longitude == null && row.lon != null) metrics.longitude = row.lon
   return {
     txid: row.txid,
-    dataType: row.data_type,
+    dataType,
     location: row.location,
     lat: row.lat,
     lon: row.lon,
     timestamp: new Date(row.timestamp).getTime(),
-    metrics: row.metrics || {},
+    metrics,
     provider: row.provider,
     blockHeight: row.block_height,
     blockTime: row.block_time ? new Date(row.block_time).getTime() : null,

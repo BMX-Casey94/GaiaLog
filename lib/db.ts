@@ -1,4 +1,10 @@
-import { Pool } from 'pg'
+import { Pool, type QueryResultRow as PgQueryResultRow } from 'pg'
+
+export interface QueryResult<T = any> {
+  rows: T[]
+  rowCount: number
+  command: string
+}
 
 // SSL configuration for Supabase
 // For localhost, disable SSL. For Supabase, use proper SSL with rejectUnauthorized: false
@@ -17,26 +23,30 @@ const connectionConfig = {
   connectionTimeoutMillis: 10000,
 }
 
-const shouldUseSSL = isSupabase
+const shouldUseSSL = !!isSupabase
 const DB_DISABLED = process.env.GAIALOG_NO_DB === 'true'
 let dbWarned = false
 
 // Keep the pool initialized so we can re-enable later without code churn.
 export const dbPool = new Pool(connectionConfig)
 
-export async function query<T = any>(text: string, params?: any[]): Promise<{ rows: T[] }> {
+export async function query<T extends PgQueryResultRow = any>(text: string, params?: any[]): Promise<QueryResult<T>> {
   // Temporary DB disable switch - non-destructive. Returns empty rows.
   if (DB_DISABLED) {
     if (!dbWarned) {
       console.warn('🗄️ Database disabled via GAIALOG_NO_DB=true. All queries return empty rows.')
       dbWarned = true
     }
-    return { rows: [] as any }
+    return { rows: [] as any, rowCount: 0, command: 'DISABLED' }
   }
   const client = await dbPool.connect()
   try {
     const res = await client.query<T>(text, params)
-    return { rows: res.rows }
+    return {
+      rows: res.rows,
+      rowCount: typeof res.rowCount === 'number' ? res.rowCount : res.rows.length,
+      command: res.command || 'UNKNOWN',
+    }
   } finally {
     client.release()
   }

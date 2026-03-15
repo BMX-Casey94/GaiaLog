@@ -11,6 +11,8 @@
  */
 
 import { autoInitializeWorkers } from './worker-auto-init'
+import { getMutatorControlState, logMutatorSkip } from './mutator-control'
+import { getRuntimeControlState, logWorkerProcessSkip } from './runtime-control'
 
 // Persist the bootstrap guard on globalThis so Next.js dev-mode
 // module re-evaluation does not reset it and re-run the bootstrap.
@@ -36,13 +38,13 @@ async function bootstrapWorkers() {
         console.log('✅ Worker bootstrap completed successfully')
       } else {
         console.warn('⚠️ Worker bootstrap failed:', result.error)
-        console.warn('⚠️ Workers can be manually started via /api/workers/auto-start')
+        console.warn('⚠️ Start the dedicated worker via scripts/run-workers.ts or the VPS process manager.')
         // Allow retry on next module evaluation if it failed
         ;(globalThis as any)[BOOTSTRAP_KEY] = false
       }
     } catch (error) {
       console.error('❌ Worker bootstrap error:', error)
-      console.warn('⚠️ Workers can be manually started via /api/workers/auto-start')
+      console.warn('⚠️ Start the dedicated worker via scripts/run-workers.ts or the VPS process manager.')
       ;(globalThis as any)[BOOTSTRAP_KEY] = false
     }
   }, 2000) // 2 second delay to allow app initialization
@@ -52,9 +54,20 @@ async function bootstrapWorkers() {
 if (typeof process !== 'undefined' && process.versions?.node) {
   // Only bootstrap if not in build process
   if (process.env.NEXT_PHASE !== 'phase-production-build') {
-    // Mirror standalone worker behavior so API gates allow writes
-    try { process.env.GAIALOG_WORKER_PROCESS = '1' } catch {}
-    bootstrapWorkers()
+    const runtimeControl = getRuntimeControlState()
+    if (!runtimeControl.workerProcessEnabled) {
+      logWorkerProcessSkip('worker-bootstrap')
+    } else {
+      const mutatorControl = getMutatorControlState()
+      if (!mutatorControl.mutatorsEnabled) {
+        logMutatorSkip('worker-bootstrap')
+      } else {
+        // Mirror standalone worker behaviour in combined Node runtimes
+        // so background collectors are allowed to write on-chain.
+        try { process.env.GAIALOG_WORKER_PROCESS = '1' } catch {}
+        bootstrapWorkers()
+      }
+    }
   }
 }
 

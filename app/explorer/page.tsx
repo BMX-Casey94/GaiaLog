@@ -27,6 +27,8 @@ import {
   Hash,
   Layers
 } from "lucide-react"
+import { getKeyMetrics } from "@/lib/family-metrics"
+import { DATA_FAMILY_DESCRIPTORS, resolveAttributionText } from "@/lib/stream-registry"
 
 // Types
 interface ExplorerReading {
@@ -63,17 +65,33 @@ interface LocationSuggestion {
   location: string
   dataType: string
   readingCount: number
-  lastReading: string
-  coordinates: { lat: number; lon: number } | null
 }
 
-// Metric type labels, icons, and glow colours
-const DATA_TYPE_CONFIG: Record<string, { label: string; icon: React.ElementType; color: string; glowColor: 'blue' | 'cyan' | 'orange' | 'purple'; accent: string }> = {
-  air_quality: { label: "Air Quality", icon: Database, color: "blue", glowColor: "blue", accent: "text-blue-400" },
-  water_levels: { label: "Water Levels", icon: Droplets, color: "cyan", glowColor: "cyan", accent: "text-cyan-400" },
-  seismic_activity: { label: "Seismic Activity", icon: Activity, color: "orange", glowColor: "orange", accent: "text-orange-400" },
-  advanced_metrics: { label: "Advanced Metrics", icon: Thermometer, color: "purple", glowColor: "purple", accent: "text-purple-400" },
+const FAMILY_ICON_MAP: Record<string, React.ElementType> = {
+  Database,
+  Droplets,
+  Activity,
+  Thermometer,
+  Magnet: Globe,
+  Mountain: Layers,
+  Orbit: Globe,
+  Cloud: Globe,
 }
+
+const DATA_TYPE_CONFIG: Record<string, { label: string; icon: React.ElementType; color: string; glowColor: 'blue' | 'purple' | 'green' | 'red' | 'orange' | 'cyan'; accent: string }> = Object.fromEntries(
+  Object.entries(DATA_FAMILY_DESCRIPTORS).map(([key, descriptor]) => [
+    key,
+    {
+      label: descriptor.label,
+      icon: FAMILY_ICON_MAP[descriptor.icon] || Database,
+      color: descriptor.color === 'emerald' ? 'green' : descriptor.color === 'rose' ? 'red' : descriptor.color === 'indigo' ? 'purple' : descriptor.color === 'sky' ? 'cyan' : descriptor.color,
+      glowColor: descriptor.glowColor === 'blue' || descriptor.glowColor === 'purple' || descriptor.glowColor === 'green' || descriptor.glowColor === 'red' || descriptor.glowColor === 'orange' || descriptor.glowColor === 'cyan'
+        ? descriptor.glowColor
+        : 'purple',
+      accent: descriptor.accent,
+    },
+  ]),
+)
 
 // Format timestamp for display
 function formatTimestamp(ts: string): { date: string; time: string } {
@@ -84,122 +102,8 @@ function formatTimestamp(ts: string): { date: string; time: string } {
   }
 }
 
-// Format metric value
-function formatMetricValue(key: string, value: any): string {
-  if (value === null || value === undefined) return '-'
-  if (typeof value === 'number') {
-    if (key.includes('lat') || key.includes('lon') || key.includes('latitude') || key.includes('longitude')) {
-      return value.toFixed(4)
-    }
-    return value.toFixed(2)
-  }
-  return String(value)
-}
-
-// Safely extract a numeric metric, returning null when absent
-function num(metrics: Record<string, any>, ...keys: string[]): number | null {
-  for (const k of keys) {
-    const v = metrics[k]
-    if (v !== null && v !== undefined && Number.isFinite(Number(v))) return Number(v)
-  }
-  return null
-}
-
-// Convert km to miles (USGS depth arrives in km)
-function kmToMiles(km: number | null): number | null {
-  return km !== null ? km * 0.621371 : null
-}
-
-/**
- * Build the key metrics array for each data type.
- *
- * Field name priority: on-chain renamed field first, then original worker field.
- * - Air Quality:       renamed (air_quality_index, fine_particulate_matter_pm25 …) → originals (aqi, pm25 …)
- * - Water Levels:      no renaming – fields as-is from NOAA worker
- * - Seismic Activity:  no renaming – depth arrives in km, converted to miles
- * - Advanced Metrics:  no renaming – soil_moisture is 0-1, multiplied to %
- */
-function getKeyMetrics(dataType: string, m: Record<string, any>): Array<{ label: string; value: string }> {
-  switch (dataType) {
-    case 'air_quality': {
-      const aqi   = num(m, 'air_quality_index', 'aqi')
-      const pm25  = num(m, 'fine_particulate_matter_pm25', 'pm25')
-      const pm10  = num(m, 'coarse_particulate_matter_pm10', 'pm10')
-      const co    = num(m, 'carbon_monoxide', 'co')
-      const no2   = num(m, 'nitrogen_dioxide', 'no2')
-      const o3    = num(m, 'ozone', 'o3')
-      return [
-        aqi  !== null ? { label: 'AQI',  value: aqi.toFixed(0) } : null,
-        pm25 !== null ? { label: 'PM2.5', value: `${pm25.toFixed(1)} µg/m³` } : null,
-        pm10 !== null ? { label: 'PM10',  value: `${pm10.toFixed(1)} µg/m³` } : null,
-        co   !== null ? { label: 'CO',    value: co.toFixed(2) } : null,
-        no2  !== null ? { label: 'NO₂',   value: no2.toFixed(2) } : null,
-        o3   !== null ? { label: 'O₃',    value: o3.toFixed(2) } : null,
-      ].filter(Boolean) as Array<{ label: string; value: string }>
-    }
-
-    case 'water_levels': {
-      const level    = num(m, 'river_level', 'sea_level', 'level')
-      const tide     = num(m, 'tide_height')
-      const temp     = num(m, 'water_temperature_c')
-      const salinity = num(m, 'salinity_psu')
-      const doVal    = num(m, 'dissolved_oxygen_mg_l')
-      const turb     = num(m, 'turbidity_ntu')
-      return [
-        level    !== null ? { label: 'Level',    value: `${level.toFixed(2)} m` } : null,
-        tide     !== null ? { label: 'Tide',     value: `${tide.toFixed(2)} m` } : null,
-        temp     !== null ? { label: 'Temp',     value: `${temp.toFixed(1)} °C` } : null,
-        salinity !== null ? { label: 'Salinity', value: `${salinity.toFixed(1)} PSU` } : null,
-        doVal    !== null ? { label: 'DO',       value: `${doVal.toFixed(1)} mg/L` } : null,
-        turb     !== null ? { label: 'Turbidity', value: `${turb.toFixed(1)} NTU` } : null,
-      ].filter(Boolean) as Array<{ label: string; value: string }>
-    }
-
-    case 'seismic_activity': {
-      const mag      = num(m, 'magnitude')
-      const depthKm  = num(m, 'depth')
-      const depthMi  = kmToMiles(depthKm)
-      const lat      = num(m, 'latitude', 'lat')
-      const lon      = num(m, 'longitude', 'lon')
-      return [
-        mag     !== null ? { label: 'Magnitude', value: `${mag.toFixed(1)} M` } : null,
-        depthMi !== null ? { label: 'Depth',     value: `${depthMi.toFixed(1)} mi` } : null,
-        lat     !== null ? { label: 'Latitude',  value: lat.toFixed(4) } : null,
-        lon     !== null ? { label: 'Longitude', value: lon.toFixed(4) } : null,
-      ].filter(Boolean) as Array<{ label: string; value: string }>
-    }
-
-    case 'advanced_metrics': {
-      const uv        = num(m, 'uv_index')
-      // soil_moisture arrives as 0-1 fraction; convert to percentage
-      const soilRaw   = num(m, 'soil_moisture_pct', 'soil_moisture')
-      const soilPct   = soilRaw !== null ? (soilRaw <= 1 ? soilRaw * 100 : soilRaw) : null
-      const wildfire   = num(m, 'wildfire_risk')
-      const envScore   = num(m, 'environmental_quality_score', 'environmental_score')
-      const temp       = num(m, 'temperature_c')
-      const humidity   = num(m, 'humidity_pct')
-      return [
-        uv       !== null ? { label: 'UV Index',      value: uv.toFixed(1) } : null,
-        soilPct  !== null ? { label: 'Soil Moisture',  value: `${soilPct.toFixed(0)}%` } : null,
-        wildfire !== null ? { label: 'Wildfire Risk',  value: `${wildfire.toFixed(0)}/10` } : null,
-        envScore !== null ? { label: 'Env Score',      value: `${envScore.toFixed(0)}/100` } : null,
-        temp     !== null ? { label: 'Temp',           value: `${temp.toFixed(1)} °C` } : null,
-        humidity !== null ? { label: 'Humidity',       value: `${humidity.toFixed(0)}%` } : null,
-      ].filter(Boolean) as Array<{ label: string; value: string }>
-    }
-
-    default:
-      return Object.entries(m)
-        .filter(([, v]) => v !== null && v !== undefined && typeof v !== 'object')
-        .slice(0, 6)
-        .map(([k, v]) => ({
-          label: k.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-          value: formatMetricValue(k, v)
-        }))
-  }
-}
-
 export default function ExplorerPage() {
+  const MAX_STATS_POLL_ATTEMPTS = 5
   // Search state
   const [searchQuery, setSearchQuery] = useState("")
   const [suggestions, setSuggestions] = useState<LocationSuggestion[]>([])
@@ -207,6 +111,7 @@ export default function ExplorerPage() {
   const searchRef = useRef<HTMLDivElement>(null)
   const inputWrapperRef = useRef<HTMLDivElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
+  const suggestionCacheRef = useRef<Map<string, LocationSuggestion[]>>(new Map())
   const [dropdownStyle, setDropdownStyle] = useState<React.CSSProperties | null>(null)
   const repositionRafRef = useRef<number | null>(null)
   const suppressAutoSearchUntilRef = useRef<number>(0)
@@ -232,21 +137,37 @@ export default function ExplorerPage() {
   
   // Fetch location suggestions
   const fetchSuggestions = useCallback(async (query: string) => {
-    if (query.length < 2) {
+    const trimmedQuery = query.trim()
+    if (trimmedQuery.length < 2) {
       setSuggestions([])
       return
     }
-    
+
+    const cacheKey = `${selectedType || 'all'}:${trimmedQuery.toLowerCase()}`
+    const cached = suggestionCacheRef.current.get(cacheKey)
+    if (cached) {
+      setSuggestions(cached)
+      return
+    }
+
     try {
-      const res = await fetch(`/api/explorer/locations?q=${encodeURIComponent(query)}&limit=10`)
+      const params = new URLSearchParams({
+        q: trimmedQuery,
+        limit: '10',
+      })
+      if (selectedType) params.set('type', selectedType)
+
+      const res = await fetch(`/api/explorer/locations?${params.toString()}`)
       const data = await res.json()
       if (data.success) {
-        setSuggestions(data.data.suggestions)
+        const nextSuggestions = data.data.suggestions
+        suggestionCacheRef.current.set(cacheKey, nextSuggestions)
+        setSuggestions(nextSuggestions)
       }
     } catch (e) {
       console.error('Failed to fetch suggestions:', e)
     }
-  }, [])
+  }, [selectedType])
   
   // Debounce suggestions
   useEffect(() => {
@@ -391,6 +312,7 @@ export default function ExplorerPage() {
   useEffect(() => {
     let cancelled = false
     let retryTimer: ReturnType<typeof setTimeout> | null = null
+    let attempts = 0
 
     async function fetchStats() {
       try {
@@ -426,8 +348,9 @@ export default function ExplorerPage() {
 
     async function pollStatsUntilReady() {
       if (cancelled) return
+      attempts++
       const hasLocations = await fetchStats()
-      if (!cancelled && !hasLocations) {
+      if (!cancelled && !hasLocations && attempts < MAX_STATS_POLL_ATTEMPTS) {
         retryTimer = setTimeout(pollStatsUntilReady, 4000)
       }
     }
@@ -748,6 +671,7 @@ export default function ExplorerPage() {
                   const Icon = config.icon
                   const { date, time } = formatTimestamp(item.timestamp)
                   const keyMetrics = getKeyMetrics(item.dataType, item.metrics)
+                  const attributionText = resolveAttributionText(item.metrics?.provider_id, item.provider)
                   
                   return (
                     <GlowCard 
@@ -793,6 +717,12 @@ export default function ExplorerPage() {
                           ))}
                         </div>
                       </div>
+
+                      {attributionText ? (
+                        <div className="pt-2 text-[10px] text-slate-500 leading-relaxed">
+                          Attribution: {attributionText}
+                        </div>
+                      ) : null}
                       
                       {/* Card Footer Bar (matches live-dashboard cards) */}
                       <div className="flex items-center justify-between -mx-4 -mb-4 px-4 py-2.5 border-t border-slate-700/30">

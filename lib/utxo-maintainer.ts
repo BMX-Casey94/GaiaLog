@@ -3,6 +3,8 @@ import * as bsv from 'bsv'
 // BSV has no protocol-enforced dust limit — override the BTC-inherited default
 ;(bsv.Transaction as any).DUST_AMOUNT = 1
 import { bsvConfig } from './bsv-config'
+import { getMutatorControlState, logMutatorSkip } from './mutator-control'
+import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress } from './spend-source'
 
 const NET = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY || ''
@@ -12,10 +14,11 @@ const TAAL_ARC_ENDPOINT = (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com
 const ARC_KEY = process.env.BSV_ARC_API_KEY || ''
 
 // ─── Auto-sizing from expected throughput ───────────────────────────────────
-// 150,000 TX/day across 3 wallets ≈ 50,000 TX/wallet/day.
-// With 2-confirmation policy (~20 min), each wallet needs inventory for ~700 TXs + headroom.
+// 2,000,000 TX/day across 3 wallets ≈ 666,667 TX/wallet/day.
+// With a ~20 minute confirmation window, each wallet needs materially higher
+// inventory until the admission-driven splitter replaces this legacy auto-sizing.
 // Users can override via env vars; otherwise we auto-calculate from BSV_EXPECTED_TX_PER_DAY.
-const EXPECTED_TX_PER_DAY = Number(process.env.BSV_EXPECTED_TX_PER_DAY || 150000)
+const EXPECTED_TX_PER_DAY = Number(process.env.BSV_EXPECTED_TX_PER_DAY || 2000000)
 const WALLET_COUNT = Math.max(1, (bsvConfig?.wallets?.privateKeys || []).filter(k => !!k).length)
 const CONFIRMATION_WINDOW_SECS = Number(process.env.BSV_CONFIRMATION_WINDOW_SECS || 1200) // ~20 min (2 blocks)
 const AUTO_TARGET = Math.ceil((EXPECTED_TX_PER_DAY / WALLET_COUNT / 86400) * CONFIRMATION_WINDOW_SECS * 1.5) // 1.5x headroom
@@ -84,6 +87,10 @@ function isSplitInputHeld(address: string, utxoKey: string): boolean {
     return false
   }
   return true
+}
+
+export function isWalletSplitInputHeld(address: string, utxoKey: string): boolean {
+  return isSplitInputHeld(address, utxoKey)
 }
 
 function reserveSplitInputHold(address: string, utxoKey: string): void {
@@ -205,6 +212,50 @@ function p2pkhScriptHexFromWif(wif: string): string {
   return '76a914' + pubKeyHash + '88ac'
 }
 
+async function getSpendableInventoryCount(address: string, legacyConfirmedCount: number): Promise<number> {
+  const walletIndex = getWalletIndexForAddress(address)
+  if (walletIndex == null) return legacyConfirmedCount
+
+  try {
+    return await getSpendSourceForWallet(walletIndex).countSpendable({
+      topic: getTreasuryTopicForWallet(walletIndex),
+      minSatoshis: 0,
+      excludeReserved: false,
+      confirmedOnly: true,
+      allowDegradedStale: true,
+    })
+  } catch {
+    return legacyConfirmedCount
+  }
+}
+
+async function submitSplitToSpendSource(
+  address: string,
+  txid: string,
+  rawTx: string,
+  scriptHex: string,
+  inputSource: any,
+): Promise<void> {
+  const walletIndex = getWalletIndexForAddress(address)
+  if (walletIndex == null) return
+
+  await getSpendSourceForWallet(walletIndex).submitAcceptedTx({
+    clientRequestId: txid,
+    topics: [getTreasuryTopicForWallet(walletIndex)],
+    requireAllHostAcks: true,
+    rawTxEnvelope: {
+      txid,
+      rawTx,
+      acceptedVia: 'splitter',
+      broadcastedAt: new Date().toISOString(),
+      prevouts: [{
+        lockingScript: scriptHex,
+        satoshis: Number(inputSource?.value || 0),
+      }],
+    },
+  })
+}
+
 // ─── Core split logic ───────────────────────────────────────────────────────
 async function topUpWallet(wif: string): Promise<{ txid: string; address: string; outputs: number } | null> {
   const sdk = SDKPrivateKey.fromWif(wif)
@@ -225,7 +276,7 @@ async function topUpWallet(wif: string): Promise<{ txid: string; address: string
     const conf = (u.confirmations || 0) === 0
     return byHeight || conf
   })
-  const count = confirmed.length
+  const count = await getSpendableInventoryCount(address, confirmed.length)
 
   // If a split was recently broadcast for this address, wait for cooldown or confirmation
   const pendingUntil = maintState.pendingSplitUntilByAddress.get(address) || 0
@@ -322,6 +373,12 @@ async function doSplit(
   try {
     const txid = await broadcastWithFallbacks(raw)
     maintState.pendingSplitUntilByAddress.set(address, Date.now() + SPLIT_COOLDOWN_MS)
+    try {
+      await submitSplitToSpendSource(address, txid, raw, scriptHex, inputSource)
+    } catch (submitError) {
+      const message = submitError instanceof Error ? submitError.message : String(submitError)
+      console.warn(`⚠️ Split overlay submit failed for ${txid.substring(0, 12)}...: ${message}`)
+    }
     // Keep reservations on success for a short hold period; indexers may still
     // report the spent UTXO for a while, and immediate reuse causes doublespends.
     return { txid, address, outputs: outputCount }
@@ -417,6 +474,11 @@ export function clearWalletBackoff(address: string): void {
 const UTXO_MAINTAINER_KEY = '__GAIALOG_UTXO_MAINTAINER_STARTED__' as const
 
 export function startUtxoMaintainer(): void {
+  const mutatorControl = getMutatorControlState()
+  if (!mutatorControl.mutatorsEnabled) {
+    logMutatorSkip('utxo-maintainer')
+    return
+  }
   const disabled = process.env.BSV_UTXO_MAINTAINER_DISABLED === 'true'
   if (disabled) return
 

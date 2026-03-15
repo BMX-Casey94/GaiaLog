@@ -5,6 +5,7 @@
 
 import { PrivateKey } from '@bsv/sdk'
 import { bsvConfig } from './bsv-config'
+import { normaliseDataFamily, resolveProviderIdFromSource } from './stream-registry'
 
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY
 
@@ -21,7 +22,7 @@ const WOC_LATEST_MAX_CANDIDATES = Math.max(WOC_LATEST_MIN_CANDIDATES, Number(pro
 const WOC_LATEST_CACHE_TTL_MS = Math.max(3000, Number(process.env.BSV_WOC_LATEST_CACHE_TTL_MS || 20000))
 const WOC_LATEST_NEGATIVE_CACHE_TTL_MS = Math.max(1000, Number(process.env.BSV_WOC_LATEST_NEGATIVE_CACHE_TTL_MS || 5000))
 
-type LatestByTypeResult = { data_type: string; payload: any; timestamp: number; provider?: string; txid: string } | null
+type LatestByTypeResult = { data_type: string; payload: any; timestamp: number; provider?: string; provider_id?: string; dataset_id?: string; txid: string } | null
 type LatestByTypeCacheEntry = { ts: number; value: LatestByTypeResult; inFlight: Promise<LatestByTypeResult> | null }
 const latestByTypeCache = new Map<string, LatestByTypeCacheEntry>()
 
@@ -287,6 +288,8 @@ export async function fetchTxOpReturn(
       payload: parsed?.payload || {},
       timestamp: parsed?.timestamp || Date.now(),
       provider: parsed?.provider,
+      provider_id: parsed?.provider_id || parsed?.payload?.provider_id || resolveProviderIdFromSource(parsed?.provider),
+      dataset_id: parsed?.dataset_id || parsed?.payload?.dataset_id,
     }
   } catch (error: any) {
     if (process.env.NODE_ENV === 'development') {
@@ -301,14 +304,16 @@ export async function fetchTxOpReturn(
  */
 export async function findLatestByType(
   network: 'main' | 'test',
-  dataType: 'air_quality' | 'water_levels' | 'seismic_activity' | 'advanced_metrics',
-  maxCandidatesPerWallet: number = 20 // Increased to 20 to find all data types (still fast)
-): Promise<{ data_type: string; payload: any; timestamp: number; provider?: string; txid: string } | null> {
+  dataType: string,
+  maxCandidatesPerWallet: number = 20,
+  filters?: { providerId?: string; datasetId?: string },
+): Promise<{ data_type: string; payload: any; timestamp: number; provider?: string; provider_id?: string; dataset_id?: string; txid: string } | null> {
+  const normalizedType = normaliseDataFamily(dataType) || dataType
   const effectiveCandidates = Math.min(
     WOC_LATEST_MAX_CANDIDATES,
     Math.max(WOC_LATEST_MIN_CANDIDATES, maxCandidatesPerWallet || WOC_LATEST_MIN_CANDIDATES)
   )
-  const cacheKey = `${network}:${dataType}:${effectiveCandidates}`
+  const cacheKey = `${network}:${normalizedType}:${effectiveCandidates}:${filters?.providerId || ''}:${filters?.datasetId || ''}`
   const now = Date.now()
   const cached = latestByTypeCache.get(cacheKey)
   if (cached && cached.inFlight) return cached.inFlight
@@ -324,15 +329,18 @@ export async function findLatestByType(
     return null
   }
   
-  // Map of data_type variations (handle legacy/alternate names)
   const dataTypeVariations: Record<string, string[]> = {
     'air_quality': ['air_quality'],
     'water_levels': ['water_levels', 'water'], // Handle both
     'seismic_activity': ['seismic_activity', 'seismic'],
     'advanced_metrics': ['advanced_metrics'],
+    'geomagnetism': ['geomagnetism'],
+    'volcanic_activity': ['volcanic_activity', 'volcanic'],
+    'space_weather': ['space_weather', 'space-weather'],
+    'upper_atmosphere': ['upper_atmosphere', 'upper-atmosphere'],
   }
   
-  const validTypes = dataTypeVariations[dataType] || [dataType]
+  const validTypes = dataTypeVariations[normalizedType] || [normalizedType]
   
   // Search wallets in order, but stop as soon as we find a match
   // This minimizes API calls and prevents timeout
@@ -346,7 +354,7 @@ export async function findLatestByType(
       }
       
       const candidates = txs.slice(0, effectiveCandidates)
-      console.log(`[WoC] Checking ${candidates.length} transactions from wallet ${addr.substring(0, 10)}... for type ${dataType}`)
+      console.log(`[WoC] Checking ${candidates.length} transactions from wallet ${addr.substring(0, 10)}... for type ${normalizedType}`)
       
       // Check transactions one by one, stop on first match
       for (const t of candidates) {
@@ -355,7 +363,10 @@ export async function findLatestByType(
           if (decoded) {
             // Check if data_type matches (including variations)
             if (validTypes.includes(decoded.data_type)) {
-              console.log(`[WoC] Found ${dataType} transaction: ${t.tx_hash.substring(0, 12)}...`)
+              const decodedProviderId = decoded.provider_id || resolveProviderIdFromSource(decoded.provider)
+              if (filters?.providerId && decodedProviderId !== filters.providerId) continue
+              if (filters?.datasetId && decoded.dataset_id !== filters.datasetId) continue
+              console.log(`[WoC] Found ${normalizedType} transaction: ${t.tx_hash.substring(0, 12)}...`)
               return {
                 ...decoded,
                 txid: t.tx_hash,
@@ -374,7 +385,7 @@ export async function findLatestByType(
     }
   }
   
-  console.log(`[WoC] No ${dataType} transactions found across ${addresses.length} wallet(s)`)
+  console.log(`[WoC] No ${normalizedType} transactions found across ${addresses.length} wallet(s)`)
   return null
   })()
 

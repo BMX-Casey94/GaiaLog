@@ -8,6 +8,7 @@
     "dev": "next dev",
     "lint": "next lint",
     "start": "next start",
+    "overlay": "tsx scripts/run-overlay-server.ts",
     "workers": "tsx scripts/run-workers.ts",
     "db:migrate": "tsx scripts/migrate.ts",
     "db:optimize": "tsx scripts/optimize-tx-log.ts",
@@ -20,6 +21,7 @@
     "explorer:addresses": "tsx scripts/show-wallet-addresses.ts"
   },
   "dependencies": {
+    "@bsv/auth-express-middleware": "^2.0.4",
     "@bsv/sdk": "^1.6.24",
     "@emotion/is-prop-valid": "latest",
     "@gorillapool/js-junglebus": "^0.4.4",
@@ -64,6 +66,7 @@
     "date-fns": "4.1.0",
     "dotenv": "^17.2.2",
     "embla-carousel-react": "8.5.1",
+    "express": "^5.2.1",
     "framer-motion": "latest",
     "geist": "^1.3.1",
     "input-otp": "1.4.1",
@@ -86,6 +89,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.9",
+    "@types/express": "^5.0.6",
     "@types/node": "^22",
     "@types/pg": "^8.15.5",
     "@types/react": "^19",

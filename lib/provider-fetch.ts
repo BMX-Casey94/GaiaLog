@@ -11,12 +11,14 @@ export interface FetchOptions {
   retries?: number
   baseBackoffMs?: number
   maxBackoffMs?: number
+  timeoutMs?: number
   metrics?: FetchMetrics
   headers?: Record<string, string>
   etagKey?: string // cache key for ETag
   lastModifiedKey?: string // cache key for Last-Modified
   providerId?: string // optional provider id for per-provider budgets
   tokens?: number // optional token cost (default 1)
+  jsonFallbackValue?: unknown // optional fallback for persistently malformed JSON bodies
 }
 
 function sleep(ms: number): Promise<void> {
@@ -31,11 +33,19 @@ function jitter(ms: number): number {
 const etagCache = new Map<string, string>()
 const lastModCache = new Map<string, string>()
 
-export async function fetchJsonWithRetry<T = any>(url: string, opts: FetchOptions = {}): Promise<T> {
+class JsonBodyParseError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'JsonBodyParseError'
+  }
+}
+
+async function fetchWithRetry<T>(url: string, opts: FetchOptions, parse: (response: Response) => Promise<T>): Promise<T> {
   const {
     retries = 3,
     baseBackoffMs = 500,
     maxBackoffMs = 8000,
+    timeoutMs = 15000,
     metrics,
     headers = {},
     etagKey,
@@ -59,12 +69,17 @@ export async function fetchJsonWithRetry<T = any>(url: string, opts: FetchOption
       }
     }
     const start = Date.now()
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
     try {
       const reqHeaders: Record<string, string> = { ...headers }
       if (etagKey && etagCache.has(etagKey)) reqHeaders['If-None-Match'] = etagCache.get(etagKey) as string
       if (lastModifiedKey && lastModCache.has(lastModifiedKey)) reqHeaders['If-Modified-Since'] = lastModCache.get(lastModifiedKey) as string
 
-      const res = await fetch(url, { headers: reqHeaders })
+      const controller = new AbortController()
+      if (timeoutMs > 0) {
+        timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+      }
+      const res = await fetch(url, { headers: reqHeaders, signal: controller.signal })
       if (providerId) {
         await budgetStore.consume(providerId, tokens)
       }
@@ -81,7 +96,7 @@ export async function fetchJsonWithRetry<T = any>(url: string, opts: FetchOption
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`)
       }
-      const data = (await res.json()) as T
+      const data = await parse(res)
       // Capture validators
       if (etagKey) {
         const et = res.headers.get('ETag')
@@ -104,9 +119,40 @@ export async function fetchJsonWithRetry<T = any>(url: string, opts: FetchOption
       metrics?.onBackoff?.({ url, attempt, delayMs: delay })
       fetchMetricsStore.recordBackoff(url)
       await sleep(delay)
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId)
     }
   }
   throw lastError
+}
+
+export async function fetchJsonWithRetry<T = any>(url: string, opts: FetchOptions = {}): Promise<T> {
+  try {
+    return await fetchWithRetry(url, opts, async (response) => {
+      const bodyText = await response.text()
+      const trimmed = bodyText.trim()
+      if (!trimmed) {
+        throw new JsonBodyParseError('Empty JSON response body')
+      }
+
+      try {
+        return JSON.parse(trimmed) as T
+      } catch (error) {
+        const preview = trimmed.replace(/\s+/g, ' ').slice(0, 200)
+        const detail = error instanceof Error ? error.message : String(error)
+        throw new JsonBodyParseError(`Malformed JSON response body (${detail})${preview ? `: ${preview}` : ''}`)
+      }
+    })
+  } catch (error) {
+    if (error instanceof JsonBodyParseError && Object.prototype.hasOwnProperty.call(opts, 'jsonFallbackValue')) {
+      return opts.jsonFallbackValue as T
+    }
+    throw error
+  }
+}
+
+export async function fetchTextWithRetry(url: string, opts: FetchOptions = {}): Promise<string> {
+  return fetchWithRetry(url, opts, async (response) => await response.text())
 }
 
 

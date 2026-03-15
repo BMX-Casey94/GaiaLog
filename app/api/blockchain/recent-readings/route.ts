@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { query } from '../../../../lib/db'
 import { blockchainService } from '@/lib/blockchain'
+import { DATA_FAMILY_DESCRIPTORS } from '@/lib/stream-registry'
 
 function getBSVNetwork(): 'main' | 'test' {
   return process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
@@ -21,14 +22,12 @@ interface TxLogRecord {
 
 export async function GET(req: NextRequest) {
   const network = getBSVNetwork()
+  const wanted = Object.keys(DATA_FAMILY_DESCRIPTORS)
   try {
     // Preferred: Use in-memory broadcast log for fresh TXIDs (no external reads)
     // Always pick the most recent per type; remain fixed until new data appears
     const local = blockchainService.getLocalTransactionLog()
     if (Array.isArray(local) && local.length > 0) {
-      const wanted: Array<'air_quality' | 'water_levels' | 'seismic_activity' | 'advanced_metrics'> = [
-        'air_quality', 'water_levels', 'seismic_activity', 'advanced_metrics'
-      ]
       const readings = wanted.map((type) => {
         const items = local
           .filter((t) =>
@@ -71,10 +70,10 @@ export async function GET(req: NextRequest) {
        WHERE status IN ('pending', 'confirmed')
          AND txid IS NOT NULL
          AND LENGTH(txid) = 64
-         AND type IN ('air_quality', 'water_levels', 'seismic_activity', 'advanced_metrics')
+         AND type = ANY($1::text[])
          AND collected_at > NOW() - INTERVAL '7 days'
        ORDER BY type, collected_at DESC`
-    )
+    , [wanted])
 
     if (Array.isArray(result.rows) && result.rows.length > 0) {
       const readings = result.rows
@@ -112,12 +111,9 @@ export async function GET(req: NextRequest) {
     )
 
     const work = (async () => {
-      const [air, water, seismic, adv] = await Promise.allSettled([
-        findLatestByType(net, 'air_quality', 20),
-        findLatestByType(net, 'water_levels', 20),
-        findLatestByType(net, 'seismic_activity', 20),
-        findLatestByType(net, 'advanced_metrics', 20),
-      ])
+      const results = await Promise.allSettled(
+        wanted.map(type => findLatestByType(net, type, 20))
+      )
 
       const { isValidTxId } = await import('@/lib/utils')
       const toReading = (r: any, type: string) => {
@@ -131,12 +127,9 @@ export async function GET(req: NextRequest) {
         }
       }
 
-      const readings = [
-        air.status === 'fulfilled' && air.value ? toReading(air.value, 'air_quality') : null,
-        water.status === 'fulfilled' && water.value ? toReading(water.value, 'water_levels') : null,
-        seismic.status === 'fulfilled' && seismic.value ? toReading(seismic.value, 'seismic_activity') : null,
-        adv.status === 'fulfilled' && adv.value ? toReading(adv.value, 'advanced_metrics') : null,
-      ].filter(Boolean) as any[]
+      const readings = results
+        .map((result, index) => result.status === 'fulfilled' && result.value ? toReading(result.value, wanted[index]) : null)
+        .filter(Boolean) as any[]
 
       readings.sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
       return readings

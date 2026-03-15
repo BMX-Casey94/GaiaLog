@@ -12,6 +12,12 @@ import { startUtxoMaintainer } from './utxo-maintainer'
 import { initializeProviderBudgets } from './provider-registry'
 import { walletManager } from './wallet-manager'
 import { bsvConfig } from './bsv-config'
+import { getMutatorControlState, logMutatorSkip } from './mutator-control'
+import { getRuntimeControlState, logWorkerProcessSkip } from './runtime-control'
+import { spendSourceObservability } from './spend-source-observability'
+import { buildRolloutGateStatus } from './rollout-controls'
+import { getSpendSourceStatus } from './spend-source'
+import { throughputObservability } from './throughput-observability'
 
 // Persist init state on globalThis to survive Next.js dev-mode module
 // re-evaluations (HMR, route compilations) that would otherwise reset
@@ -70,6 +76,26 @@ export async function autoInitializeWorkers(): Promise<{
     }
   }
 
+  const runtimeControl = getRuntimeControlState()
+  if (!runtimeControl.workerProcessEnabled) {
+    logWorkerProcessSkip('worker-auto-init')
+    return {
+      success: true,
+      message: 'Background workers disabled for this runtime',
+      status: getWorkerStatus()
+    }
+  }
+
+  const mutatorControl = getMutatorControlState()
+  if (!mutatorControl.mutatorsEnabled) {
+    logMutatorSkip('worker-auto-init')
+    return {
+      success: true,
+      message: 'Background mutators delegated to the primary run-workers process',
+      status: getWorkerStatus()
+    }
+  }
+
   _initState.isInitializing = true
   _initState.initializationAttempts++
 
@@ -85,26 +111,16 @@ export async function autoInitializeWorkers(): Promise<{
     const hasArcKey = bsvConfig.api.arcApiKey.length > 0
     
     console.log(`📋 Configuration Status:`)
-    console.log(`   Private Keys: ${hasPrivateKeys ? '✅ Loaded' : '⚠️ Missing (will use test keys)'}`)
+    console.log(`   Private Keys: ${hasPrivateKeys ? '✅ Loaded' : '⚠️ Missing'}`)
     console.log(`   ARC API Key: ${hasArcKey ? '✅ Loaded' : '⚠️ Missing'}`)
     console.log(`   Network: ${bsvConfig.network}`)
 
     // Step 3: Initialize wallet manager
     if (!walletManager.isReady()) {
       console.log('💼 Initializing wallet manager...')
-      
-      // If no private keys in production, log warning but continue with test keys
+
       if (!hasPrivateKeys) {
-        console.warn('⚠️ No private keys found in environment')
-        console.warn('⚠️ Using test keys - DO NOT USE IN PRODUCTION WITH REAL FUNDS')
-        
-        // Use test private keys for development/testing
-        const testPrivateKeys = [
-          'KxAayTuE6JcLfb8hTpvQKahP64wmqE2RRokSv4GF2mTnUvgkeRYc',
-          'L24kCohkqdz9suKmvavLCzJKVL2VzcPQVgB2mPXXA9Sdsh79TShu',
-          'L2EBxsRWif1QPUaAVRrJ3zorsVA7Wj3Ls9xHwhQ3v5PLztncMKNV'
-        ]
-        bsvConfig.wallets.privateKeys = testPrivateKeys
+        throw new Error('No BSV wallet private keys configured for the worker process')
       }
       
       walletManager.forceInitialize()
@@ -176,18 +192,33 @@ export function getWorkerStatus() {
   try {
     const workerStats = workerManager.getWorkerStats()
     const queueStats = workerQueue.getQueueStats()
+    const throughput = throughputObservability.getSnapshot(60)
+    const rollout = buildRolloutGateStatus(
+      throughput.overall.projectedAcceptedPerDay,
+      throughput.overall.projectedConfirmedPerDay,
+    )
     
     return {
       initialized: _initState.isInitialized,
+      runtimeControl: getRuntimeControlState(),
+      mutatorControl: getMutatorControlState(),
+      spendSource: getSpendSourceStatus(),
+      spendSourceMetrics: spendSourceObservability.snapshot(),
       walletManager: walletManager.isReady(),
       workerManager: workerManager.isReady(),
       walletCount: walletManager.getWalletCount(),
       workersRunning: workerStats.filter(w => w.isRunning).length,
       totalWorkers: workerStats.length,
       queueSize: queueStats.totalItems,
+      queueThroughputLane: queueStats.throughputLaneItems,
+      queueCoverageLane: queueStats.coverageLaneItems,
       queueProcessing: queueStats.processingItems,
       queueCompleted: queueStats.completedItems,
       queueFailed: queueStats.failedItems,
+      projectedAcceptedPerDay: throughput.overall.projectedAcceptedPerDay,
+      projectedConfirmedPerDay: throughput.overall.projectedConfirmedPerDay,
+      requestedRolloutGate: rollout.requestedGate,
+      highestUnlockedGate: rollout.highestUnlockedGate,
       hasPrivateKeys: bsvConfig.wallets.privateKeys.length > 0,
       hasArcKey: bsvConfig.api.arcApiKey.length > 0,
       network: bsvConfig.network
@@ -195,6 +226,10 @@ export function getWorkerStatus() {
   } catch (error) {
     return {
       initialized: false,
+      runtimeControl: getRuntimeControlState(),
+      mutatorControl: getMutatorControlState(),
+      spendSource: getSpendSourceStatus(),
+      spendSourceMetrics: spendSourceObservability.snapshot(),
       error: error instanceof Error ? error.message : 'Unknown error'
     }
   }
@@ -204,7 +239,7 @@ export function getWorkerStatus() {
  * Check if workers are initialized
  */
 export function areWorkersInitialized(): boolean {
-  return _initState.isInitialized
+  return !getRuntimeControlState().workerProcessEnabled || !getMutatorControlState().mutatorsEnabled || _initState.isInitialized
 }
 
 /**

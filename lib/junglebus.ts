@@ -12,7 +12,8 @@ import { APP_NAME } from './constants'
 import {
   addReadingsBatch,
   type StoredReading,
-} from './supabase-explorer'
+} from './explorer-read-source'
+import { normaliseDataFamily } from './stream-registry'
 
 // Configuration
 const START_BLOCK = parseInt(process.env.JUNGLEBUS_START_BLOCK || '0', 10)
@@ -256,22 +257,7 @@ function decodeGaiaLogFromTx(tx: WocTxDetails): DecodedGaiaLogTx | null {
  */
 function normalizeDataType(dataType: string): string {
   const normalized = dataType.toLowerCase().replace(/[^a-z_]/g, '_')
-  
-  const typeMap: Record<string, string> = {
-    'air_quality': 'air_quality',
-    'airquality': 'air_quality',
-    'water_levels': 'water_levels',
-    'waterlevels': 'water_levels',
-    'water_level': 'water_levels',
-    'seismic_activity': 'seismic_activity',
-    'seismicactivity': 'seismic_activity',
-    'seismic': 'seismic_activity',
-    'advanced_metrics': 'advanced_metrics',
-    'advancedmetrics': 'advanced_metrics',
-    'advanced': 'advanced_metrics',
-  }
-  
-  return typeMap[normalized] || normalized
+  return normaliseDataFamily(normalized) || normalized
 }
 
 /**

@@ -1,13 +1,33 @@
 import 'dotenv/config'
 import dotenv from 'dotenv'
+import { applyPrimaryMutatorRole, getMutatorControlState } from '../lib/mutator-control'
 // Prefer .env.local (Next-style) so workers match the app environment
 dotenv.config({ path: '.env.local' })
 // Fallback to default .env if needed
 dotenv.config()
 
+applyPrimaryMutatorRole()
+
 console.log('🚀 Starting GaiaLog worker service...')
 // Mark this process as the worker process so API routes can gate chain writes
 process.env.GAIALOG_WORKER_PROCESS = '1'
+const mutatorControl = getMutatorControlState()
+if (mutatorControl.mode !== 'off') {
+  console.log(`🧭 Single-writer mode: ${mutatorControl.mode} (role=${mutatorControl.role})`)
+}
+
+// Log the next scheduled cron_restart boundary (:00 or :30) so it is visible in logs
+function logNextScheduledRestart(): void {
+  const now = new Date()
+  const next = new Date(now)
+  if (now.getMinutes() < 30) {
+    next.setMinutes(30, 0, 0)
+  } else {
+    next.setHours(now.getHours() + 1, 0, 0, 0)
+  }
+  const diffMin = Math.round((next.getTime() - now.getTime()) / 60000)
+  console.log(`🔁 Scheduled restart: next recycle in ~${diffMin} min at ${next.toISOString().substring(11, 16)} UTC (cron_restart every 30 min)`)
+}
 
 async function main() {
   try {
@@ -41,6 +61,7 @@ async function main() {
       workerQueue.startProcessing()
     }, 3000)
     console.log('✅ Workers and queue started. Service is running.')
+    logNextScheduledRestart()
 
     setInterval(() => {
       const stats = workerQueue.getQueueStats()
@@ -52,7 +73,8 @@ async function main() {
       const gate = workerQueue.getGateInfo()
       const gateStr = gate.totalWallets > 0 ? `gate=${gate.paused ? 'paused' : 'ok'} okWallets=${gate.okWallets}/${gate.totalWallets} minConf=${gate.minConfirmed}/${gate.minRequired}` : 'gate=na'
       const hint = (stats.totalItems > 0 && sample.processed === 0 && !gate.paused) ? ' hint=paused_by_lock?' : ''
-      console.log(`📈 Queue items=${stats.totalItems} +${sample.queued} proc+${sample.processed} fail+${sample.failed} retryScheduled=${retryScheduled} workersRunning=${running} broadcastedLast10s=${broadcasted} ${gateStr}${hint}`)
+      const lanes = `lanes=throughput:${stats.throughputLaneItems}/coverage:${stats.coverageLaneItems}`
+      console.log(`📈 Queue items=${stats.totalItems} +${sample.queued} proc+${sample.processed} fail+${sample.failed} retryScheduled=${retryScheduled} workersRunning=${running} broadcastedLast10s=${broadcasted} ${lanes} ${gateStr}${hint}`)
     }, 10000)
 
     // Optional DB ingestion throughput (debug only; COUNT(*) can be expensive on large tables)
@@ -103,12 +125,21 @@ async function main() {
       }, 30000) // 30 seconds
     }
 
-    process.on('SIGINT', () => {
-      console.log('\n🛑 Shutting down GaiaLog worker service...')
+    const gracefulShutdown = (signal: string) => {
+      console.log(`\n🛑 Shutting down GaiaLog worker service (${signal})...`)
+      // Stop workers so no new collection cycles start
       workerManager.stopAll()
+      // Stop queue processing interval — in-flight DB-persisted items are
+      // automatically reclaimed as 'queued' after 2 minutes on next startup
       workerQueue.stop()
+      console.log('✅ Worker service shut down cleanly.')
       process.exit(0)
-    })
+    }
+
+    // SIGINT  — manual Ctrl-C or pm2 stop
+    // SIGTERM — sent by PM2 on cron_restart, pm2 reload, and some OS signals
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'))
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
   } catch (e) {
     console.error('❌ Failed to start worker service:', e)
     process.exit(1)

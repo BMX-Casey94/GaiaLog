@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { validateGaiaLog, parsePushes } from '@/lib/opreturn-validator'
 import { promises as fs } from 'fs'
 import path from 'path'
+import { getFamilyTitle, getKeyMetrics, getRenderableMetricEntries } from '@/lib/family-metrics'
+import { resolveAttributionText } from '@/lib/stream-registry'
 
 export const runtime = 'nodejs'
 
@@ -61,15 +63,6 @@ function stat(label: string, value: unknown): string {
 	</div>`
 }
 
-const LABELS: Record<string, string> = {
-	air_quality_index: 'Air Quality Index',
-	fine_particulate_matter_pm25: 'Fine Particulate Matter (PM2.5)',
-	coarse_particulate_matter_pm10: 'Coarse Particulate Matter (PM10)',
-	carbon_monoxide: 'Carbon Monoxide (CO)',
-	nitrogen_dioxide: 'Nitrogen Dioxide (NO2)',
-	ozone: 'Ozone (O3)',
-}
-
 function renderTypeSections(dataType: string, payload: any): string {
 	const sections: string[] = []
 	const p = payload || {}
@@ -81,93 +74,43 @@ function renderTypeSections(dataType: string, payload: any): string {
 	const datePart = dateISO ? String(dateISO).slice(0, 10) : ''
 	const timePart = dateISO ? (dateISO.includes('T') ? String(dateISO).slice(11, 19) : '') : ''
 
-	if (dataType === 'air_quality') {
+	const primaryStats = getKeyMetrics(dataType, p, 12)
+	const secondaryStats = getRenderableMetricEntries(p, 24)
+		.filter(entry => !primaryStats.some(primary => primary.label === entry.label && primary.value === entry.value))
+	const attributionText = resolveAttributionText(p.provider_id, p.source)
+
+	sections.push(`
+		<div class="gl-card">
+			<div class="gl-card-title">${escapeHtml(getFamilyTitle(dataType))}</div>
+			<div class="gl-chips">
+				${chip('Location', loc)}
+				${chip('Date', datePart)}
+				${chip('Time', timePart)}
+				${chip('Provider', p.provider_id ?? p.source ?? '')}
+				${chip('Dataset', p.dataset_id ?? '')}
+			</div>
+			<div class="gl-grid">
+				${(primaryStats.length > 0 ? primaryStats : secondaryStats).map(entry => stat(entry.label, entry.value)).join('')}
+			</div>
+		</div>
+	`)
+
+	if (secondaryStats.length > primaryStats.length) {
 		sections.push(`
 			<div class="gl-card">
-				<div class="gl-card-title">Air Quality</div>
-				<div class="gl-chips">
-					${chip('Location', loc)}
-					${chip('Date', datePart)}
-					${chip('Time', timePart)}
-				</div>
+				<div class="gl-card-title">Additional Metrics</div>
 				<div class="gl-grid">
-					${stat(LABELS.air_quality_index, p.air_quality_index)}
-					${stat(LABELS.fine_particulate_matter_pm25, p.fine_particulate_matter_pm25)}
-					${stat(LABELS.coarse_particulate_matter_pm10, p.coarse_particulate_matter_pm10)}
-					${stat(LABELS.carbon_monoxide, p.carbon_monoxide)}
-					${stat(LABELS.nitrogen_dioxide, p.nitrogen_dioxide)}
-					${stat(LABELS.ozone, p.ozone)}
+					${secondaryStats.slice(0, 24).map(entry => stat(entry.label, entry.value)).join('')}
 				</div>
 			</div>
 		`)
-	} else if (dataType === 'water' || dataType === 'water_levels' || (p.river_level !== undefined || p.sea_level !== undefined)) {
+	}
+
+	if (attributionText) {
 		sections.push(`
 			<div class="gl-card">
-				<div class="gl-card-title">Water Levels</div>
-				<div class="gl-chips">
-					${chip('Location', loc)}
-					${chip('Date', datePart)}
-					${chip('Time', timePart)}
-				</div>
-				<div class="gl-grid">
-					${stat('River Level (meters)', p.river_level ?? p.level ?? '')}
-					${stat('Sea Level (meters)', p.sea_level ?? '')}
-					${stat('Station ID', p.station_id ?? '')}
-					${stat('Water Temperature (°C)', p.water_temperature_c ?? '')}
-					${stat('Tide Height (meters)', p.tide_height ?? '')}
-					${stat('Wave Height (meters)', p.wave_height_m ?? '')}
-					${stat('Salinity (PSU)', p.salinity_psu ?? '')}
-					${stat('Dissolved Oxygen (mg/L)', p.dissolved_oxygen_mg_l ?? '')}
-					${stat('Turbidity (NTU)', p.turbidity_ntu ?? '')}
-					${stat('Wind Speed (kph)', p.wind_speed_kph ?? '')}
-					${stat('Wind Direction (deg)', p.wind_direction_deg ?? '')}
-					${stat('Current Speed (m/s)', p.current_speed_ms ?? '')}
-					${stat('Current Direction (deg)', p.current_direction_deg ?? '')}
-				</div>
-			</div>
-		`)
-	} else if (dataType === 'seismic' || (p.magnitude !== undefined && p.latitude !== undefined)) {
-		sections.push(`
-			<div class="gl-card">
-				<div class="gl-card-title">Seismic Activity</div>
-				<div class="gl-chips">
-					${chip('Location', loc)}
-					${chip('Date', datePart)}
-					${chip('Time', timePart)}
-				</div>
-				<div class="gl-grid">
-					${stat('Magnitude', p.magnitude)}
-					${stat('Depth', p.depth_miles ?? p.depth)}
-					${stat('Latitude', p.latitude)}
-					${stat('Longitude', p.longitude)}
-				</div>
-			</div>
-		`)
-	} else if (dataType === 'advanced_metrics') {
-		const entries = Object.entries(p).filter(([k]) => !['location', 'location_ascii', 'timestamp', 'payload_sha256', 'db_source_hash', 'source_hash'].includes(k))
-		const labelMap: Record<string, string> = {
-			humidity_pct: 'Humidity (Pct)',
-			pressure_mb: 'Pressure (Mb)',
-			temperature_c: 'Temperature (C)',
-			uv_index: 'UV Index',
-			wind_deg: 'Wind (Deg)',
-			wind_kph: 'Wind (Kph)',
-		}
-		const stats = entries.slice(0, 24).map(([k, v]) => {
-			const label = labelMap[k] || k.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
-			return stat(label, typeof v === 'object' ? JSON.stringify(v) : v)
-		}).join('')
-		sections.push(`
-			<div class="gl-card">
-				<div class="gl-card-title">Advanced Metrics</div>
-				<div class="gl-chips">
-					${chip('Location', loc)}
-					${chip('Date', datePart)}
-					${chip('Time', timePart)}
-				</div>
-				<div class="gl-grid">
-					${stats}
-				</div>
+				<div class="gl-card-title">Attribution</div>
+				<div style="font-size:12px;line-height:1.6;opacity:.9">${escapeHtml(attributionText)}</div>
 			</div>
 		`)
 	}

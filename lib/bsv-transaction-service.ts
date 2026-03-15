@@ -9,6 +9,12 @@ export interface BSVTransactionData {
   location: string
   measurement: any
   source_hash: string
+  family?: string
+  providerId?: string
+  datasetId?: string
+  sourceLabel?: string
+  queueLane?: 'throughput' | 'coverage'
+  maxInFlight?: number
   coordinates?: { lat: number; lon: number }
   stationId?: string
 }

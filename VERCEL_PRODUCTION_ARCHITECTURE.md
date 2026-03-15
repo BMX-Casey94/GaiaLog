@@ -1,5 +1,9 @@
 # Vercel Production Architecture Fix
 
+> Superseded by `VERCEL_VPS_SPLIT_DEPLOYMENT.md` for the current production topology.
+> This older note describes the original read-only Vercel split, but the canonical
+> production guidance now assumes a dedicated VPS worker plus shared Postgres.
+
 ## The Problem (What Was Wrong)
 
 ### Original Incorrect Assumption

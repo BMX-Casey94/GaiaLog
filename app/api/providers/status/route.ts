@@ -1,7 +1,17 @@
 import { NextResponse } from 'next/server'
 import { fetchJsonWithRetry } from '@/lib/provider-fetch'
+import { datasetConfigs, providerConfigs } from '@/lib/provider-registry'
+import { buildRolloutGateStatus } from '@/lib/rollout-controls'
+import { PROVIDER_DESCRIPTORS } from '@/lib/stream-registry'
+import { throughputObservability } from '@/lib/throughput-observability'
 
 export async function GET() {
+  const throughput = throughputObservability.getSnapshot(60)
+  const rollout = buildRolloutGateStatus(
+    throughput.overall.projectedAcceptedPerDay,
+    throughput.overall.projectedConfirmedPerDay,
+  )
+
   const results: any = {
     weatherapi: { ok: false, message: '', status: null as null | number },
     waqi: { ok: false, message: '', status: null as null | number },
@@ -57,7 +67,47 @@ export async function GET() {
     results.owm.message = e?.message || 'error'
   }
 
-  return NextResponse.json({ results })
+  return NextResponse.json({
+    results,
+    rollout,
+    throughput,
+    controls: {
+      providers: Object.values(providerConfigs).map(cfg => ({
+        id: cfg.id,
+        enabled: cfg.enabled,
+        configuredEnabled: cfg.configuredEnabled,
+        requestedRolloutGate: cfg.requestedRolloutGate,
+        rolloutEnabled: cfg.rolloutEnabled,
+        rollout: cfg.rollout,
+        lane: cfg.queueLane,
+        priority: cfg.defaultPriority,
+        chunkSize: cfg.chunkSize,
+        maxInFlight: cfg.maxInFlight,
+        intervalMs: cfg.cadence.intervalMs,
+        budgets: cfg.budgets,
+        throughputClass: cfg.throughputClass,
+        blockchainFriendly: cfg.blockchainFriendly,
+        attributionRequired: cfg.attributionRequired || false,
+        attributionText: PROVIDER_DESCRIPTORS[cfg.id].attributionText || null,
+      })),
+      datasets: Object.values(datasetConfigs).map(cfg => ({
+        id: cfg.id,
+        providerId: cfg.providerId,
+        family: cfg.family,
+        enabled: cfg.enabled,
+        configuredEnabled: cfg.configuredEnabled,
+        requestedRolloutGate: cfg.requestedRolloutGate,
+        rolloutEnabled: cfg.rolloutEnabled,
+        rollout: cfg.rollout,
+        lane: cfg.queueLane,
+        priority: cfg.defaultPriority,
+        chunkSize: cfg.chunkSize,
+        maxInFlight: cfg.maxInFlight,
+        intervalMs: cfg.cadence.intervalMs,
+        budgets: cfg.budgets,
+      })),
+    },
+  })
 }
 
 

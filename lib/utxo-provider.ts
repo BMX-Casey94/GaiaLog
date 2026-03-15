@@ -1,14 +1,19 @@
 import { bsvConfig } from './bsv-config'
 
 type HeadersMap = Record<string, string>
+type GetUnspentOptions = {
+  allowDegradedStale?: boolean
+}
 
 const NET = bsvConfig.network === 'mainnet' ? 'main' : 'test'
 const UTXO_FETCH_BACKOFF_BASE_MS = Number(process.env.BSV_UTXO_FETCH_BACKOFF_BASE_MS || 250)
 const UTXO_FETCH_MAX_RETRIES = Number(process.env.BSV_UTXO_FETCH_MAX_RETRIES || 4)
 const UTXO_CACHE_TTL_MS = Math.max(1000, Number(process.env.BSV_UTXO_CACHE_TTL_MS || 10000))
 const UTXO_STALE_TTL_MS = Math.max(5000, Number(process.env.BSV_UTXO_STALE_TTL_MS || 120000))
+const UTXO_DEGRADED_STALE_TTL_MS = Math.max(UTXO_STALE_TTL_MS, Number(process.env.BSV_UTXO_DEGRADED_STALE_TTL_MS || 15 * 60 * 1000))
 const UTXO_ERROR_COOLDOWN_MS = Math.max(1000, Number(process.env.BSV_UTXO_ERROR_COOLDOWN_MS || 20000))
 const UTXO_429_COOLDOWN_MS = Math.max(1000, Number(process.env.BSV_UTXO_429_COOLDOWN_MS || 60000))
+const UTXO_DEGRADED_LOG_INTERVAL_MS = Math.max(10000, Number(process.env.BSV_UTXO_DEGRADED_LOG_INTERVAL_MS || 60000))
 
 type UtxoCacheEntry = {
   fetchedAt: number
@@ -16,6 +21,7 @@ type UtxoCacheEntry = {
   inFlight: Promise<any[]> | null
   cooldownUntil: number
   lastError?: string
+  lastDegradedLogAt?: number
 }
 
 const utxoCacheByAddress = new Map<string, UtxoCacheEntry>()
@@ -23,7 +29,7 @@ const utxoCacheByAddress = new Map<string, UtxoCacheEntry>()
 function getCacheEntry(address: string): UtxoCacheEntry {
   let entry = utxoCacheByAddress.get(address)
   if (!entry) {
-    entry = { fetchedAt: 0, utxos: [], inFlight: null, cooldownUntil: 0 }
+    entry = { fetchedAt: 0, utxos: [], inFlight: null, cooldownUntil: 0, lastDegradedLogAt: 0 }
     utxoCacheByAddress.set(address, entry)
   }
   return entry
@@ -85,7 +91,30 @@ function normaliseUtxoShape(list: any[]): any[] {
   }))
 }
 
-export async function getUnspentForAddress(address: string): Promise<any[]> {
+function maybeUseCachedUtxos(address: string, cache: UtxoCacheEntry, now: number, reason: string, options: GetUnspentOptions = {}): any[] | null {
+  if (cache.utxos.length === 0 || cache.fetchedAt <= 0) return null
+  const ageMs = now - cache.fetchedAt
+  const maxAgeMs = options.allowDegradedStale ? UTXO_DEGRADED_STALE_TTL_MS : UTXO_STALE_TTL_MS
+  if (ageMs > maxAgeMs) return null
+
+  if (ageMs <= UTXO_STALE_TTL_MS) {
+    if (bsvConfig.logging.level === 'debug') {
+      console.log(`[UTXO Provider] Using stale cached UTXOs for ${address.substring(0, 10)}... (${reason})`)
+    }
+    return cache.utxos
+  }
+
+  if (!options.allowDegradedStale) return null
+
+  const lastLogAt = cache.lastDegradedLogAt || 0
+  if ((now - lastLogAt) >= UTXO_DEGRADED_LOG_INTERVAL_MS) {
+    console.warn(`[UTXO Provider] Using degraded stale UTXO cache for ${address.substring(0, 10)}... (${cache.utxos.length} cached, age=${Math.round(ageMs / 1000)}s, reason=${reason})`)
+    cache.lastDegradedLogAt = now
+  }
+  return cache.utxos
+}
+
+export async function getUnspentForAddress(address: string, options: GetUnspentOptions = {}): Promise<any[]> {
   const now = Date.now()
   const cache = getCacheEntry(address)
   if (cache.inFlight) return cache.inFlight
@@ -93,12 +122,8 @@ export async function getUnspentForAddress(address: string): Promise<any[]> {
     return cache.utxos
   }
   if (cache.cooldownUntil > now) {
-    if (cache.utxos.length > 0 && (now - cache.fetchedAt) <= UTXO_STALE_TTL_MS) {
-      if (bsvConfig.logging.level === 'debug') {
-        console.log(`[UTXO Provider] Using stale cached UTXOs for ${address.substring(0, 10)}... during cooldown`)
-      }
-      return cache.utxos
-    }
+    const stale = maybeUseCachedUtxos(address, cache, now, 'provider cooldown', options)
+    if (stale) return stale
     return []
   }
 
@@ -178,10 +203,8 @@ export async function getUnspentForAddress(address: string): Promise<any[]> {
     cache.cooldownUntil = Date.now() + cooldown
     cache.lastError = msg
 
-    if (cache.utxos.length > 0 && (Date.now() - cache.fetchedAt) <= UTXO_STALE_TTL_MS) {
-      console.warn(`[UTXO Provider] Using stale UTXO cache for ${address.substring(0, 10)}... after fetch failure (${msg})`)
-      return cache.utxos
-    }
+    const stale = maybeUseCachedUtxos(address, cache, Date.now(), `fetch failure: ${msg || 'unknown'}`, options)
+    if (stale) return stale
     return []
   }
   })().finally(() => {

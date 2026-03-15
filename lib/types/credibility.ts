@@ -168,6 +168,39 @@ export const VALIDATION_RANGES = {
     latitude: { min: -90, max: 90 },
     longitude: { min: -180, max: 180 },
   },
+  geomagnetism: {
+    x: { min: -100000, max: 100000 },
+    y: { min: -100000, max: 100000 },
+    z: { min: -100000, max: 100000 },
+    h: { min: 0, max: 100000 },
+    f: { min: 0, max: 100000 },
+    d: { min: -360, max: 360 },
+    latitude: { min: -90, max: 90 },
+    longitude: { min: -180, max: 180 },
+  },
+  volcanic_activity: {
+    alert_level: { min: 0, max: 5 },
+    eruption_probability: { min: 0, max: 100, warnMax: 80 },
+    gas_flux: { min: 0, max: 1000000, warnMax: 100000 },
+    latitude: { min: -90, max: 90 },
+    longitude: { min: -180, max: 180 },
+  },
+  space_weather: {
+    speed: { min: 0, max: 5000, warnMax: 3000 },
+    density: { min: 0, max: 1000, warnMax: 200 },
+    temperature: { min: 0, max: 100000000, warnMax: 10000000 },
+    bz: { min: -200, max: 200, warnMin: -50, warnMax: 50 },
+    bt: { min: 0, max: 200, warnMax: 50 },
+  },
+  upper_atmosphere: {
+    temperature_c: { min: -120, max: 60, warnMin: -90, warnMax: 45 },
+    humidity_pct: { min: 0, max: 100 },
+    wind_kph: { min: 0, max: 500, warnMax: 250 },
+    pressure_mb: { min: 0, max: 1100 },
+    altitude_m: { min: 0, max: 50000 },
+    latitude: { min: -90, max: 90 },
+    longitude: { min: -180, max: 180 },
+  },
 } as const
 
 // =============================================================================
@@ -178,12 +211,25 @@ export const SOURCE_RELIABILITY: Record<string, number> = {
   // Government/official sources - highest reliability
   'USGS Earthquake API': 95,
   'NOAA Tides & Currents': 95,
+  'NOAA NDBC': 95,
+  'NOAA Space Weather': 95,
+  'USGS Geomagnetism': 95,
+  'USGS Volcanoes': 95,
   
   // Established commercial APIs with quality controls
   'WAQI': 85,
   'WeatherAPI.com': 80,
   'WeatherAPI-derived metrics': 75,
   'OWM-derived metrics': 75,
+  'Sensor.Community': 70,
+  'EMSC': 90,
+  'GeoNet NZ': 92,
+  'IRIS EarthScope': 92,
+  'openSenseMap': 70,
+  'INTERMAGNET': 93,
+  'Copernicus CAMS': 90,
+  'NASA POWER': 90,
+  'IGRA v2': 92,
   
   // Default for unknown sources
   'unknown': 50,

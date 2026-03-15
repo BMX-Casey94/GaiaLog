@@ -10,7 +10,7 @@ import {
   calculateSourceHash,
   upsertTxLog,
 } from './repositories'
-import { fetchJsonWithRetry } from './provider-fetch'
+import { fetchJsonWithRetry, fetchTextWithRetry } from './provider-fetch'
 import { budgetStore, cursorStore, dedupeStore, cacheStore } from './stores'
 
 export interface AirQualityData {
@@ -31,11 +31,12 @@ export interface AirQualityData {
   timestamp: string
   source: string
   coordinates?: { lat: number; lon: number }
+  station_id?: string
 }
 
 export interface WaterLevelData {
-  river_level: number
-  sea_level: number
+  river_level?: number
+  sea_level?: number
   location: string
   timestamp: string
   source: string
@@ -55,6 +56,15 @@ export interface WaterLevelData {
   current_direction_deg?: number
   wind_speed_kph?: number
   wind_direction_deg?: number
+  gust_kph?: number
+  wave_period_s?: number
+  average_wave_period_s?: number
+  mean_wave_direction_deg?: number
+  pressure_hpa?: number
+  pressure_tendency_hpa?: number
+  air_temperature_c?: number
+  dew_point_c?: number
+  visibility_nmi?: number
   coordinates?: { lat: number; lon: number }
 }
 
@@ -83,6 +93,208 @@ export interface AdvancedMetricsData {
   pressure_mb?: number
   wind_kph?: number
   wind_deg?: number
+}
+
+function parseNumericValue(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed || trimmed === 'MM') return undefined
+    const parsed = Number(trimmed)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  return undefined
+}
+
+function normaliseProviderTimestamp(raw: string | undefined | null): string {
+  if (!raw) return new Date().toISOString()
+  const trimmed = raw.trim()
+  if (!trimmed) return new Date().toISOString()
+  if (trimmed.endsWith('Z')) return new Date(trimmed).toISOString()
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) {
+    return new Date(trimmed.replace(' ', 'T') + 'Z').toISOString()
+  }
+  const parsed = new Date(trimmed)
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString()
+}
+
+function parseSensorCommunityValues(values: any[]): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const entry of Array.isArray(values) ? values : []) {
+    const key = String(entry?.value_type || '').trim()
+    const value = parseNumericValue(entry?.value)
+    if (!key || value === undefined) continue
+    out[key] = value
+  }
+  return out
+}
+
+function interpolateAqi(concentration: number, table: Array<[number, number, number, number]>): number {
+  for (const [cLow, cHigh, aqiLow, aqiHigh] of table) {
+    if (concentration >= cLow && concentration <= cHigh) {
+      return Math.round(((aqiHigh - aqiLow) / (cHigh - cLow)) * (concentration - cLow) + aqiLow)
+    }
+  }
+  return Math.round(Math.min(500, Math.max(0, concentration)))
+}
+
+function approximateAqiFromPm(pm25?: number, pm10?: number): number | undefined {
+  if (pm25 !== undefined) {
+    return interpolateAqi(pm25, [
+      [0, 12, 0, 50],
+      [12.1, 35.4, 51, 100],
+      [35.5, 55.4, 101, 150],
+      [55.5, 150.4, 151, 200],
+      [150.5, 250.4, 201, 300],
+      [250.5, 350.4, 301, 400],
+      [350.5, 500.4, 401, 500],
+    ])
+  }
+  if (pm10 !== undefined) {
+    return interpolateAqi(pm10, [
+      [0, 54, 0, 50],
+      [55, 154, 51, 100],
+      [155, 254, 101, 150],
+      [255, 354, 151, 200],
+      [355, 424, 201, 300],
+      [425, 504, 301, 400],
+      [505, 604, 401, 500],
+    ])
+  }
+  return undefined
+}
+
+function buildRotatingSlice<T>(items: T[], startIndex: number, limit: number): T[] {
+  if (items.length === 0 || limit <= 0) return []
+  const slice: T[] = []
+  const total = items.length
+  for (let offset = 0; offset < Math.min(limit, total); offset++) {
+    slice.push(items[(startIndex + offset) % total])
+  }
+  return slice
+}
+
+function isTruthyEnv(value: string | undefined, fallback: boolean = false): boolean {
+  if (value == null || value.trim() === '') return fallback
+  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
+}
+
+function parseCsvSet(value: string | undefined): Set<string> {
+  return new Set(
+    String(value || '')
+      .split(',')
+      .map(entry => entry.trim().toLowerCase())
+      .filter(Boolean),
+  )
+}
+
+const NOAA_COOPS_DEFAULT_PRODUCTS = ['water_level', 'water_temperature', 'wind'] as const
+
+function getNoaaCoopsProducts(): Set<string> {
+  const configured = parseCsvSet(process.env.NOAA_COOPS_PRODUCTS)
+  if (configured.size === 0) {
+    return new Set(NOAA_COOPS_DEFAULT_PRODUCTS)
+  }
+  configured.add('water_level')
+  return configured
+}
+
+async function collectNoaaWaterLevelForStation(station: any, products: Set<string>): Promise<WaterLevelData | null> {
+  try {
+    try {
+      const plat = Number((station as any).lat)
+      const plon = Number((station as any).lon ?? (station as any).lng)
+      if (Number.isFinite(plat) && Number.isFinite(plon)) {
+        const { getNearestOwmCountry } = await import('./repositories')
+        const { isCountryAllowed } = await import('./country-controls')
+        const cc = await getNearestOwmCountry(plat, plon)
+        if (!isCountryAllowed('noaa' as any, cc)) return null
+      }
+    } catch {}
+
+    const stationId = station.id
+    const stationLatN = Number((station as any).lat)
+    const stationLonN = Number((station as any).lng ?? (station as any).lon)
+    const stationLat: number | undefined = Number.isFinite(stationLatN) ? stationLatN : undefined
+    const stationLon: number | undefined = Number.isFinite(stationLonN) ? stationLonN : undefined
+
+    const begin = new Date().toISOString().slice(0, 10)
+    const end = begin
+    const base = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?station=${stationId}&time_zone=gmt&units=metric&format=json`
+    const fetchProduct = (suffix: string, retries: number = 1) =>
+      fetchJsonWithRetry<any>(`${base}${suffix}`, { retries, providerId: 'noaa' }).catch(() => null)
+
+    const [
+      waterData,
+      tempData,
+      windData,
+      tidePred,
+      salinityData,
+      doData,
+      turbidityData,
+      currentsData,
+    ] = await Promise.all([
+      fetchProduct(`&product=water_level&datum=MLLW&begin_date=${begin}&end_date=${end}`, 2),
+      products.has('water_temperature')
+        ? fetchProduct(`&product=water_temperature&begin_date=${begin}&end_date=${end}`)
+        : Promise.resolve(null),
+      products.has('wind')
+        ? fetchProduct(`&product=wind&begin_date=${begin}&end_date=${end}`)
+        : Promise.resolve(null),
+      products.has('predictions')
+        ? fetchProduct(`&product=predictions&interval=h&datum=MLLW&begin_date=${begin}&end_date=${end}`)
+        : Promise.resolve(null),
+      products.has('salinity')
+        ? fetchProduct(`&product=salinity&begin_date=${begin}&end_date=${end}`)
+        : Promise.resolve(null),
+      products.has('dissolved_oxygen')
+        ? fetchProduct(`&product=dissolved_oxygen&begin_date=${begin}&end_date=${end}`)
+        : Promise.resolve(null),
+      products.has('turbidity')
+        ? fetchProduct(`&product=turbidity&begin_date=${begin}&end_date=${end}`)
+        : Promise.resolve(null),
+      products.has('currents')
+        ? fetchProduct(`&product=currents&bin=1&begin_date=${begin}&end_date=${end}`)
+        : Promise.resolve(null),
+    ])
+
+    const latest = (arr?: any[]) => (Array.isArray(arr) && arr.length > 0 ? arr[arr.length - 1] : null)
+    const wl = latest(waterData?.data)
+    if (!wl) return null
+
+    const waterLevelValue = parseFloat(wl.v) || 0
+    const wt = latest(tempData?.data)
+    const wind = latest(windData?.data)
+    const pred = latest(tidePred?.predictions)
+    const sal = latest(salinityData?.data)
+    const disox = latest(doData?.data)
+    const turb = latest(turbidityData?.data)
+
+    const item: WaterLevelData = {
+      river_level: waterLevelValue,
+      sea_level: waterLevelValue,
+      location: station.name,
+      timestamp: (wl.t ? new Date(wl.t).toISOString() : new Date().toISOString()),
+      source: 'NOAA Tides & Currents',
+      station_id: stationId,
+      coordinates: (stationLat != null && stationLon != null) ? { lat: stationLat, lon: stationLon } : undefined,
+      tide_height: pred ? parseFloat(pred.v) : undefined,
+      water_temperature_c: wt ? parseFloat(wt.v) : undefined,
+      salinity_psu: sal ? parseFloat(sal.v) : undefined,
+      dissolved_oxygen_mg_l: disox ? parseFloat(disox.v) : undefined,
+      turbidity_ntu: turb ? parseFloat(turb.v) : undefined,
+      wind_speed_kph: wind && wind.s ? Math.round((parseFloat(wind.s) || 0) * 3.6) : undefined,
+      wind_direction_deg: wind && wind.d ? parseFloat(wind.d) : undefined,
+      current_speed_ms: currentsData?.data?.length ? parseFloat(currentsData.data[currentsData.data.length - 1]?.s) || undefined : undefined,
+      current_direction_deg: currentsData?.data?.length ? parseFloat(currentsData.data[currentsData.data.length - 1]?.d) || undefined : undefined,
+    }
+
+    const key = `noaa:water:${item.station_id}:${item.timestamp}`
+    return (await dedupeStore.add(key)) ? item : null
+  } catch {
+    return null
+  }
 }
 
 // Enhanced data collection service with worldwide coverage
@@ -272,7 +484,7 @@ export class DataCollector {
         fetchJsonWithRetry<any>(`${base}&product=dissolved_oxygen&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
         fetchJsonWithRetry<any>(`${base}&product=turbidity&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
         // Currents may require bin; try bin=1
-        fetchJsonWithRetry<any>(`${base}&product=currents&bin=1&begin_date=${begin}&end_date=${end}`, { retries: 1 }).catch(() => null),
+        fetchJsonWithRetry<any>(`${base}&product=currents&bin=1&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
       ])
 
       const latest = (arr?: any[]) => (Array.isArray(arr) && arr.length > 0 ? arr[arr.length - 1] : null)
@@ -952,102 +1164,36 @@ export async function collectWaterLevelDataBatch(limit: number = 25): Promise<Wa
     console.warn('🌊 NOAA: Station list is empty – nothing to collect')
     return out
   }
-  console.log(`🌊 NOAA: Processing ${Math.min(limit, total)} stations (${total} total available)...`)
   const startIndex = (await cursorStore.get('noaa')) as number | null
-  let i = typeof startIndex === 'number' ? startIndex : 0
+  const cursor = typeof startIndex === 'number' ? startIndex : 0
+  const selectedStations = buildRotatingSlice(list, cursor, Math.min(limit, total))
+  if (selectedStations.length === 0) return out
+  await cursorStore.set('noaa', (cursor + selectedStations.length) % total)
+
+  const products = getNoaaCoopsProducts()
+  const concurrency = Math.max(1, Number(process.env.NOAA_STATION_CONCURRENCY || 4))
+  console.log(
+    `🌊 NOAA: Processing ${selectedStations.length} stations (${total} total available, ` +
+    `products=${Array.from(products).join(',')}, concurrency=${concurrency})...`
+  )
   const batchStart = Date.now()
-  for (let count = 0; count < limit && count < total; count++) {
-    const s = list[i % total]
-    // Progress log every 25 stations so the user can see NOAA is actively working
-    if (count > 0 && count % 25 === 0) {
+  let processedStations = 0
+  let nextProgressLogAt = 25
+  for (let offset = 0; offset < selectedStations.length; offset += concurrency) {
+    const slice = selectedStations.slice(offset, offset + concurrency)
+    const results = await Promise.all(slice.map(station => collectNoaaWaterLevelForStation(station, products)))
+    for (const item of results) {
+      if (item) out.push(item)
+    }
+    processedStations += slice.length
+    if (processedStations >= nextProgressLogAt && processedStations < selectedStations.length) {
       const elapsed = ((Date.now() - batchStart) / 1000).toFixed(1)
-      console.log(`🌊 NOAA: ${count}/${Math.min(limit, total)} stations processed (${out.length} readings, ${elapsed}s elapsed)`)
+      console.log(`🌊 NOAA: ${processedStations}/${selectedStations.length} stations processed (${out.length} readings, ${elapsed}s elapsed)`)
+      nextProgressLogAt += 25
     }
-    try {
-      // Country toggle enforcement for NOAA station batch
-      try {
-        const plat = Number((s as any).lat)
-        const plon = Number((s as any).lon ?? (s as any).lng)
-        if (Number.isFinite(plat) && Number.isFinite(plon)) {
-          const { getNearestOwmCountry } = await import('./repositories')
-          const { isCountryAllowed } = await import('./country-controls')
-          const cc = await getNearestOwmCountry(plat, plon)
-          if (!isCountryAllowed('noaa' as any, cc)) { i++; continue }
-        }
-      } catch {}
-      const stationId = s.id
-      const stationLatN = Number((s as any).lat)
-      const stationLonN = Number((s as any).lng ?? (s as any).lon)
-      const stationLat: number | undefined = Number.isFinite(stationLatN) ? stationLatN : undefined
-      const stationLon: number | undefined = Number.isFinite(stationLonN) ? stationLonN : undefined
-
-      const begin = new Date().toISOString().slice(0, 10)
-      const end = begin
-      const base = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?station=${stationId}&time_zone=gmt&units=metric&format=json`
-
-      // Fetch core water level plus optional products in parallel
-      const [waterData, tempData, windData, tidePred, salinityData, doData, turbidityData, currentsData] = await Promise.all([
-        fetchJsonWithRetry<any>(`${base}&product=water_level&datum=MLLW&begin_date=${begin}&end_date=${end}`, { retries: 2, providerId: 'noaa' }).catch(() => null),
-        fetchJsonWithRetry<any>(`${base}&product=water_temperature&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
-        fetchJsonWithRetry<any>(`${base}&product=wind&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
-        fetchJsonWithRetry<any>(`${base}&product=predictions&interval=h&datum=MLLW&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
-        fetchJsonWithRetry<any>(`${base}&product=salinity&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
-        fetchJsonWithRetry<any>(`${base}&product=dissolved_oxygen&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
-        fetchJsonWithRetry<any>(`${base}&product=turbidity&begin_date=${begin}&end_date=${end}`, { retries: 1, providerId: 'noaa' }).catch(() => null),
-        fetchJsonWithRetry<any>(`${base}&product=currents&bin=1&begin_date=${begin}&end_date=${end}`, { retries: 1 }).catch(() => null),
-      ])
-
-      const latest = (arr?: any[]) => (Array.isArray(arr) && arr.length > 0 ? arr[arr.length - 1] : null)
-
-      const wl = latest(waterData?.data)
-      if (!wl) { i++; continue }
-
-      const water_level_val = parseFloat(wl.v) || 0
-
-      // Optional extractions
-      const wt = latest(tempData?.data)
-      const wind = latest(windData?.data)
-      const pred = latest(tidePred?.predictions)
-      const sal = latest(salinityData?.data)
-      const disox = latest(doData?.data)
-      const turb = latest(turbidityData?.data)
-
-      const item: WaterLevelData = {
-        river_level: water_level_val,
-        sea_level: water_level_val,
-        location: s.name,
-        timestamp: (wl.t ? new Date(wl.t).toISOString() : new Date().toISOString()),
-        source: 'NOAA Tides & Currents',
-        station_id: stationId,
-        coordinates: (stationLat != null && stationLon != null) ? { lat: stationLat, lon: stationLon } : undefined,
-        tide_height: pred ? parseFloat(pred.v) : undefined,
-        water_temperature_c: wt ? parseFloat(wt.v) : undefined,
-        salinity_psu: sal ? parseFloat(sal.v) : undefined,
-        dissolved_oxygen_mg_l: disox ? parseFloat(disox.v) : undefined,
-        turbidity_ntu: turb ? parseFloat(turb.v) : undefined,
-        wind_speed_kph: wind && wind.s ? Math.round((parseFloat(wind.s) || 0) * 3.6) : undefined,
-        wind_direction_deg: wind && wind.d ? parseFloat(wind.d) : undefined,
-        current_speed_ms: currentsData?.data?.length ? parseFloat(currentsData.data[currentsData.data.length - 1]?.s) || undefined : undefined,
-        current_direction_deg: currentsData?.data?.length ? parseFloat(currentsData.data[currentsData.data.length - 1]?.d) || undefined : undefined,
-      }
-
-      // Enrich with NDBC wave height if coordinates available (async, don't block)
-      if (stationLat != null && stationLon != null) {
-        // Wave height fetch is optional and can be slow, so we'll skip it in batch mode for performance
-        // Individual fetches via fetchNOAAWaterData will still include it
-      }
-
-      const key = `noaa:water:${item.station_id}:${item.timestamp}`
-      if (await dedupeStore.add(key)) out.push(item)
-      await new Promise(r => setTimeout(r, 250))
-    } catch {
-      // skip station on failure
-    }
-    i++
   }
-  await cursorStore.set('noaa', i % (total || 1))
   const totalElapsed = ((Date.now() - batchStart) / 1000).toFixed(1)
-  console.log(`🌊 NOAA: Batch complete – ${out.length} readings from ${Math.min(limit, total)} stations in ${totalElapsed}s`)
+  console.log(`🌊 NOAA: Batch complete – ${out.length} readings from ${selectedStations.length} stations in ${totalElapsed}s`)
   return out
 }
 
@@ -1059,7 +1205,7 @@ export async function collectSeismicDataBatch(hours: number = 6, minMag: number 
   if (typeof maxResults === 'number' && maxResults > 0) {
     url += `&limit=${maxResults}`
   }
-  const data = await fetchJsonWithRetry<any>(url, { retries: 2 })
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'usgs' })
   const features = data?.features || []
   const out: SeismicData[] = []
   for (const f of features) {
@@ -1082,6 +1228,234 @@ export async function collectSeismicDataBatch(hours: number = 6, minMag: number 
     const key = `usgs:seis:${item.event_id}`
     if (await dedupeStore.add(key)) out.push(item)
   }
+  return out
+}
+
+export async function collectSensorCommunityDataBatch(limit: number = 5000): Promise<AirQualityData[]> {
+  const cacheKey = 'sensor_community:snapshot'
+  const cursorKey = 'sensor_community'
+  const endpoint = process.env.SENSOR_COMMUNITY_URL || 'https://data.sensor.community/static/v2/data.dust.min.json'
+
+  let snapshot = await fetchJsonWithRetry<any[]>(endpoint, {
+    retries: 2,
+    providerId: 'sensor_community',
+    etagKey: cacheKey,
+  })
+
+  if ((snapshot as any)?.__notModified) {
+    snapshot = (await cacheStore.get<any[]>(cacheKey)) || []
+  } else if (Array.isArray(snapshot)) {
+    await cacheStore.set(cacheKey, snapshot, 10 * 60 * 1000)
+  }
+
+  const records = Array.isArray(snapshot) ? snapshot : []
+  if (records.length === 0) return []
+
+  const sorted = [...records].sort((a, b) => {
+    const left = Number(a?.sensor?.id || 0)
+    const right = Number(b?.sensor?.id || 0)
+    return left - right
+  })
+
+  const total = sorted.length
+  const useFullSnapshot = isTruthyEnv(process.env.SENSOR_COMMUNITY_USE_FULL_SNAPSHOT, false)
+  const cursor = Number((await cursorStore.get(cursorKey)) ?? 0)
+  const selected = useFullSnapshot || limit >= total
+    ? sorted
+    : buildRotatingSlice(sorted, Number.isFinite(cursor) ? cursor : 0, limit)
+  if (!(useFullSnapshot || limit >= total)) {
+    await cursorStore.set(cursorKey, ((cursor || 0) + selected.length) % total)
+  }
+
+  const out: AirQualityData[] = []
+  for (const record of selected) {
+    const values = parseSensorCommunityValues(record?.sensordatavalues || [])
+    const pm10 = values.P1 ?? values.pm10
+    const pm25 = values.P2 ?? values.pm25
+    if (pm10 === undefined && pm25 === undefined) continue
+
+    const coordinates = (record?.location?.latitude != null && record?.location?.longitude != null)
+      ? {
+          lat: Number(record.location.latitude),
+          lon: Number(record.location.longitude),
+        }
+      : undefined
+    if (coordinates && (!Number.isFinite(coordinates.lat) || !Number.isFinite(coordinates.lon))) {
+      continue
+    }
+
+    const sensorId = record?.sensor?.id != null ? String(record.sensor.id) : String(record?.id || 'unknown')
+    const timestamp = normaliseProviderTimestamp(record?.timestamp)
+    const key = `sensor_community:${sensorId}:${timestamp}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const country = record?.location?.country ? ` ${record.location.country}` : ''
+    out.push({
+      aqi: approximateAqiFromPm(pm25, pm10) ?? 0,
+      pm25: pm25 ?? 0,
+      pm10: pm10 ?? 0,
+      co: 0,
+      no2: 0,
+      o3: 0,
+      temperature: values.temperature ?? values.temperature_c,
+      humidity: values.humidity ?? values.humidity_pct,
+      pressure: values.pressure_at_sealevel ?? values.pressure,
+      location: `Sensor ${sensorId}${country}`,
+      timestamp,
+      source: 'Sensor.Community',
+      coordinates,
+      station_id: sensorId,
+    })
+  }
+
+  return out
+}
+
+export async function collectNdbcLatestObservations(limit: number = 1000): Promise<WaterLevelData[]> {
+  const endpoint = process.env.NDBC_LATEST_OBS_URL || 'https://www.ndbc.noaa.gov/data/latest_obs/latest_obs.txt'
+  const raw = await fetchTextWithRetry(endpoint, {
+    retries: 2,
+    providerId: 'noaa_ndbc',
+    headers: { 'User-Agent': 'GaiaLog/1.0' },
+  })
+
+  const lines = raw
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line && !line.startsWith('#'))
+
+  if (lines.length === 0) return []
+
+  const useFullSnapshot = isTruthyEnv(process.env.NDBC_USE_FULL_SNAPSHOT, false)
+  const cursor = Number((await cursorStore.get('noaa_ndbc')) ?? 0)
+  const selected = useFullSnapshot || limit >= lines.length
+    ? lines
+    : buildRotatingSlice(lines, Number.isFinite(cursor) ? cursor : 0, limit)
+  if (!(useFullSnapshot || limit >= lines.length)) {
+    await cursorStore.set('noaa_ndbc', ((cursor || 0) + selected.length) % lines.length)
+  }
+
+  const out: WaterLevelData[] = []
+  for (const line of selected) {
+    const parts = line.split(/\s+/)
+    if (parts.length < 18) continue
+
+    const [
+      stationId,
+      latRaw,
+      lonRaw,
+      yearRaw,
+      monthRaw,
+      dayRaw,
+      hourRaw,
+      minuteRaw,
+      windDirRaw,
+      windSpeedRaw,
+      gustRaw,
+      waveHeightRaw,
+      dominantPeriodRaw,
+      averagePeriodRaw,
+      meanWaveDirectionRaw,
+      pressureRaw,
+      pressureTrendRaw,
+      airTempRaw,
+      waterTempRaw,
+      dewPointRaw,
+      visibilityRaw,
+      tideRaw,
+    ] = parts
+
+    const year = Number(yearRaw)
+    const month = Number(monthRaw)
+    const day = Number(dayRaw)
+    const hour = Number(hourRaw)
+    const minute = Number(minuteRaw)
+    if (![year, month, day, hour, minute].every(value => Number.isFinite(value))) continue
+
+    const timestamp = new Date(Date.UTC(year, month - 1, day, hour, minute)).toISOString()
+    const key = `noaa_ndbc:${stationId}:${timestamp}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const lat = parseNumericValue(latRaw)
+    const lon = parseNumericValue(lonRaw)
+    const tideFeet = parseNumericValue(tideRaw)
+    const tideMetres = tideFeet !== undefined ? Number((tideFeet * 0.3048).toFixed(3)) : undefined
+    const waveHeight = parseNumericValue(waveHeightRaw)
+
+    out.push({
+      river_level: tideMetres,
+      sea_level: tideMetres,
+      location: stationId,
+      timestamp,
+      source: 'NOAA NDBC',
+      station_id: stationId,
+      coordinates: lat !== undefined && lon !== undefined ? { lat, lon } : undefined,
+      wave_height_m: waveHeight,
+      tide_height: tideMetres,
+      water_temperature_c: parseNumericValue(waterTempRaw),
+      air_temperature_c: parseNumericValue(airTempRaw),
+      dew_point_c: parseNumericValue(dewPointRaw),
+      visibility_nmi: parseNumericValue(visibilityRaw),
+      pressure_hpa: parseNumericValue(pressureRaw),
+      pressure_tendency_hpa: parseNumericValue(pressureTrendRaw),
+      wind_speed_kph: (() => {
+        const windSpeed = parseNumericValue(windSpeedRaw)
+        return windSpeed !== undefined ? Number((windSpeed * 3.6).toFixed(2)) : undefined
+      })(),
+      gust_kph: (() => {
+        const gust = parseNumericValue(gustRaw)
+        return gust !== undefined ? Number((gust * 3.6).toFixed(2)) : undefined
+      })(),
+      wind_direction_deg: parseNumericValue(windDirRaw),
+      wave_period_s: parseNumericValue(dominantPeriodRaw),
+      average_wave_period_s: parseNumericValue(averagePeriodRaw),
+      mean_wave_direction_deg: parseNumericValue(meanWaveDirectionRaw),
+      dissolved_oxygen_mg_l: undefined,
+      salinity_psu: undefined,
+      turbidity_ntu: undefined,
+      ph: undefined,
+      wave_height_is_nearby: false,
+      wave_nearby_distance_km: undefined,
+      wave_nearby_station: undefined,
+    })
+  }
+
+  return out
+}
+
+export async function collectEMSCLatestEvents(minutesBack: number = 15, limit: number = 500): Promise<SeismicData[]> {
+  const end = new Date()
+  const start = new Date(end.getTime() - minutesBack * 60 * 1000)
+  const url = `https://www.seismicportal.eu/fdsnws/event/1/query?format=json&starttime=${start.toISOString()}&endtime=${end.toISOString()}&limit=${limit}&orderby=time`
+  const data = await fetchJsonWithRetry<any>(url, {
+    retries: 2,
+    providerId: 'emsc',
+    jsonFallbackValue: { features: [] },
+  })
+  const features = Array.isArray(data?.features) ? data.features : []
+  const out: SeismicData[] = []
+
+  for (const feature of features) {
+    const properties = feature?.properties || {}
+    const coordinates = feature?.geometry?.coordinates || []
+    const eventId = String(properties?.unid || feature?.id || '')
+    if (!eventId) continue
+    const key = `emsc:seis:${eventId}`
+    if (!(await dedupeStore.add(key))) continue
+    out.push({
+      magnitude: Number(properties?.mag ?? 0),
+      depth: Number(properties?.depth ?? 0),
+      location: String(properties?.flynn_region || properties?.place || 'Unknown region'),
+      coordinates: {
+        lat: Number(properties?.lat ?? coordinates?.[1] ?? 0),
+        lon: Number(properties?.lon ?? coordinates?.[0] ?? 0),
+      },
+      timestamp: normaliseProviderTimestamp(properties?.time),
+      source: 'EMSC',
+      event_id: eventId,
+    })
+  }
+
   return out
 }
 

@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { getBSVNetwork, getBSVExplorerUrl, getBSVAddressUrl, isValidTxId } from "@/lib/utils"
+import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
 
 interface ReadingData {
   provider?: string
@@ -88,13 +89,7 @@ export function BlockchainExplorer() {
   }, [])
 
   const formatType = (type: string): string => {
-    const typeMap: { [key: string]: string } = {
-      air_quality: 'Air Quality',
-      water_levels: 'Water Levels',
-      seismic_activity: 'Seismic Activity',
-      advanced_metrics: 'Advanced Metrics',
-    }
-    return typeMap[type] || type
+    return DATA_FAMILY_DESCRIPTORS[type as keyof typeof DATA_FAMILY_DESCRIPTORS]?.label || type
   }
 
   const formatTimestamp = (timestamp: string): string => {
@@ -152,7 +147,8 @@ export function BlockchainExplorer() {
 
           <>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
-              {['Air Quality', 'Water Levels', 'Seismic Activity', 'Advanced Metrics'].map((label) => {
+              {Object.values(DATA_FAMILY_DESCRIPTORS).map((descriptor) => {
+                const label = descriptor.label
                 const tx = transactions.find((t) => t.type === label)
                 return (
                   <GlowCard key={label} glowColor="purple" customSize>
