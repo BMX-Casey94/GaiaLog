@@ -532,7 +532,7 @@ export class WorkerQueue {
               topic,
               minSatoshis: 0,
               excludeReserved: false,
-              confirmedOnly: true,
+              confirmedOnly: minConf > 0,
               allowDegradedStale: true,
             })
             return { addr, walletIndex, confirmed }

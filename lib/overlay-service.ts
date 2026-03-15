@@ -13,6 +13,7 @@ import {
   insertAdmittedOutput,
   listLookupOutputs,
   markCoinRemoved,
+  refreshTopicCounts,
   type OverlayAdmittedUtxoRow,
   type OverlayLookupQuery,
   updateExistingOutputMetadata,
@@ -413,6 +414,13 @@ export async function submitOverlayTransaction(input: unknown): Promise<OverlayS
       })
 
       steakByTopic[topic] = steak
+    }
+
+    // Refresh cached topic counts once per topic at the end of the transaction,
+    // replacing the dropped per-row trigger (migration 0013).
+    const touchedTopics = new Set(normalized.topics)
+    for (const topic of touchedTopics) {
+      await refreshTopicCounts(client, topic)
     }
 
     return steakByTopic

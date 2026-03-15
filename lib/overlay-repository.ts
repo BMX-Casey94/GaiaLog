@@ -89,6 +89,13 @@ export async function insertAdmittedOutput(
        topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed
      )
      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+     ON CONFLICT (topic, txid, vout) DO UPDATE SET
+       raw_tx = EXCLUDED.raw_tx,
+       beef = COALESCE(EXCLUDED.beef, overlay_admitted_utxos.beef),
+       confirmed = CASE WHEN EXCLUDED.confirmed THEN true ELSE overlay_admitted_utxos.confirmed END,
+       removed = false,
+       removed_at = NULL,
+       spending_txid = NULL
      RETURNING topic, txid, vout, satoshis, output_script, raw_tx, beef, admitted_at, confirmed, removed, removed_at, spending_txid`,
     [
       row.topic,
@@ -185,6 +192,10 @@ export async function upsertOverlaySubmission(client: PoolClient, submission: Ov
       submission.accepted,
     ],
   )
+}
+
+export async function refreshTopicCounts(client: PoolClient, topic: string): Promise<void> {
+  await client.query(`SELECT refresh_overlay_topic_counts($1)`, [topic])
 }
 
 export async function getCachedTopicCount(topic: string, confirmedOnly: boolean): Promise<number | null> {
