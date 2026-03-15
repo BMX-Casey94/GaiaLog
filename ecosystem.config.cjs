@@ -93,7 +93,7 @@ module.exports = {
       cwd: __dirname,
       instances: 1,
       exec_mode: 'fork',
-      node_args: '--max-old-space-size=6144',
+      node_args: '--max-old-space-size=8192',
       env: {
         NODE_ENV: 'production',
         GAIALOG_WORKER_PROCESS: '1',
@@ -101,8 +101,10 @@ module.exports = {
         GAIALOG_MUTATOR_ROLE: 'primary',
         BSV_OVERLAY_AUTH_MODE: process.env.BSV_OVERLAY_AUTH_MODE || 'brc104',
         BSV_OVERLAY_CLIENT_IDENTITY_WIF: process.env.BSV_OVERLAY_CLIENT_IDENTITY_WIF,
+        BSV_HEAP_GUARD_HIGH_WATERMARK: process.env.BSV_HEAP_GUARD_HIGH_WATERMARK || '0.90',
+        BSV_HEAP_GUARD_PAUSE_MS: process.env.BSV_HEAP_GUARD_PAUSE_MS || '15000',
       },
-      max_memory_restart: '5G',
+      max_memory_restart: '8G',
       // Recycle the worker process every 30 minutes to prevent event-loop stalls.
       // PM2 sends SIGINT, waits kill_timeout ms, then SIGKILL if still alive.
       // Queue state is persisted in the DB and re-hydrated on each restart.
