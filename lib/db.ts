@@ -18,9 +18,10 @@ const connectionConfig = {
   user: process.env.PGUSER || 'postgres',
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE || 'gaialog',
-  max: Number(process.env.PGPOOL_MAX || 10),
+  max: Number(process.env.PGPOOL_MAX || 3),
   ssl: sslConfig,
   connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 5000,
 }
 
 const shouldUseSSL = !!isSupabase
@@ -29,6 +30,13 @@ let dbWarned = false
 
 // Keep the pool initialized so we can re-enable later without code churn.
 export const dbPool = new Pool(connectionConfig)
+
+// Drain pool on process exit so session-mode pooler connections are freed promptly
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, () => {
+    dbPool.end().catch(() => {})
+  })
+}
 
 export async function query<T extends PgQueryResultRow = any>(text: string, params?: any[]): Promise<QueryResult<T>> {
   // Temporary DB disable switch - non-destructive. Returns empty rows.
