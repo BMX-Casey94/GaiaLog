@@ -71,6 +71,8 @@ export class WorkerQueue {
   private lastUtxoGateCheckedAt = 0
   private lastUtxoGateOk = true
   private lastUtxoPauseLogAt = 0
+  private lastProcessQueueSkipLogAt = 0
+  private queueSkipLogAtByReason = new Map<string, number>()
   private utxoPauseState: 'ok' | 'paused' = 'ok'
   private queuedCountSinceLastSample = 0
   private processedCountSinceLastSample = 0
@@ -286,14 +288,25 @@ export class WorkerQueue {
     }, 5 * 60 * 1000)
   }
 
+  private shouldLogQueueSkip(reason: string): boolean {
+    const now = Date.now()
+    const last = this.queueSkipLogAtByReason.get(reason) ?? 0
+    if (now - last < 60000) return false
+    this.queueSkipLogAtByReason.set(reason, now)
+    return true
+  }
+
   private async processQueue(): Promise<void> {
+    const totalItems = this.highPriorityQueue.length + this.normalPriorityQueue.length
     // Skip processing if no items in queue
-    if (this.highPriorityQueue.length === 0 && this.normalPriorityQueue.length === 0) {
+    if (totalItems === 0) {
       return
     }
 
     if (!bsvTransactionService.isReady()) {
-      // Try lazy init and continue; avoid stalling the queue if wallet manager is ready
+      if (this.shouldLogQueueSkip('txServiceNotReady')) {
+        console.warn(`🔍 [queue-debug] Skipping processQueue: bsvTransactionService not ready (items=${totalItems})`)
+      }
       return
     }
 
@@ -308,7 +321,10 @@ export class WorkerQueue {
       }
     }
     if (!this.lastUtxoGateOk) {
-      // Soft pause: wait for maintainer/splits to confirm
+      if (this.shouldLogQueueSkip('utxoGatePaused')) {
+        const gate = this.lastGateInfo
+        console.warn(`🔍 [queue-debug] Skipping processQueue: UTXO gate paused (items=${totalItems}, okWallets=${gate.okWallets}/${gate.totalWallets}, minConf=${gate.minConfirmed}/${gate.minRequired})`)
+      }
       return
     }
 
@@ -407,8 +423,12 @@ export class WorkerQueue {
         })
         wasBroadcast = true
       } catch (e) {
+        const msg = e instanceof Error ? e.message : 'Unknown error'
+        if (this.shouldLogQueueSkip('writeToChainError')) {
+          console.warn(`🔍 [queue-debug] writeToChain failed for item ${item.id}: ${msg}`)
+        }
         // Always re-queue failed transactions instead of using fallbacks
-        await this.handleFailedItem(item, e instanceof Error ? e.message : 'Unknown error')
+        await this.handleFailedItem(item, msg)
         return
       }
 
