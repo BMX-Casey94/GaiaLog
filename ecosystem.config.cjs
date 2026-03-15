@@ -93,9 +93,10 @@ module.exports = {
       cwd: __dirname,
       instances: 1,
       exec_mode: 'fork',
-      node_args: '--max-old-space-size=8192',
+      node_args: ['--max-old-space-size=8192'],
       env: {
         NODE_ENV: 'production',
+        NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=8192',
         GAIALOG_WORKER_PROCESS: '1',
         GAIALOG_SINGLE_WRITER_MODE: 'run-workers',
         GAIALOG_MUTATOR_ROLE: 'primary',

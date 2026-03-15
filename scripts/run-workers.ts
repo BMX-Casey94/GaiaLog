@@ -9,6 +9,13 @@ dotenv.config()
 applyPrimaryMutatorRole()
 
 console.log('🚀 Starting GaiaLog worker service...')
+// Log heap limit for debugging OOM (expect 8192 MB on workers)
+try {
+  const v8 = require('v8')
+  const stats = v8.getHeapStatistics()
+  const limitMB = Math.round((stats.heap_size_limit || 0) / 1024 / 1024)
+  console.log(`📦 Node heap limit: ${limitMB} MB`)
+} catch {}
 // Mark this process as the worker process so API routes can gate chain writes
 process.env.GAIALOG_WORKER_PROCESS = '1'
 const mutatorControl = getMutatorControlState()
