@@ -82,6 +82,9 @@ const TAAL_ARC_ENDPOINT = (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com
 // GorillaPool/TAAL ARC minimum: 100 sat/kB (0.1 sat/byte)
 // Default to 0.105 sat/byte (105 sat/kB) — 5% margin above ARC floor
 const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.105)
+// #region agent log
+if (process.env.GAIALOG_WORKER_PROCESS === '1') { try { const p={sessionId:'de58de',location:'blockchain.ts:init',message:'FEE_RATE at module load',data:{FEE_RATE_SAT_PER_BYTE,envRaw:process.env.BSV_TX_FEE_RATE,feePerKb:Math.ceil(FEE_RATE_SAT_PER_BYTE*1000)},timestamp:Date.now(),hypothesisId:'fee-init'}; require('fs').appendFileSync('debug-de58de.log',JSON.stringify(p)+'\n'); fetch('http://127.0.0.1:7837/ingest/190a1802-4ad6-4b1b-88b9-1377d3158233',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'de58de'},body:JSON.stringify(p)}).catch(()=>{}); } catch(_){} }
+// #endregion
 // BSV has no dust limit — 1 sat is the minimum viable output
 const DUST_LIMIT = 1
 // UTXO spend policy: default allows all UTXOs (including unconfirmed).
@@ -1046,79 +1049,6 @@ export class BlockchainService {
       const confirmedOnly = utxos.filter(isConfirmedUtxo)
       const selectionPool = (preferConfirmed && confirmedOnly.length > 0) ? confirmedOnly : utxos
 
-      // If below low-watermark, prefer the smallest to leave the largest for the splitter
-      const lowWater = Number(process.env.BSV_UTXO_LOW_WATERMARK || 50)
-      // Order candidate UTXOs
-      const candidates = selectionPool.length <= lowWater
-        ? [...selectionPool].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
-        : [...selectionPool].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
-      // Try to reserve one; skip already-reserved inputs
-      let selectedUtxo: any | null = null
-      let inputKey = ''
-      for (const u of candidates) {
-        const key = `${u.tx_hash}:${u.tx_pos}`
-        if (isSplitInputHeld && isSplitInputHeld(address, key)) continue
-        if (ENABLE_UTXO_DB_LOCKS) {
-          try {
-            const { reserveUtxoKeys } = await import('./utxo-locks')
-            const reserved = await reserveUtxoKeys([key])
-            if (reserved.includes(key)) {
-              selectedUtxo = u
-              inputKey = key
-              break
-            }
-          } catch {}
-        } else {
-          // No DB lock: pick the first candidate that isn't already in-flight.
-          // Check usedKeys directly (not just the pre-filtered snapshot) to close
-          // the race window between concurrent writeToChain calls.
-          const addrCache = this.utxoCacheByAddress.get(address)
-          const alreadyUsed = addrCache?.usedKeys?.get(key)
-          if (alreadyUsed && alreadyUsed > Date.now()) continue // skip — another call grabbed it
-          // Mark used IMMEDIATELY to prevent concurrent calls from selecting the same UTXO
-          if (ENABLE_UTXO_POOL && addrCache) {
-            addrCache.usedKeys.set(key, Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS))
-          }
-          selectedUtxo = u
-          inputKey = key
-          break
-        }
-      }
-      // If every candidate was already claimed, force-refresh and try once more.
-      // Change outputs from recent TXs may now be visible to the indexer.
-      if (!selectedUtxo) {
-        await this.refreshUtxoCache(address, wif, true)
-        const freshUtxos = await this.getSpendableUtxos(address, wif, walletIndexForLog, traceId)
-        const freshConfirmedOnly = freshUtxos.filter(isConfirmedUtxo)
-        const freshPool = (preferConfirmed && freshConfirmedOnly.length > 0) ? freshConfirmedOnly : freshUtxos
-        const freshCandidates = freshPool.length <= lowWater
-          ? [...freshPool].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
-          : [...freshPool].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
-        for (const u of freshCandidates) {
-          const key = `${u.tx_hash}:${u.tx_pos}`
-          if (isSplitInputHeld && isSplitInputHeld(address, key)) continue
-          const addrCache = this.utxoCacheByAddress.get(address)
-          const alreadyUsed = addrCache?.usedKeys?.get(key)
-          if (alreadyUsed && alreadyUsed > Date.now()) continue
-          if (ENABLE_UTXO_POOL && addrCache) {
-            addrCache.usedKeys.set(key, Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS))
-          }
-          selectedUtxo = u
-          inputKey = key
-          break
-        }
-      }
-      if (!selectedUtxo) {
-        throw new Error('No reservable UTXO available')
-      }
-      const bitcoreUtxos = [{
-        txId: selectedUtxo.tx_hash,
-        outputIndex: selectedUtxo.tx_pos,
-        address,
-        script: scriptPubKey,
-        satoshis: selectedUtxo.value,
-      }]
-
       // Build payload bytes (optionally gzip) and optional extra pushes
       const includeHashPush = process.env.BSV_OPRETURN_INCLUDE_HASH_PUSH === 'true'
       const useGzip = process.env.BSV_OPRETURN_GZIP === 'true'
@@ -1152,28 +1082,143 @@ export class BlockchainService {
         useTrueReturn,
       })
       const opReturnScript = (bsv as any).Script.fromHex(scriptHex)
+      const opReturnBytes = scriptHex.length / 2
+      const opReturnOutputSats = useTrueReturn ? 1 : 0
+      const BASE_WITH_CHANGE = 44 // version + locktime + varints + P2PKH change output
+      const INPUT_SIGNED = 148 // signed P2PKH input with scriptSig
 
-      // Create transaction using library helpers for fee/change handling.
-      // feePerKb MUST be set BEFORE .change() — bitcore-lib calculates the
-      // change output at .change() time using the currently-set fee rate.
+      const estimateExplicitFee = (inputCount: number, feeMultiplier: number): { estimatedSize: number; explicitFee: number } => {
+        const estimatedSize = BASE_WITH_CHANGE + inputCount * INPUT_SIGNED + opReturnBytes
+        const explicitFee = Math.ceil(estimatedSize * FEE_RATE_SAT_PER_BYTE * feeMultiplier)
+        return { estimatedSize, explicitFee }
+      }
+
+      const releaseSelectedKeys = async (keys: string[]): Promise<void> => {
+        if (keys.length === 0) return
+        if (ENABLE_UTXO_POOL) this.releaseUtxos(keys)
+        if (ENABLE_UTXO_DB_LOCKS) {
+          try {
+            const { releaseUtxoKeys } = await import('./utxo-locks')
+            await releaseUtxoKeys(keys)
+          } catch {}
+        }
+      }
+
+      const tryReserveCandidate = async (u: any): Promise<string | null> => {
+        const key = `${u.tx_hash}:${u.tx_pos}`
+        if (isSplitInputHeld && isSplitInputHeld(address, key)) return null
+        if (ENABLE_UTXO_DB_LOCKS) {
+          try {
+            const { reserveUtxoKeys } = await import('./utxo-locks')
+            const reserved = await reserveUtxoKeys([key])
+            if (reserved.includes(key)) return key
+          } catch {}
+          return null
+        }
+        const addrCache = this.utxoCacheByAddress.get(address)
+        const alreadyUsed = addrCache?.usedKeys?.get(key)
+        if (alreadyUsed && alreadyUsed > Date.now()) return null
+        if (ENABLE_UTXO_POOL && addrCache) {
+          addrCache.usedKeys.set(key, Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS))
+        }
+        return key
+      }
+
+      const selectEnoughInputs = async (sourceUtxos: any[]): Promise<{ selectedUtxos: any[]; selectedKeys: string[] } | null> => {
+        const selectedUtxos: any[] = []
+        const selectedKeys: string[] = []
+        let totalInput = 0
+        for (const u of sourceUtxos) {
+          const key = await tryReserveCandidate(u)
+          if (!key) continue
+          selectedUtxos.push(u)
+          selectedKeys.push(key)
+          totalInput += Number(u?.value || 0)
+          const { explicitFee } = estimateExplicitFee(selectedUtxos.length, 1)
+          if (totalInput - opReturnOutputSats >= explicitFee) {
+            return { selectedUtxos, selectedKeys }
+          }
+        }
+        await releaseSelectedKeys(selectedKeys)
+        return null
+      }
+
+      // If below low-watermark, prefer the smallest to leave the largest for the splitter
+      const lowWater = Number(process.env.BSV_UTXO_LOW_WATERMARK || 50)
+      const candidates = selectionPool.length <= lowWater
+        ? [...selectionPool].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
+        : [...selectionPool].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
+
+      let selectedInputs = await selectEnoughInputs(candidates)
+      if (!selectedInputs) {
+        await this.refreshUtxoCache(address, wif, true)
+        const freshUtxos = await this.getSpendableUtxos(address, wif, walletIndexForLog, traceId)
+        const freshConfirmedOnly = freshUtxos.filter(isConfirmedUtxo)
+        const freshPool = (preferConfirmed && freshConfirmedOnly.length > 0) ? freshConfirmedOnly : freshUtxos
+        const freshCandidates = freshPool.length <= lowWater
+          ? [...freshPool].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
+          : [...freshPool].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
+        selectedInputs = await selectEnoughInputs(freshCandidates)
+      }
+      if (!selectedInputs) {
+        throw new Error('No reservable UTXO set covers the required fee')
+      }
+      const selectedInputKeys = selectedInputs.selectedKeys
+      const bitcoreUtxos = selectedInputs.selectedUtxos.map((u: any) => ({
+        txId: u.tx_hash,
+        outputIndex: u.tx_pos,
+        address,
+        script: scriptPubKey,
+        satoshis: u.value,
+      }))
+
+      // Create transaction using explicit fee. bsv's feePerKb uses _estimateSize()
+      // which runs BEFORE signing — input scriptSigs grow from ~40 to ~148 bytes,
+      // so the library underestimates size and we end up with ~22 sat/kB instead of 105.
+      // We estimate size ourselves: signed P2PKH input=148 bytes, op_return known.
       const buildSerialized = (feeMultiplier: number): string => {
-        const feePerKb = Math.ceil(FEE_RATE_SAT_PER_BYTE * 1000 * feeMultiplier)
-        const tx = new (bsv as any).Transaction()
+        const numInputs = bitcoreUtxos.length
+        const { estimatedSize, explicitFee } = estimateExplicitFee(numInputs, feeMultiplier)
+        const inputSats = bitcoreUtxos.reduce((s: number, u: any) => s + (u.satoshis || 0), 0)
+        const availableForFee = inputSats - opReturnOutputSats
+        if (availableForFee < explicitFee) {
+          throw new Error(`Selected inputs do not cover explicit fee: available=${availableForFee} explicitFee=${explicitFee}`)
+        }
+        const dustAmount = Number((bsv as any).Transaction?.DUST_AMOUNT ?? 546)
+        const changeSats = availableForFee - explicitFee
+        const useChangeOutput = changeSats >= dustAmount
+        const feeToUse = useChangeOutput ? explicitFee : availableForFee
+        let tx = new (bsv as any).Transaction()
           .from(bitcoreUtxos)
           .addOutput(new bsv.Transaction.Output({
             script: opReturnScript,
-            satoshis: useTrueReturn ? 1 : 0,
+            satoshis: opReturnOutputSats,
           }))
-          .feePerKb(feePerKb)
-          .change(address)
+          .fee(feeToUse)
+        if (useChangeOutput) {
+          tx = tx.change(address)
+        }
         const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
         tx.sign(signingKey)
-        const serialized = tx.serialize()
-        const inputSats = bitcoreUtxos.reduce((s: number, u: any) => s + (u.satoshis || 0), 0)
+        let serialized: string
+        try {
+          serialized = tx.serialize()
+        } catch (serializeErr) {
+          const serializeMsg = serializeErr instanceof Error ? serializeErr.message : String(serializeErr)
+          // #region agent log
+          try { const p={sessionId:'de58de',location:'blockchain.ts:buildSerialized',message:'TX serialize failed',data:{FEE_RATE_SAT_PER_BYTE,explicitFee,estimatedSize,feeMultiplier,feeToUse,useChangeOutput,inputCount:numInputs,inputSats,availableForFee,changeSats,error:serializeMsg},timestamp:Date.now(),hypothesisId:'fee-selection'}; require('fs').appendFileSync('debug-de58de.log',JSON.stringify(p)+'\n'); fetch('http://127.0.0.1:7837/ingest/190a1802-4ad6-4b1b-88b9-1377d3158233',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'de58de'},body:JSON.stringify(p)}).catch(()=>{}); } catch(_){}
+          // #endregion
+          throw serializeErr
+        }
         const outputSats = tx.outputs.reduce((s: number, o: any) => s + (o.satoshis || o._satoshis || 0), 0)
         const actualFee = inputSats - outputSats
+        const txSizeBytes = serialized.length / 2
+        const impliedSatPerKb = txSizeBytes > 0 ? Math.round((actualFee / txSizeBytes) * 1000) : 0
+        // #region agent log
+        try { const p={sessionId:'de58de',location:'blockchain.ts:buildSerialized',message:'TX fee at build',data:{FEE_RATE_SAT_PER_BYTE,explicitFee,estimatedSize,feeMultiplier,feeToUse,useChangeOutput,inputCount:numInputs,actualFee,txSizeBytes,impliedSatPerKb,inputSats,outputSats},timestamp:Date.now(),hypothesisId:'fee-rate'}; require('fs').appendFileSync('debug-de58de.log',JSON.stringify(p)+'\n'); fetch('http://127.0.0.1:7837/ingest/190a1802-4ad6-4b1b-88b9-1377d3158233',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'de58de'},body:JSON.stringify(p)}).catch(()=>{}); } catch(_){}
+        // #endregion
         if (actualFee < 2) {
-          console.warn(`⚠️  TX fee sanity check: fee=${actualFee} sats, feePerKb=${feePerKb}, txSize=${serialized.length / 2} bytes, input=${inputSats}`)
+          console.warn(`⚠️  TX fee sanity check: fee=${actualFee} sats, explicitFee=${explicitFee}, txSize=${txSizeBytes} bytes, input=${inputSats}`)
         }
         return serialized
       }
@@ -1195,10 +1240,10 @@ export class BlockchainService {
       // Broadcast transaction via GorillaPool ARC (primary) → TAAL ARC (fallback)
       // Note: UTXO was already marked used at selection time (race-condition guard).
       // The call below simply refreshes the TTL.
-      let reservedKeys: string[] = []
+        let reservedKeys: string[] = []
       try {
         if (ENABLE_UTXO_POOL) {
-          reservedKeys = bitcoreUtxos.map((i: any) => `${i.txId}:${i.outputIndex}`)
+            reservedKeys = selectedInputKeys.slice()
           this.markUtxosUsed(reservedKeys) // refresh TTL
         }
         const buildStartedAt = Date.now()
@@ -1324,7 +1369,7 @@ export class BlockchainService {
         this.broadcastCountSinceLastSample++
         // Release global reservation after successful broadcast
         if (ENABLE_UTXO_DB_LOCKS) {
-          try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys([inputKey]) } catch {}
+          try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys(selectedInputKeys) } catch {}
         }
         this.logWriteToChainSummary({
           traceId,
@@ -1350,7 +1395,7 @@ export class BlockchainService {
         }
         // Release global reservation as well
         if (ENABLE_UTXO_DB_LOCKS) {
-          try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys([inputKey]) } catch {}
+          try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys(selectedInputKeys) } catch {}
         }
         throw innerErr
       }
