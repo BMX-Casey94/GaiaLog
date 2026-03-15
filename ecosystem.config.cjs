@@ -101,6 +101,7 @@ module.exports = {
         GAIALOG_MUTATOR_ROLE: 'primary',
         BSV_OVERLAY_AUTH_MODE: process.env.BSV_OVERLAY_AUTH_MODE || 'brc104',
         BSV_OVERLAY_CLIENT_IDENTITY_WIF: process.env.BSV_OVERLAY_CLIENT_IDENTITY_WIF,
+        BSV_HEAP_GUARD_ENABLED: process.env.BSV_HEAP_GUARD_ENABLED ?? 'false',
         BSV_HEAP_GUARD_HIGH_WATERMARK: process.env.BSV_HEAP_GUARD_HIGH_WATERMARK || '0.98',
         BSV_HEAP_GUARD_PAUSE_MS: process.env.BSV_HEAP_GUARD_PAUSE_MS || '10000',
         BSV_SPEND_SOURCE_MODE: process.env.BSV_SPEND_SOURCE_MODE || 'legacy',
