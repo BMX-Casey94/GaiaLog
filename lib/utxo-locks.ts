@@ -33,6 +33,7 @@ export async function ensureUtxoLocksTable(): Promise<void> {
       utxo_key text PRIMARY KEY,
       reserved_by text NOT NULL,
       reserved_at timestamptz NOT NULL DEFAULT now(),
+      created_at timestamptz NOT NULL DEFAULT now(),
       expires_at timestamptz NOT NULL
     );
     CREATE INDEX IF NOT EXISTS utxo_locks_expires_idx ON utxo_locks(expires_at);

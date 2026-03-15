@@ -2,10 +2,13 @@
 import fs from 'fs'
 import path from 'path'
 import dotenv from 'dotenv'
+
+// Load env before db module; imports are hoisted so we must load db dynamically
 dotenv.config({ path: '.env.local' })
-import { dbPool } from '@/lib/db'
+dotenv.config()
 
 async function run() {
+  const { dbPool } = await import('@/lib/db')
   const migrationsDir = path.resolve(process.cwd(), 'db', 'migrations')
   const files = fs
     .readdirSync(migrationsDir)
