@@ -412,6 +412,9 @@ export class WorkerQueue {
       let resultTxid: string | null = null
       let wasBroadcast = false
       try {
+        if (this.shouldLogQueueSkip('writeToChainEnter')) {
+          console.log(`🔍 [queue-debug] Entering writeToChain for item ${item.id} (stream=${stream})`)
+        }
         resultTxid = await blockchainService.writeToChain({
           stream,
           timestamp: item.data.timestamp,

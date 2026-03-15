@@ -89,11 +89,10 @@ module.exports = {
     {
       name: 'gaialog-workers',
       script: 'node',
-      args: ['--import', 'tsx', 'scripts/run-workers.ts'],
+      args: ['--max-old-space-size=8192', '--import', 'tsx', 'scripts/run-workers.ts'],
       cwd: __dirname,
       instances: 1,
       exec_mode: 'fork',
-      node_args: ['--max-old-space-size=8192'],
       env: {
         NODE_ENV: 'production',
         NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=8192',
@@ -104,6 +103,7 @@ module.exports = {
         BSV_OVERLAY_CLIENT_IDENTITY_WIF: process.env.BSV_OVERLAY_CLIENT_IDENTITY_WIF,
         BSV_HEAP_GUARD_HIGH_WATERMARK: process.env.BSV_HEAP_GUARD_HIGH_WATERMARK || '0.98',
         BSV_HEAP_GUARD_PAUSE_MS: process.env.BSV_HEAP_GUARD_PAUSE_MS || '10000',
+        BSV_SPEND_SOURCE_MODE: process.env.BSV_SPEND_SOURCE_MODE || 'legacy',
       },
       max_memory_restart: '8G',
       // Recycle the worker process every 30 minutes to prevent event-loop stalls.
