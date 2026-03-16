@@ -493,9 +493,9 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
       const allow = (providerConfigs as any)?.waqi?.countries?.allow || []
       const countries = Array.isArray(allow) && allow.length > 0 ? allow : undefined
       const key = 'stations'
-      const pageSize = Number(process.env.WAQI_STATION_PAGE_SIZE || 150)
+      const pageSize = Number(process.env.WAQI_STATION_PAGE_SIZE || 1000)
+      const concurrency = Math.max(1, Number(process.env.WAQI_STATION_CONCURRENCY || 20))
 
-      // Continuous Sweep: page through all DB stations within a time budget
       const sweepBudgetMs = Math.max(30_000, Math.floor(this.getIntervalMs() * 0.85))
       const sweepStart = Date.now()
       const allItems: any[] = []
@@ -507,6 +507,7 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
       if (!dbDisabled && process.env.WAQI_API_KEY) {
         const cursorScope = countries && countries.length === 1 ? countries[0] : null
         let cursorWrapped = false
+        const token = process.env.WAQI_API_KEY
 
         while (!cursorWrapped && (Date.now() - sweepStart) < sweepBudgetMs) {
           try {
@@ -527,12 +528,14 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
             }
             await writeCursor('waqi', cursorScope, key, nextOffset)
 
-            for (const s of stations) {
-              try {
-                const url = `https://api.waqi.info/feed/@${encodeURIComponent(s.station_code)}/?token=${process.env.WAQI_API_KEY}`
+            for (let chunkStart = 0; chunkStart < stations.length; chunkStart += concurrency) {
+              if ((Date.now() - sweepStart) >= sweepBudgetMs) break
+              const chunk = stations.slice(chunkStart, chunkStart + concurrency)
+              const results = await Promise.allSettled(chunk.map(async (s) => {
+                const url = `https://api.waqi.info/feed/@${encodeURIComponent(s.station_code)}/?token=${token}`
                 const d = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'waqi' })
                 if (d?.status === 'ok') {
-                  allItems.push({
+                  return {
                     aqi: d.data?.aqi,
                     pm25: d.data?.iaqi?.pm25?.['v'] || 0,
                     pm10: d.data?.iaqi?.pm10?.['v'] || 0,
@@ -548,17 +551,23 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
                     temperature: d.data?.iaqi?.t?.['v'] ?? d.data?.iaqi?.temp?.['v'],
                     humidity: d.data?.iaqi?.h?.['v'],
                     pressure: d.data?.iaqi?.p?.['v'],
-                  })
-                  totalSuccess++
+                  }
                 }
-              } catch {
-                totalErrors++
+                return null
+              }))
+              for (const r of results) {
+                if (r.status === 'fulfilled' && r.value) {
+                  allItems.push(r.value)
+                  totalSuccess++
+                } else if (r.status === 'rejected') {
+                  totalErrors++
+                }
               }
             }
 
             totalStationsQueried += stations.length
             pagesSwept++
-            if (pagesSwept % 5 === 0 || cursorWrapped) {
+            if (pagesSwept % 3 === 0 || cursorWrapped) {
               const elapsed = ((Date.now() - sweepStart) / 1000).toFixed(1)
               console.log(`WAQI: Sweep p${pagesSwept} stations=${totalStationsQueried} readings=${allItems.length} ok=${totalSuccess} err=${totalErrors} ${elapsed}s`)
             }

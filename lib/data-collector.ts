@@ -1574,7 +1574,7 @@ async function saveWaqiIndexToDisk(stations: WaqiStation[]): Promise<void> {
   } catch {}
 }
 
-const WAQI_TILES_PER_CYCLE = Math.max(1, Number(process.env.WAQI_TILES_PER_CYCLE || 10))
+const WAQI_TILES_PER_CYCLE = Math.max(1, Number(process.env.WAQI_TILES_PER_CYCLE || 100))
 
 export async function ensureWaqiStationIndex(maxTilesToScan: number = WAQI_TILES_PER_CYCLE): Promise<void> {
   const token = process.env.WAQI_API_KEY
@@ -1648,70 +1648,64 @@ export async function ensureWaqiStationIndex(maxTilesToScan: number = WAQI_TILES
   await saveWaqiIndexToDisk(index)
 }
 
-export async function collectWAQIStationsBatch(limit: number = 100): Promise<AirQualityData[]> {
+export async function collectWAQIStationsBatch(limit: number = 1000): Promise<AirQualityData[]> {
   const out: AirQualityData[] = []
   const token = process.env.WAQI_API_KEY
   if (!token) return out
   await ensureWaqiStationIndex(WAQI_TILES_PER_CYCLE)
   const stations = (await cacheStore.get<WaqiStation[]>('waqi:stationIndex')) || []
   if (stations.length === 0) return out
+  const concurrency = Math.max(1, Number(process.env.WAQI_STATION_CONCURRENCY || 20))
   let idx = (await cursorStore.get('waqi', 'stationIdx')) as number | null
   let i = typeof idx === 'number' ? idx : 0
-  let taken = 0
-  while (taken < limit && taken < stations.length) {
-    const s: WaqiStation = stations[i % stations.length] as any
+  const batchStations: WaqiStation[] = []
+  for (let taken = 0; taken < limit && taken < stations.length; taken++) {
+    batchStations.push(stations[i % stations.length] as any)
     i++
-    try {
-      if (!(await budgetStore.canConsume('waqi'))) break
+  }
+
+  for (let chunkStart = 0; chunkStart < batchStations.length; chunkStart += concurrency) {
+    const chunk = batchStations.slice(chunkStart, chunkStart + concurrency)
+    const results = await Promise.allSettled(chunk.map(async (s) => {
       const url = `https://api.waqi.info/feed/@${s.uid}/?token=${token}`
       const etagKey = `waqi:feed:@${s.uid}`
       const data = await fetchJsonWithRetry<any>(url, { retries: 1, etagKey, providerId: 'waqi' })
-      if ((data as any)?.__notModified) {
-        taken++
-        await budgetStore.consume('waqi')
-        continue
+      if ((data as any)?.__notModified) return null
+      if (data?.status !== 'ok') return null
+      const d = data.data
+      const item: AirQualityData = {
+        aqi: d.aqi,
+        pm25: d.iaqi?.pm25?.['v'] || 0,
+        pm10: d.iaqi?.pm10?.['v'] || 0,
+        co: d.iaqi?.co?.['v'] || 0,
+        no2: d.iaqi?.no2?.['v'] || 0,
+        o3: d.iaqi?.o3?.['v'] || 0,
+        so2: d.iaqi?.so2?.['v'] || 0,
+        location: d.city?.name || s.name || `@${s.uid}`,
+        timestamp: d.time?.iso || new Date().toISOString(),
+        source: 'WAQI',
+        coordinates: (typeof s.lat === 'number' && typeof s.lon === 'number') ? { lat: s.lat, lon: s.lon } : undefined,
+        ...(s?.uid ? { station_id: s.uid as any } : {}),
+        temperature: d.iaqi?.t?.['v'] ?? d.iaqi?.temp?.['v'],
+        humidity: d.iaqi?.h?.['v'],
+        pressure: d.iaqi?.p?.['v'],
       }
-      if (data?.status === 'ok') {
-        const d = data.data
-        const item: AirQualityData = {
-          aqi: d.aqi,
-          pm25: d.iaqi?.pm25?.['v'] || 0,
-          pm10: d.iaqi?.pm10?.['v'] || 0,
-          co: d.iaqi?.co?.['v'] || 0,
-          no2: d.iaqi?.no2?.['v'] || 0,
-          o3: d.iaqi?.o3?.['v'] || 0,
-          so2: d.iaqi?.so2?.['v'] || 0,
-          location: d.city?.name || s.name || `@${s.uid}`,
-          timestamp: d.time?.iso || new Date().toISOString(),
-          source: 'WAQI',
-          coordinates: (typeof s.lat === 'number' && typeof s.lon === 'number') ? { lat: s.lat, lon: s.lon } : undefined,
-          // Attach station id for downstream persistence
-          ...(s?.uid ? { station_id: s.uid as any } : {}),
-          // Optional environmental fields when present
-          temperature: d.iaqi?.t?.['v'] ?? d.iaqi?.temp?.['v'],
-          humidity: d.iaqi?.h?.['v'],
-          pressure: d.iaqi?.p?.['v'],
+      try {
+        if (item.coordinates) {
+          const { getNearestOwmCountry } = await import('./repositories')
+          const cc = await getNearestOwmCountry(item.coordinates.lat, item.coordinates.lon)
+          const { isCountryAllowed } = await import('./country-controls')
+          if (!isCountryAllowed('waqi' as any, cc)) return null
         }
-        // Country filter hook: derive WAQI country via nearest OWM country when coords exist
-        try {
-          if (item.coordinates) {
-            const { getNearestOwmCountry } = await import('./repositories')
-            const cc = await getNearestOwmCountry(item.coordinates.lat, item.coordinates.lon)
-            const { isCountryAllowed } = await import('./country-controls')
-            if (!isCountryAllowed('waqi' as any, cc)) {
-              i++
-              continue
-            }
-          }
-        } catch {}
+      } catch {}
+      return item
+    }))
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value) {
+        const item = r.value
         const key = `waqi:air:${item.location}:${item.timestamp}`
         if (await dedupeStore.add(key)) out.push(item)
-        await budgetStore.consume('waqi')
-        taken++
       }
-      await new Promise(r => setTimeout(r, 50))
-    } catch {
-      // skip station on failure
     }
   }
   await cursorStore.set('waqi', i % stations.length, 'stationIdx')

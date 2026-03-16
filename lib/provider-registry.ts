@@ -294,7 +294,7 @@ const PROVIDER_ENV_OVERRIDES: Partial<Record<ProviderId, {
 }
 
 const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
-  waqi: { perSecond: 2, perDay: 100000 },
+  waqi: { perSecond: 15, perDay: 1_296_000 },
   weatherapi: { perSecond: 5 },
   noaa: { perSecond: 10, perDay: 100000 },
   noaa_ndbc: { perSecond: 5 },
@@ -331,7 +331,7 @@ const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
 }
 
 const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
-  waqi: 15 * 60 * 1000,
+  waqi: 60 * 1000,
   weatherapi: 30 * 60 * 1000,
   noaa: 6 * 60 * 1000,
   noaa_ndbc: 5 * 60 * 1000,
