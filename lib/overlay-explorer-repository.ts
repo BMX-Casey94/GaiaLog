@@ -151,9 +151,25 @@ export async function getLocationSuggestions(
   const trimmed = searchText.trim()
   if (trimmed.length < 2) return []
 
-  const sqlParams: unknown[] = [`%${trimmed.toLowerCase()}%`]
-  let familyFilter = ''
+  const coordQuery = parseCoordinateQuery(trimmed)
 
+  const sqlParams: unknown[] = []
+  let locationFilter: string
+
+  if (coordQuery) {
+    sqlParams.push(
+      coordQuery.lat - COORD_SEARCH_RADIUS_DEG,
+      coordQuery.lat + COORD_SEARCH_RADIUS_DEG,
+      coordQuery.lon - COORD_SEARCH_RADIUS_DEG,
+      coordQuery.lon + COORD_SEARCH_RADIUS_DEG,
+    )
+    locationFilter = `avg_lat >= $1 AND avg_lat <= $2 AND avg_lon >= $3 AND avg_lon <= $4`
+  } else {
+    sqlParams.push(`%${trimmed.toLowerCase()}%`)
+    locationFilter = `normalized_location ILIKE $1`
+  }
+
+  let familyFilter = ''
   if (dataType) {
     const families = getDataFamilyFilterValues(dataType)
     if (families.length === 1) {
@@ -176,7 +192,7 @@ export async function getLocationSuggestions(
        avg_lat,
        avg_lon
      FROM overlay_explorer_location_keys
-     WHERE normalized_location ILIKE $1
+     WHERE ${locationFilter}
        ${familyFilter}
      ORDER BY reading_count DESC
      LIMIT $${sqlParams.length}`,
@@ -379,13 +395,42 @@ export async function getRecentReadingsByFamily(
 
 // ─── Internal Helpers ────────────────────────────────────────────────────────
 
+/**
+ * Detect if a search string looks like a lat/lon coordinate pair.
+ * Accepts formats like "47.14, 24.48", "47.14 24.48", "-33.87, 151.21"
+ */
+function parseCoordinateQuery(q: string): { lat: number; lon: number } | null {
+  const cleaned = q.trim().replace(/°[NSEW]/gi, '')
+  const match = cleaned.match(/^(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)$/)
+  if (!match) return null
+  const lat = parseFloat(match[1])
+  const lon = parseFloat(match[2])
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null
+  return { lat, lon }
+}
+
+const COORD_SEARCH_RADIUS_DEG = 0.5
+
 function buildWhereClause(params: SearchParams): { whereSql: string; sqlParams: unknown[] } {
   const parts: string[] = []
   const sqlParams: unknown[] = []
 
   if (params.q?.trim()) {
-    sqlParams.push(`%${params.q.trim()}%`)
-    parts.push(`location ILIKE $${sqlParams.length}`)
+    const coordQuery = parseCoordinateQuery(params.q.trim())
+    if (coordQuery) {
+      sqlParams.push(coordQuery.lat - COORD_SEARCH_RADIUS_DEG)
+      parts.push(`lat >= $${sqlParams.length}`)
+      sqlParams.push(coordQuery.lat + COORD_SEARCH_RADIUS_DEG)
+      parts.push(`lat <= $${sqlParams.length}`)
+      sqlParams.push(coordQuery.lon - COORD_SEARCH_RADIUS_DEG)
+      parts.push(`lon >= $${sqlParams.length}`)
+      sqlParams.push(coordQuery.lon + COORD_SEARCH_RADIUS_DEG)
+      parts.push(`lon <= $${sqlParams.length}`)
+    } else {
+      sqlParams.push(`%${params.q.trim()}%`)
+      parts.push(`location ILIKE $${sqlParams.length}`)
+    }
   }
 
   if (params.dataType) {

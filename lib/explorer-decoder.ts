@@ -12,6 +12,7 @@
 
 import { normaliseDataFamily, resolveProviderIdFromSource, DATA_FAMILY_DESCRIPTORS, type DataFamily } from './stream-registry'
 import type { StoredReading } from './supabase-explorer'
+import { reverseGeocode, buildDisplayLocation, locationNeedsGeocoding } from './reverse-geocoder'
 
 // ─── Public Types ────────────────────────────────────────────────────────────
 
@@ -126,6 +127,34 @@ export function toOverlayExplorerReading(
     blockTime,
     confirmed,
     metricsPreview,
+  }
+}
+
+/**
+ * Enrich an OverlayExplorerReading with a reverse-geocoded location when the
+ * existing location is missing or coordinate-based.  Returns a new object if
+ * enrichment succeeds, or the original unchanged.  Never throws.
+ */
+export async function enrichWithGeocodedLocation(
+  reading: OverlayExplorerReading,
+): Promise<OverlayExplorerReading> {
+  if (!locationNeedsGeocoding(reading.location)) return reading
+  if (reading.lat == null || reading.lon == null) return reading
+
+  try {
+    const place = await reverseGeocode(reading.lat, reading.lon)
+    if (!place) return reading
+
+    const displayLocation = buildDisplayLocation(place)
+    if (!displayLocation) return reading
+
+    return {
+      ...reading,
+      location: displayLocation,
+      normalizedLocation: displayLocation.toLowerCase(),
+    }
+  } catch {
+    return reading
   }
 }
 

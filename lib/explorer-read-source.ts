@@ -36,7 +36,7 @@ import {
 
 import * as overlayService from './overlay-explorer-service'
 import { upsertReading as overlayUpsert, upsertReadingsBatch as overlayUpsertBatch } from './overlay-explorer-repository'
-import { toOverlayExplorerReading } from './explorer-decoder'
+import { toOverlayExplorerReading, enrichWithGeocodedLocation } from './explorer-decoder'
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -129,7 +129,8 @@ export async function addReading(
 
   if (mode === 'overlay') {
     try {
-      const overlayReading = toOverlayExplorerReading(reading, extra)
+      let overlayReading = toOverlayExplorerReading(reading, extra)
+      overlayReading = await enrichWithGeocodedLocation(overlayReading)
       return await overlayUpsert(overlayReading)
     } catch (err) {
       console.warn('[explorer-write] overlay upsert failed:', err instanceof Error ? err.message : err)
@@ -138,7 +139,8 @@ export async function addReading(
   }
 
   // dual mode
-  const overlayReading = toOverlayExplorerReading(reading, extra)
+  let overlayReading = toOverlayExplorerReading(reading, extra)
+  overlayReading = await enrichWithGeocodedLocation(overlayReading)
 
   const [legacyResult, overlayResult] = await Promise.allSettled([
     legacyAddReading(reading),
@@ -164,7 +166,8 @@ export async function addReadingsBatch(
     return legacyAddReadingsBatch(readings)
   }
 
-  const overlayReadings = readings.map(r => toOverlayExplorerReading(r, extra))
+  const rawOverlayReadings = readings.map(r => toOverlayExplorerReading(r, extra))
+  const overlayReadings = await Promise.all(rawOverlayReadings.map(enrichWithGeocodedLocation))
 
   if (mode === 'overlay') {
     try {

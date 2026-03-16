@@ -476,7 +476,7 @@ export default function ExplorerPage() {
               <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400 z-10" />
               <Input
                 type="text"
-                placeholder="Search by location (e.g. London, New York, Tokyo...)"
+                placeholder="Search by location or coordinates (e.g. London, Tokyo, 47.14, 24.48...)"
                 value={searchQuery}
                 onChange={(e) => {
                   setSearchQuery(e.target.value)
