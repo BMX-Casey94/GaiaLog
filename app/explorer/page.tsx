@@ -28,7 +28,7 @@ import {
   Layers
 } from "lucide-react"
 import { getKeyMetrics } from "@/lib/family-metrics"
-import { DATA_FAMILY_DESCRIPTORS, resolveAttributionText } from "@/lib/stream-registry"
+import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
 
 // Types
 interface ExplorerReading {
@@ -671,7 +671,6 @@ export default function ExplorerPage() {
                   const Icon = config.icon
                   const { date, time } = formatTimestamp(item.timestamp)
                   const keyMetrics = getKeyMetrics(item.dataType, item.metrics)
-                  const attributionText = resolveAttributionText(item.metrics?.provider_id, item.provider)
                   
                   return (
                     <GlowCard 
@@ -718,11 +717,6 @@ export default function ExplorerPage() {
                         </div>
                       </div>
 
-                      {attributionText ? (
-                        <div className="pt-2 text-[10px] text-slate-500 leading-relaxed">
-                          Attribution: {attributionText}
-                        </div>
-                      ) : null}
                       
                       {/* Card Footer Bar (matches live-dashboard cards) */}
                       <div className="flex items-center justify-between -mx-4 -mb-4 px-4 py-2.5 border-t border-slate-700/30">

@@ -1300,7 +1300,19 @@ export async function collectSensorCommunityDataBatch(limit: number = 5000): Pro
     const key = `sensor_community:${sensorId}:${timestamp}`
     if (!(await dedupeStore.add(key))) continue
 
-    const country = record?.location?.country ? ` ${record.location.country}` : ''
+    const country = record?.location?.country ? String(record.location.country).trim() : ''
+    let locationName = ''
+    if (coordinates) {
+      const latDir = coordinates.lat >= 0 ? 'N' : 'S'
+      const lonDir = coordinates.lon >= 0 ? 'E' : 'W'
+      const latStr = Math.abs(coordinates.lat).toFixed(2)
+      const lonStr = Math.abs(coordinates.lon).toFixed(2)
+      locationName = country
+        ? `${country} (${latStr}°${latDir}, ${lonStr}°${lonDir})`
+        : `${latStr}°${latDir}, ${lonStr}°${lonDir}`
+    } else {
+      locationName = country || `Sensor ${sensorId}`
+    }
     out.push({
       aqi: approximateAqiFromPm(pm25, pm10) ?? 0,
       pm25: pm25 ?? 0,
@@ -1311,7 +1323,7 @@ export async function collectSensorCommunityDataBatch(limit: number = 5000): Pro
       temperature: values.temperature ?? values.temperature_c,
       humidity: values.humidity ?? values.humidity_pct,
       pressure: values.pressure_at_sealevel ?? values.pressure,
-      location: `Sensor ${sensorId}${country}`,
+      location: locationName,
       timestamp,
       source: 'Sensor.Community',
       coordinates,
