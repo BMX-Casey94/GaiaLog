@@ -687,17 +687,28 @@ export default function ExplorerPage() {
 
                       {/* Location & Time */}
                       <div className="pt-3 pb-2">
-                        {item.location ? (
-                          <div className="flex items-start gap-2 text-white mb-1.5 min-w-0">
-                            <MapPin className="h-3.5 w-3.5 text-purple-400 flex-shrink-0 mt-0.5" />
-                            <span className="font-medium text-sm flex-1 min-w-0 line-clamp-2">{item.location}</span>
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-2 text-slate-500 mb-1.5">
-                            <MapPin className="h-3.5 w-3.5 flex-shrink-0" />
-                            <span className="text-sm italic">Unknown location</span>
-                          </div>
-                        )}
+                        {(() => {
+                          let displayLocation = item.location
+                          if (displayLocation && /^Sensor\s+\d+/i.test(displayLocation) && item.lat != null && item.lon != null) {
+                            const latDir = item.lat >= 0 ? 'N' : 'S'
+                            const lonDir = item.lon >= 0 ? 'E' : 'W'
+                            const country = displayLocation.replace(/^Sensor\s+\d+\s*/i, '').trim()
+                            displayLocation = country
+                              ? `${country} (${Math.abs(item.lat).toFixed(2)}°${latDir}, ${Math.abs(item.lon).toFixed(2)}°${lonDir})`
+                              : `${Math.abs(item.lat).toFixed(2)}°${latDir}, ${Math.abs(item.lon).toFixed(2)}°${lonDir}`
+                          }
+                          return displayLocation ? (
+                            <div className="flex items-start gap-2 text-white mb-1.5 min-w-0">
+                              <MapPin className="h-3.5 w-3.5 text-purple-400 flex-shrink-0 mt-0.5" />
+                              <span className="font-medium text-sm flex-1 min-w-0 line-clamp-2">{displayLocation}</span>
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2 text-slate-500 mb-1.5">
+                              <MapPin className="h-3.5 w-3.5 flex-shrink-0" />
+                              <span className="text-sm italic">Unknown location</span>
+                            </div>
+                          )
+                        })()}
                         <div className="flex items-center gap-3 text-xs text-slate-500">
                           <span>{date}</span>
                           <span className="text-slate-700">|</span>

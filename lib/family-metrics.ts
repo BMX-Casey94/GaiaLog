@@ -20,6 +20,12 @@ const GENERIC_META_KEYS = new Set([
   'family',
   'station_id',
   'coordinates',
+  'attribution',
+  'notice',
+  'sensor_type',
+  'sensor_id',
+  'data_license',
+  'license',
 ])
 
 const METRIC_LABELS: Record<string, string> = {

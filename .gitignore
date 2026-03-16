@@ -26,6 +26,9 @@ debug-*.log
 # IDE / local
 .cursor/
 
+# Project-specific setup notes (contain Supabase project IDs)
+NEW_SUPABASE_SETUP.md
+
 # vercel
 .vercel
 
