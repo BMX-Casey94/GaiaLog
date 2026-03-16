@@ -1145,7 +1145,7 @@ let _noaaStationCache: any[] | null = null
 const _ndbcWatermarks = new Map<string, string>()
 const _sensorCommunityWatermarks = new Map<string, string>()
 
-export async function collectWaterLevelDataBatch(limit: number = 25): Promise<WaterLevelData[]> {
+export async function collectWaterLevelDataBatch(limit: number = 25, sweepBudgetMs: number = 0): Promise<WaterLevelData[]> {
   const out: WaterLevelData[] = []
   const stations = await fetchJsonWithRetry<any>(
     'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=waterlevels',
@@ -1165,41 +1165,53 @@ export async function collectWaterLevelDataBatch(limit: number = 25): Promise<Wa
       _noaaStationCache = fresh
     }
   }
+
   const list = _noaaStationCache || []
   const total = list.length
   if (total === 0) {
-    console.warn('🌊 NOAA: Station list is empty – nothing to collect')
+    console.warn('NOAA: Station list is empty - nothing to collect')
     return out
   }
-  const cursor = await readCursor('noaa', null, 'station_index')
-  const selectedStations = buildRotatingSlice(list, cursor, Math.min(limit, total))
-  if (selectedStations.length === 0) return out
-  await writeCursor('noaa', null, 'station_index', (cursor + selectedStations.length) % total)
 
   const products = getNoaaCoopsProducts()
   const concurrency = Math.max(1, Number(process.env.NOAA_STATION_CONCURRENCY || 4))
-  console.log(
-    `🌊 NOAA: Processing ${selectedStations.length} stations (${total} total available, ` +
-    `products=${Array.from(products).join(',')}, concurrency=${concurrency})...`
-  )
-  const batchStart = Date.now()
-  let processedStations = 0
-  let nextProgressLogAt = 25
-  for (let offset = 0; offset < selectedStations.length; offset += concurrency) {
-    const slice = selectedStations.slice(offset, offset + concurrency)
-    const results = await Promise.all(slice.map(station => collectNoaaWaterLevelForStation(station, products)))
-    for (const item of results) {
-      if (item) out.push(item)
+  const sweepStart = Date.now()
+  const effectiveBudget = sweepBudgetMs > 0 ? sweepBudgetMs : Infinity
+  let totalProcessed = 0
+  let sweepPages = 0
+  let cursorWrapped = false
+
+  while (!cursorWrapped && (Date.now() - sweepStart) < effectiveBudget) {
+    const cursor = await readCursor('noaa', null, 'station_index')
+    const selectedStations = buildRotatingSlice(list, cursor, Math.min(limit, total))
+    if (selectedStations.length === 0) break
+    const nextCursor = (cursor + selectedStations.length) % total
+    cursorWrapped = nextCursor <= cursor && sweepPages > 0
+    await writeCursor('noaa', null, 'station_index', nextCursor)
+
+    if (sweepPages === 0) {
+      console.log(
+        `NOAA: Processing stations (${total} total, products=${Array.from(products).join(',')}, concurrency=${concurrency}, sweep=${sweepBudgetMs > 0 ? 'on' : 'off'})...`
+      )
     }
-    processedStations += slice.length
-    if (processedStations >= nextProgressLogAt && processedStations < selectedStations.length) {
-      const elapsed = ((Date.now() - batchStart) / 1000).toFixed(1)
-      console.log(`🌊 NOAA: ${processedStations}/${selectedStations.length} stations processed (${out.length} readings, ${elapsed}s elapsed)`)
-      nextProgressLogAt += 25
+
+    const batchStart = Date.now()
+    for (let offset = 0; offset < selectedStations.length; offset += concurrency) {
+      const slice = selectedStations.slice(offset, offset + concurrency)
+      const results = await Promise.all(slice.map(station => collectNoaaWaterLevelForStation(station, products)))
+      for (const item of results) {
+        if (item) out.push(item)
+      }
     }
+    totalProcessed += selectedStations.length
+    sweepPages++
+
+    if (sweepBudgetMs <= 0) break
+    if (cursorWrapped) break
   }
-  const totalElapsed = ((Date.now() - batchStart) / 1000).toFixed(1)
-  console.log(`🌊 NOAA: Batch complete – ${out.length} readings from ${selectedStations.length} stations in ${totalElapsed}s`)
+
+  const totalElapsed = ((Date.now() - sweepStart) / 1000).toFixed(1)
+  console.log(`NOAA: Batch complete - ${out.length} readings from ${totalProcessed} stations (${sweepPages} pages) in ${totalElapsed}s${cursorWrapped ? ' [full cycle]' : ''}`)
   return out
 }
 
@@ -1237,7 +1249,7 @@ export async function collectSeismicDataBatch(hours: number = 6, minMag: number 
   return out
 }
 
-export async function collectSensorCommunityDataBatch(limit: number = 5000): Promise<AirQualityData[]> {
+export async function collectSensorCommunityDataBatch(limit: number = 5000, sweepAll: boolean = false): Promise<AirQualityData[]> {
   const cacheKey = 'sensor_community:snapshot'
   const cursorKey = 'sensor_community'
   const endpoint = process.env.SENSOR_COMMUNITY_URL || 'https://data.sensor.community/static/v2/data.dust.min.json'
@@ -1264,7 +1276,7 @@ export async function collectSensorCommunityDataBatch(limit: number = 5000): Pro
   })
 
   const total = sorted.length
-  const useFullSnapshot = isTruthyEnv(process.env.SENSOR_COMMUNITY_USE_FULL_SNAPSHOT, false)
+  const useFullSnapshot = sweepAll || isTruthyEnv(process.env.SENSOR_COMMUNITY_USE_FULL_SNAPSHOT, false)
   const cursor = await readCursor('sensor_community', null, 'snapshot_index')
   const selected = useFullSnapshot || limit >= total
     ? sorted
@@ -1334,7 +1346,7 @@ export async function collectSensorCommunityDataBatch(limit: number = 5000): Pro
   return out
 }
 
-export async function collectNdbcLatestObservations(limit: number = 1000): Promise<WaterLevelData[]> {
+export async function collectNdbcLatestObservations(limit: number = 1000, sweepAll: boolean = false): Promise<WaterLevelData[]> {
   const endpoint = process.env.NDBC_LATEST_OBS_URL || 'https://www.ndbc.noaa.gov/data/latest_obs/latest_obs.txt'
   const raw = await fetchTextWithRetry(endpoint, {
     retries: 2,
@@ -1349,7 +1361,7 @@ export async function collectNdbcLatestObservations(limit: number = 1000): Promi
 
   if (lines.length === 0) return []
 
-  const useFullSnapshot = isTruthyEnv(process.env.NDBC_USE_FULL_SNAPSHOT, false)
+  const useFullSnapshot = sweepAll || isTruthyEnv(process.env.NDBC_USE_FULL_SNAPSHOT, false)
   const cursor = await readCursor('noaa_ndbc', null, 'obs_index')
   const selected = useFullSnapshot || limit >= lines.length
     ? lines

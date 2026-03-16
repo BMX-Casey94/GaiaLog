@@ -488,116 +488,108 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
       } catch (e) {
         console.log(`⚠️ WAQI: Station index discovery failed:`, (e as Error).message)
       }
-      // If DB is disabled, skip DB querying entirely and use DB-less path
       const dbDisabled = process.env.GAIALOG_NO_DB === 'true'
-      // Iterate WAQI stations by allowed countries using persisted registry (DB), when enabled
       const allow = (providerConfigs as any)?.waqi?.countries?.allow || []
       const countries = Array.isArray(allow) && allow.length > 0 ? allow : undefined
       const key = 'stations'
-      let offset = 0
-      let stations: any[] = []
-      if (!dbDisabled) {
-        try {
-          offset = await readCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key)
-          const pageSize = Number(process.env.WAQI_STATION_PAGE_SIZE || 150)
-          console.log(`📡 WAQI: Querying stations (provider=waqi, countries=${countries || 'ALL'}, offset=${offset}, limit=${pageSize})`)
-          stations = await getStationsByProviderPage({ provider: 'waqi', countries, offset, limit: pageSize })
-          console.log(`✅ WAQI: Found ${stations.length} stations from database`)
-          
-          // Auto-reset cursor if we've gone past the end
-          let nextOffset: number
-          if (stations.length === 0 && offset > 0) {
-            console.log(`🔄 WAQI: Reached end of stations (offset=${offset}), resetting cursor to 0`)
-            nextOffset = 0
-          } else if (stations.length < pageSize && stations.length > 0) {
-            // Partial page means we're near the end, wrap around
-            console.log(`🔄 WAQI: Partial page (${stations.length}/${pageSize}), wrapping cursor to 0`)
-            nextOffset = 0
-          } else {
-            nextOffset = offset + stations.length
-          }
-          
-          await writeCursor('waqi', countries && countries.length === 1 ? countries[0] : null, key, nextOffset)
-        } catch (e) {
-          console.error(`❌ WAQI: Error fetching stations from database:`, e)
-          stations = []
-        }
-      } else {
-        console.log('🗄️ WAQI: Database disabled (GAIALOG_NO_DB=true); using DB-less station index')
-      }
+      const pageSize = Number(process.env.WAQI_STATION_PAGE_SIZE || 150)
 
-      const items: any[] = []
-      if (stations.length && process.env.WAQI_API_KEY) {
-        console.log(`🌐 WAQI: Fetching data from ${stations.length} stations via WAQI API...`)
-        let successCount = 0
-        let errorCount = 0
-        let invalidStatusCount = 0
-        let firstError: string | null = null
-        let firstInvalidStatus: any = null
-        
-        for (const s of stations) {
+      // Continuous Sweep: page through all DB stations within a time budget
+      const sweepBudgetMs = Math.max(30_000, Math.floor(this.getIntervalMs() * 0.85))
+      const sweepStart = Date.now()
+      const allItems: any[] = []
+      let pagesSwept = 0
+      let totalStationsQueried = 0
+      let totalSuccess = 0
+      let totalErrors = 0
+
+      if (!dbDisabled && process.env.WAQI_API_KEY) {
+        const cursorScope = countries && countries.length === 1 ? countries[0] : null
+        let cursorWrapped = false
+
+        while (!cursorWrapped && (Date.now() - sweepStart) < sweepBudgetMs) {
           try {
-            const url = `https://api.waqi.info/feed/@${encodeURIComponent(s.station_code)}/?token=${process.env.WAQI_API_KEY}`
-            const d = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'waqi' })
-            
-            if (d?.status === 'ok') {
-              items.push({
-                aqi: d.data?.aqi,
-                pm25: d.data?.iaqi?.pm25?.['v'] || 0,
-                pm10: d.data?.iaqi?.pm10?.['v'] || 0,
-                co: d.data?.iaqi?.co?.['v'] || 0,
-                no2: d.data?.iaqi?.no2?.['v'] || 0,
-                o3: d.data?.iaqi?.o3?.['v'] || 0,
-                so2: d.data?.iaqi?.so2?.['v'] || 0,
-                location: d.data?.city?.name || s.name || `@${s.station_code}`,
-                timestamp: d.data?.time?.iso || new Date().toISOString(),
-                source: 'WAQI',
-                coordinates: (typeof s.lat === 'number' && typeof s.lon === 'number') ? { lat: s.lat, lon: s.lon } : undefined,
-                station_id: s.station_code,
-                temperature: d.data?.iaqi?.t?.['v'] ?? d.data?.iaqi?.temp?.['v'],
-                humidity: d.data?.iaqi?.h?.['v'],
-                pressure: d.data?.iaqi?.p?.['v'],
-              })
-              successCount++
+            const offset = await readCursor('waqi', cursorScope, key)
+            const stations = await getStationsByProviderPage({ provider: 'waqi', countries, offset, limit: pageSize })
+
+            let nextOffset: number
+            if (stations.length === 0 && offset > 0) {
+              nextOffset = 0
+              cursorWrapped = true
+            } else if (stations.length < pageSize && stations.length > 0) {
+              nextOffset = 0
+              cursorWrapped = true
+            } else if (stations.length === 0) {
+              break
             } else {
-              invalidStatusCount++
-              if (!firstInvalidStatus) {
-                firstInvalidStatus = { station: s.station_code, response: d }
+              nextOffset = offset + stations.length
+            }
+            await writeCursor('waqi', cursorScope, key, nextOffset)
+
+            for (const s of stations) {
+              try {
+                const url = `https://api.waqi.info/feed/@${encodeURIComponent(s.station_code)}/?token=${process.env.WAQI_API_KEY}`
+                const d = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'waqi' })
+                if (d?.status === 'ok') {
+                  allItems.push({
+                    aqi: d.data?.aqi,
+                    pm25: d.data?.iaqi?.pm25?.['v'] || 0,
+                    pm10: d.data?.iaqi?.pm10?.['v'] || 0,
+                    co: d.data?.iaqi?.co?.['v'] || 0,
+                    no2: d.data?.iaqi?.no2?.['v'] || 0,
+                    o3: d.data?.iaqi?.o3?.['v'] || 0,
+                    so2: d.data?.iaqi?.so2?.['v'] || 0,
+                    location: d.data?.city?.name || s.name || `@${s.station_code}`,
+                    timestamp: d.data?.time?.iso || new Date().toISOString(),
+                    source: 'WAQI',
+                    coordinates: (typeof s.lat === 'number' && typeof s.lon === 'number') ? { lat: s.lat, lon: s.lon } : undefined,
+                    station_id: s.station_code,
+                    temperature: d.data?.iaqi?.t?.['v'] ?? d.data?.iaqi?.temp?.['v'],
+                    humidity: d.data?.iaqi?.h?.['v'],
+                    pressure: d.data?.iaqi?.p?.['v'],
+                  })
+                  totalSuccess++
+                }
+              } catch {
+                totalErrors++
               }
             }
-          } catch (e) {
-            errorCount++
-            if (!firstError) {
-              firstError = `Station ${s.station_code}: ${(e as Error).message}`
+
+            totalStationsQueried += stations.length
+            pagesSwept++
+            if (pagesSwept % 5 === 0 || cursorWrapped) {
+              const elapsed = ((Date.now() - sweepStart) / 1000).toFixed(1)
+              console.log(`WAQI: Sweep p${pagesSwept} stations=${totalStationsQueried} readings=${allItems.length} ok=${totalSuccess} err=${totalErrors} ${elapsed}s`)
             }
+          } catch (e) {
+            console.error('WAQI: Sweep page error:', e)
+            break
           }
         }
-        
-        console.log(`📊 WAQI API results: ${successCount} success, ${errorCount} errors, ${invalidStatusCount} invalid status from ${stations.length} stations`)
-        if (firstError) {
-          console.error(`❌ First WAQI error: ${firstError}`)
-        }
-        if (firstInvalidStatus) {
-          console.warn(`⚠️ First invalid status example:`, JSON.stringify(firstInvalidStatus))
-        }
-      } else {
-        console.log(`⚠️ WAQI: Skipping API calls (stations=${stations.length}, hasApiKey=${!!process.env.WAQI_API_KEY})`)
+
+        const elapsed = ((Date.now() - sweepStart) / 1000).toFixed(1)
+        console.log(
+          `WAQI: Sweep done pages=${pagesSwept} stations=${totalStationsQueried} ` +
+          `readings=${allItems.length} ok=${totalSuccess} err=${totalErrors} ${elapsed}s` +
+          (cursorWrapped ? ' [full cycle]' : '')
+        )
+      } else if (dbDisabled) {
+        console.log('WAQI: Database disabled (GAIALOG_NO_DB=true); using DB-less station index')
       }
 
-      // If DB isn’t in use or returned no stations, try DB-less collection via in-memory index
-      let aqItems = items
+      let aqItems: any[] = allItems
       if (aqItems.length === 0 && process.env.WAQI_API_KEY) {
         try {
           const { collectWAQIStationsBatch, ensureWaqiStationIndex } = await import('./data-collector')
           await ensureWaqiStationIndex()
-          const limit = Number(process.env.WAQI_STATION_PAGE_SIZE || 150)
+          const limit = pageSize
           const batch = await collectWAQIStationsBatch(limit)
           if (batch.length > 0) {
-            console.log(`🌐 WAQI: Collected ${batch.length} stations via in-memory index (DB-less mode)`)
+            console.log(`WAQI: Collected ${batch.length} stations via in-memory index (DB-less mode)`)
             aqItems = batch as any
           }
         } catch (e) {
-          console.log(`⚠️ WAQI: DB-less collection failed:`, (e as Error).message)
+          console.log(`WAQI: DB-less collection failed: ${(e as Error).message}`)
         }
       }
 
@@ -676,7 +668,8 @@ export class NOAAWorker extends BaseWorker {
       if (!done) {
         console.log(`🌊 NOAA-Weather: First run – using fast-start batch of ${limit} stations (full batch: ${fullBatch})`)
       }
-      const batch = await collectWaterLevelDataBatch(limit)
+      const sweepBudget = Math.max(30_000, Math.floor(this.getIntervalMs() * 0.85))
+      const batch = await collectWaterLevelDataBatch(limit, sweepBudget)
       if (!done) (global as any)[flagKey] = true
       for (const item of batch) {
         const measurement: any = {
@@ -737,7 +730,7 @@ export class SensorCommunityWorker extends BaseWorker {
 
     const data: EnvironmentalData[] = []
     try {
-      const batch = await collectSensorCommunityDataBatch(config.chunkSize)
+      const batch = await collectSensorCommunityDataBatch(config.chunkSize, true)
       for (const item of batch) {
         data.push({
           type: 'air-quality',
@@ -787,7 +780,7 @@ export class NOAANdbcWorker extends BaseWorker {
 
     const data: EnvironmentalData[] = []
     try {
-      const batch = await collectNdbcLatestObservations(config.chunkSize)
+      const batch = await collectNdbcLatestObservations(config.chunkSize, true)
       for (const item of batch) {
         const measurement: Record<string, unknown> = {
           station_id: item.station_id,
@@ -1111,23 +1104,121 @@ export class AdvancedMetricsWorker extends BaseWorker {
     if (!datasetConfigs.weatherapi_advanced_metrics?.enabled && !datasetConfigs.owm_advanced_metrics?.enabled) return []
     const items: EnvironmentalData[] = []
     try {
-      // Pull OWM stations by allowed countries (if configured), rotate with cursor
       const allow = providerConfigs.weatherapi?.countries?.allow || []
       const countries = Array.isArray(allow) && allow.length > 0 ? allow : undefined
       const key = 'owm_cities'
-      const offset = await readCursor('weatherapi', countries && countries.length === 1 ? countries[0] : null, key)
       const pageSize = Number(process.env.ADVANCED_METRICS_PAGE_SIZE || 100)
-      const stations = await getOwmStationsPage({ countries, offset, limit: pageSize })
-      const nextOffset = stations.length ? offset + stations.length : 0
-      await writeCursor('weatherapi', countries && countries.length === 1 ? countries[0] : null, key, nextOffset)
-      // Prefer precise lat,lon queries to avoid WeatherAPI 400s from ambiguous names
-      let rawQueries = stations.length
-        ? stations.map(s => (typeof (s as any).lat === 'number' && typeof (s as any).lon === 'number')
+      const concurrency = Math.max(1, Number(process.env.ADVANCED_CONCURRENCY || 8))
+      const cursorScope = countries && countries.length === 1 ? countries[0] : null
+
+      // Continuous Sweep: page through station list within a time budget
+      const sweepBudgetMs = Math.max(30_000, Math.floor(this.getIntervalMs() * 0.85))
+      const sweepStart = Date.now()
+      let pagesSwept = 0
+      let totalCitiesQueried = 0
+      let cursorWrapped = false
+
+      while (!cursorWrapped && (Date.now() - sweepStart) < sweepBudgetMs) {
+        const offset = await readCursor('weatherapi', cursorScope, key)
+        const stations = await getOwmStationsPage({ countries, offset, limit: pageSize })
+
+        let nextOffset: number
+        if (stations.length === 0 && offset > 0) {
+          nextOffset = 0
+          cursorWrapped = true
+        } else if (stations.length < pageSize && stations.length > 0) {
+          nextOffset = 0
+          cursorWrapped = true
+        } else if (stations.length === 0) {
+          break
+        } else {
+          nextOffset = offset + stations.length
+        }
+        await writeCursor('weatherapi', cursorScope, key, nextOffset)
+
+        const rawQueries = stations.map(s => (typeof (s as any).lat === 'number' && typeof (s as any).lon === 'number')
             ? `${(s as any).lat},${(s as any).lon}`
             : ((s as any).name || (s as any).station_code))
-        : []
-      // DB-less fallback: use WAQI in-memory station index (lat,lon) when stations table is empty or DB disabled
-      if (rawQueries.length === 0) {
+
+        const cities = rawQueries.filter(q => typeof q === 'string' && q.trim().length >= 2)
+        if (cities.length === 0) {
+          if (cursorWrapped) break
+          pagesSwept++
+          continue
+        }
+
+        totalCitiesQueried += cities.length
+
+        for (let i = 0; i < cities.length; i += concurrency) {
+          if ((Date.now() - sweepStart) >= sweepBudgetMs) break
+          const slice = cities.slice(i, i + concurrency)
+          const results = await Promise.all(slice.map(async (city) => {
+            const data = await this.fetchAdvancedForCity(city!)
+            if (!data) return null
+            const datasetConfig = data.datasetId === 'owm_advanced_metrics'
+              ? datasetConfigs.owm_advanced_metrics
+              : datasetConfigs.weatherapi_advanced_metrics
+            if (process.env.GAIALOG_NO_DB !== 'true') {
+              try {
+                await insertAdvanced({
+                  provider: data.source,
+                  city: data.location,
+                  lat: data.coordinates?.lat ?? null,
+                  lon: data.coordinates?.lon ?? null,
+                  uv_index: data.uv_index,
+                  soil_moisture_pct: Math.round((data.soil_moisture ?? 0) * 100),
+                  wildfire_risk: data.wildfire_risk,
+                  environmental_score: Math.round((data.environmental_quality_score ?? 0) * 100),
+                  temperature_c: data.temperature_c ?? null,
+                  humidity_pct: data.humidity_pct ?? null,
+                  pressure_mb: data.pressure_mb ?? null,
+                  wind_kph: data.wind_kph ?? null,
+                  wind_deg: data.wind_deg ?? null,
+                  source_hash: Buffer.from(JSON.stringify({ type: 'advanced', data })).toString('base64').slice(0, 64),
+                  collected_at: new Date(data.timestamp),
+                })
+              } catch (e) {
+                console.error('insertAdvanced error:', e)
+              }
+            }
+            return {
+              type: 'advanced',
+              timestamp: Date.parse(data.timestamp) || Date.now(),
+              location: data.location,
+              measurement: {
+                uv_index: data.uv_index,
+                soil_moisture: data.soil_moisture,
+                wildfire_risk: data.wildfire_risk,
+                environmental_quality_score: data.environmental_quality_score,
+                temperature_c: data.temperature_c,
+                humidity_pct: data.humidity_pct,
+                pressure_mb: data.pressure_mb,
+                wind_kph: data.wind_kph,
+                wind_deg: data.wind_deg,
+              },
+              source: data.source,
+              priority: datasetConfig?.defaultPriority || 'normal',
+              family: 'advanced_metrics',
+              providerId: data.providerId,
+              datasetId: data.datasetId,
+              queueLane: datasetConfig?.queueLane,
+              maxInFlight: datasetConfig?.maxInFlight,
+              coordinates: data.coordinates,
+            } as EnvironmentalData
+          }))
+          for (const r of results) if (r) items.push(r)
+        }
+
+        pagesSwept++
+        if (pagesSwept % 3 === 0 || cursorWrapped) {
+          const elapsed = ((Date.now() - sweepStart) / 1000).toFixed(1)
+          console.log(`Advanced: Sweep p${pagesSwept} cities=${totalCitiesQueried} readings=${items.length} ${elapsed}s`)
+        }
+      }
+
+      // DB-less fallback when sweep found nothing
+      if (items.length === 0 && pagesSwept === 0) {
+        let rawQueries: string[] = []
         try {
           const { ensureWaqiStationIndex } = await import('./data-collector')
           const { cacheStore } = await import('./stores')
@@ -1135,78 +1226,48 @@ export class AdvancedMetricsWorker extends BaseWorker {
           const waqi = (await cacheStore.get<any[]>('waqi:stationIndex')) || []
           if (Array.isArray(waqi) && waqi.length > 0) {
             rawQueries = waqi.slice(0, pageSize).map(s => `${s.lat},${s.lon}`)
-            try { console.log(`📍 Advanced: Using ${rawQueries.length} WAQI index locations`) } catch {}
+            try { console.log(`Advanced: Using ${rawQueries.length} WAQI index locations`) } catch {}
           }
         } catch {}
+        if (rawQueries.length === 0) {
+          rawQueries = TOP_100_CITIES.slice(0, pageSize)
+          try { console.log(`Advanced: Using ${rawQueries.length} TOP_100_CITIES locations`) } catch {}
+        }
+        const cities = rawQueries.filter(q => typeof q === 'string' && q.trim().length >= 2)
+        for (let i = 0; i < cities.length; i += concurrency) {
+          const slice = cities.slice(i, i + concurrency)
+          const results = await Promise.all(slice.map(async (city) => {
+            const data = await this.fetchAdvancedForCity(city!)
+            if (!data) return null
+            const datasetConfig = data.datasetId === 'owm_advanced_metrics'
+              ? datasetConfigs.owm_advanced_metrics
+              : datasetConfigs.weatherapi_advanced_metrics
+            return {
+              type: 'advanced',
+              timestamp: Date.parse(data.timestamp) || Date.now(),
+              location: data.location,
+              measurement: {
+                uv_index: data.uv_index, soil_moisture: data.soil_moisture,
+                wildfire_risk: data.wildfire_risk, environmental_quality_score: data.environmental_quality_score,
+                temperature_c: data.temperature_c, humidity_pct: data.humidity_pct,
+                pressure_mb: data.pressure_mb, wind_kph: data.wind_kph, wind_deg: data.wind_deg,
+              },
+              source: data.source,
+              priority: datasetConfig?.defaultPriority || 'normal',
+              family: 'advanced_metrics',
+              providerId: data.providerId,
+              datasetId: data.datasetId,
+              queueLane: datasetConfig?.queueLane,
+              maxInFlight: datasetConfig?.maxInFlight,
+              coordinates: data.coordinates,
+            } as EnvironmentalData
+          }))
+          for (const r of results) if (r) items.push(r)
+        }
       }
-      // Final fallback: TOP_100_CITIES up to pageSize
-      if (rawQueries.length === 0) {
-        rawQueries = TOP_100_CITIES.slice(0, pageSize)
-        try { console.log(`📍 Advanced: Using ${rawQueries.length} TOP_100_CITIES locations`) } catch {}
-      }
-      const cities = rawQueries.filter(q => typeof q === 'string' && q.trim().length >= 2)
 
-      // Fetch with configurable concurrency to reduce wall-clock time
-      const concurrency = Math.max(1, Number(process.env.ADVANCED_CONCURRENCY || 8))
-      for (let i = 0; i < cities.length; i += concurrency) {
-        const slice = cities.slice(i, i + concurrency)
-        const results = await Promise.all(slice.map(async (city) => {
-          const data = await this.fetchAdvancedForCity(city!)
-          if (!data) return null
-          const datasetConfig = data.datasetId === 'owm_advanced_metrics'
-            ? datasetConfigs.owm_advanced_metrics
-            : datasetConfigs.weatherapi_advanced_metrics
-          // Persist to DB only if enabled
-          if (process.env.GAIALOG_NO_DB !== 'true') {
-            try {
-              await insertAdvanced({
-                provider: data.source,
-                city: data.location,
-                lat: data.coordinates?.lat ?? null,
-                lon: data.coordinates?.lon ?? null,
-                uv_index: data.uv_index,
-                soil_moisture_pct: Math.round((data.soil_moisture ?? 0) * 100),
-                wildfire_risk: data.wildfire_risk,
-                environmental_score: Math.round((data.environmental_quality_score ?? 0) * 100),
-                temperature_c: data.temperature_c ?? null,
-                humidity_pct: data.humidity_pct ?? null,
-                pressure_mb: data.pressure_mb ?? null,
-                wind_kph: data.wind_kph ?? null,
-                wind_deg: data.wind_deg ?? null,
-                source_hash: Buffer.from(JSON.stringify({ type: 'advanced', data })).toString('base64').slice(0, 64),
-                collected_at: new Date(data.timestamp),
-              })
-            } catch (e) {
-              console.error('insertAdvanced error:', e)
-            }
-          }
-          return {
-            type: 'advanced',
-            timestamp: Date.parse(data.timestamp) || Date.now(),
-            location: data.location,
-            measurement: {
-              uv_index: data.uv_index,
-              soil_moisture: data.soil_moisture,
-              wildfire_risk: data.wildfire_risk,
-              environmental_quality_score: data.environmental_quality_score,
-              temperature_c: data.temperature_c,
-              humidity_pct: data.humidity_pct,
-              pressure_mb: data.pressure_mb,
-              wind_kph: data.wind_kph,
-              wind_deg: data.wind_deg,
-            },
-            source: data.source,
-            priority: datasetConfig?.defaultPriority || 'normal',
-            family: 'advanced_metrics',
-            providerId: data.providerId,
-            datasetId: data.datasetId,
-            queueLane: datasetConfig?.queueLane,
-            maxInFlight: datasetConfig?.maxInFlight,
-            coordinates: data.coordinates,
-          } as EnvironmentalData
-        }))
-        for (const r of results) if (r) items.push(r)
-      }
+      const elapsed = ((Date.now() - sweepStart) / 1000).toFixed(1)
+      console.log(`Advanced: Sweep done pages=${pagesSwept} cities=${totalCitiesQueried} readings=${items.length} ${elapsed}s${cursorWrapped ? ' [full cycle]' : ''}`)
     } catch (e) {
       console.error('Error fetching Advanced metrics:', e)
     }
