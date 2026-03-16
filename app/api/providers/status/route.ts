@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { fetchJsonWithRetry } from '@/lib/provider-fetch'
+import { fetchOwmJsonWithRotation, hasOwmApiKeys } from '@/lib/owm'
 import { datasetConfigs, providerConfigs } from '@/lib/provider-registry'
 import { buildRolloutGateStatus } from '@/lib/rollout-controls'
 import { PROVIDER_DESCRIPTORS } from '@/lib/stream-registry'
@@ -51,10 +52,12 @@ export async function GET() {
 
   // OpenWeatherMap (OWM) test
   try {
-    const appid = process.env.OWM_API_KEY
-    if (!appid) throw new Error('Missing OWM_API_KEY')
+    if (!hasOwmApiKeys()) throw new Error('Missing OWM_API_KEY / OWM_API_KEYS')
     // London coords
-    const data = await fetchJsonWithRetry<any>(`https://api.openweathermap.org/data/2.5/air_pollution?lat=51.5074&lon=-0.1278&appid=${appid}`, { retries: 1 })
+    const data = await fetchOwmJsonWithRotation<any>(
+      (apiKey) => `https://api.openweathermap.org/data/2.5/air_pollution?lat=51.5074&lon=-0.1278&appid=${apiKey}`,
+      { retries: 1, providerId: 'owm' },
+    )
     if (data?.list) {
       results.owm.ok = true
       results.owm.message = `Items: ${data.list.length}`

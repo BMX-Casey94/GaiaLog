@@ -17,6 +17,7 @@ import {
 import { TOP_100_CITIES } from './city-seeds'
 import { dedupeStore } from './stores'
 import { fetchJsonWithRetry } from './provider-fetch'
+import { fetchOwmJsonWithRotation, hasOwmApiKeys } from './owm'
 import { insertAdvanced, insertAirQuality, insertWaterLevel, insertSeismic, calculateSourceHash, getOwmStationsPage, getStationsByProviderPage, readCursor, writeCursor, hasAirQualityTxId, hasWaterLevelTxId, hasSeismicTxId, hasSeismicEventTxId, hasAdvancedTxId, getSeismicByEventId } from './repositories'
 import { datasetConfigs, providerConfigs } from './provider-registry'
 import { cursorStore } from './stores'
@@ -1322,19 +1323,19 @@ export class AdvancedMetricsWorker extends BaseWorker {
     }
     // OWM fallback (15‑min cache handled inside provider)
     try {
-      if (datasetConfigs.owm_advanced_metrics?.enabled && process.env.OWM_API_KEY) {
+      if (datasetConfigs.owm_advanced_metrics?.enabled && hasOwmApiKeys()) {
         let first: any = coordQuery ? { lat: coordQuery.lat, lon: coordQuery.lon, name: city } : null
         if (!first) {
-          const geo = await fetchJsonWithRetry<any>(
-            `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(city)}&limit=1&appid=${process.env.OWM_API_KEY}`,
-            { retries: 2, providerId: 'owm' }
+          const geo = await fetchOwmJsonWithRotation<any>(
+            (apiKey) => `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(city)}&limit=1&appid=${apiKey}`,
+            { retries: 2, providerId: 'owm' },
           )
           first = Array.isArray(geo) ? geo[0] : null
         }
         if (!first?.lat || !first?.lon) return null
-        const oc = await fetchJsonWithRetry<any>(
-          `https://api.openweathermap.org/data/3.0/onecall?lat=${first.lat}&lon=${first.lon}&exclude=minutely,hourly,daily,alerts&units=metric&appid=${process.env.OWM_API_KEY}`,
-          { retries: 2, providerId: 'owm' }
+        const oc = await fetchOwmJsonWithRotation<any>(
+          (apiKey) => `https://api.openweathermap.org/data/3.0/onecall?lat=${first.lat}&lon=${first.lon}&exclude=minutely,hourly,daily,alerts&units=metric&appid=${apiKey}`,
+          { retries: 2, providerId: 'owm' },
         )
         const curr = oc?.current || {}
         const humidity = curr.humidity ?? 0

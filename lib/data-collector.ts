@@ -13,6 +13,7 @@ import {
   writeCursor,
 } from './repositories'
 import { fetchJsonWithRetry, fetchTextWithRetry } from './provider-fetch'
+import { fetchOwmJsonWithRotation, hasOwmApiKeys } from './owm'
 import { budgetStore, cursorStore, dedupeStore, cacheStore } from './stores'
 
 export interface AirQualityData {
@@ -672,7 +673,7 @@ export class DataCollector {
       }
 
       // Fallback: derive metrics from OWM current weather if available
-      if (process.env.OWM_API_KEY) {
+      if (hasOwmApiKeys()) {
         const owmData = await this.fetchOWMDerivedMetrics(location)
         if (owmData) {
           const hash = await this.persistAdvanced(owmData)
@@ -857,14 +858,13 @@ export class DataCollector {
 
   private async fetchOWMDerivedMetrics(location: string): Promise<AdvancedMetricsData | null> {
     try {
-      const appid = process.env.OWM_API_KEY!
       // Geocode city to coords (cache 24h since geocoding is stable)
       const geoKey = `owm:geo:${location.toLowerCase()}`
       let first = await cacheStore.get<any>(geoKey)
       if (!first) {
-        const geo = await fetchJsonWithRetry<any>(
-          `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(location)}&limit=1&appid=${appid}`,
-          { retries: 2, providerId: 'owm' }
+        const geo = await fetchOwmJsonWithRotation<any>(
+          (apiKey) => `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(location)}&limit=1&appid=${apiKey}`,
+          { retries: 2, providerId: 'owm' },
         )
         first = Array.isArray(geo) ? geo[0] : null
         if (first) await cacheStore.set(geoKey, first, 24 * 60 * 60 * 1000)
@@ -872,11 +872,13 @@ export class DataCollector {
       if (!first?.lat || !first?.lon) return null
 
       // One Call 3.0 current data (cache for 15 minutes)
-      const oneCallUrl = `https://api.openweathermap.org/data/3.0/onecall?lat=${first.lat}&lon=${first.lon}&exclude=minutely,hourly,daily,alerts&units=metric&appid=${appid}`
       const ocKey = `owm:onecall:${first.lat.toFixed(3)},${first.lon.toFixed(3)}`
       let oneCall = await cacheStore.get<any>(ocKey)
       if (!oneCall) {
-        oneCall = await fetchJsonWithRetry<any>(oneCallUrl, { retries: 2, providerId: 'owm' })
+        oneCall = await fetchOwmJsonWithRotation<any>(
+          (apiKey) => `https://api.openweathermap.org/data/3.0/onecall?lat=${first.lat}&lon=${first.lon}&exclude=minutely,hourly,daily,alerts&units=metric&appid=${apiKey}`,
+          { retries: 2, providerId: 'owm' },
+        )
         await cacheStore.set(ocKey, oneCall, 15 * 60 * 1000)
       }
 

@@ -228,6 +228,43 @@ export class BSVWallet {
   }
 
   async getUTXOs(): Promise<any[]> {
+    const walletIndex = getWalletIndexForAddress(this.address)
+    if (walletIndex != null) {
+      try {
+        const spendSource = getSpendSourceForWallet(walletIndex)
+        const outputs = await spendSource.listSpendable({
+          topic: getTreasuryTopicForWallet(walletIndex),
+          limit: SPEND_SOURCE_LIST_LIMIT,
+          order: 'asc',
+          minSatoshis: 0,
+          excludeReserved: false,
+          confirmedOnly: MIN_SPEND_CONF > 0,
+          allowDegradedStale: true,
+        })
+        return outputs.map((output: SpendableOutput) => ({
+          tx_hash: output.txid,
+          tx_pos: output.vout,
+          value: output.satoshis,
+          confirmations: output.confirmed ? Math.max(1, MIN_SPEND_CONF || 1) : 0,
+          height: output.confirmed ? 1 : undefined,
+          script: output.outputScript || undefined,
+          rawTx: output.rawTx || undefined,
+          proof: output.proof || undefined,
+        }))
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if ((process.env.BSV_SPEND_SOURCE_MODE || '').toLowerCase() === 'overlay') {
+          if (bsvConfig.logging.level === 'debug') {
+            console.warn(`⚠️ Overlay spend-source wallet lookup failed for ${this.address.substring(0, 10)}...: ${message}`)
+          }
+          return []
+        }
+        if (bsvConfig.logging.level === 'debug') {
+          console.warn(`⚠️ Spend-source wallet lookup failed for ${this.address.substring(0, 10)}...; using legacy UTXO provider: ${message}`)
+        }
+      }
+    }
+
     const { getUnspentForAddress } = await import('./utxo-provider')
     const utxos = await getUnspentForAddress(this.address)
     return Array.isArray(utxos) ? utxos : []
