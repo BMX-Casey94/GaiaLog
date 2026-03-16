@@ -4,7 +4,9 @@ import { useState, useEffect } from "react"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Database, Droplets, Activity, Thermometer, RefreshCw, AlertTriangle, AlertCircle, AlertOctagon, Flame, Mountain, Shield } from "lucide-react"
+import { Database, Droplets, Activity, Thermometer, RefreshCw, AlertTriangle, AlertCircle, AlertOctagon, Shield } from "lucide-react"
+
+type AlertType = 'air' | 'water' | 'seismic' | 'environmental'
 
 interface EnvironmentalData {
   airQuality: any
@@ -15,16 +17,16 @@ interface EnvironmentalData {
 }
 
 interface AlertData {
-  type: 'air' | 'water' | 'seismic' | 'environmental' | 'flood' | 'volcanic' | 'natural-event' | 'space-weather' | 'biodiversity' | 'conservation'
+  type: AlertType
   severity: 'low' | 'moderate' | 'high' | 'critical'
   value: number
   location: string
   timestamp: string
   source: string
   details: string
-  txid?: string
-  verifiedOnChain?: boolean
 }
+
+const SEVERITY_RANK = { low: 0, moderate: 1, high: 2, critical: 3 } as const
 
 interface OverlayAlert {
   family: string
@@ -42,20 +44,10 @@ export function LiveDashboard() {
   const [alerts, setAlerts] = useState<AlertData[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  // Remember the last severe alert (high/critical) so the card doesn't go empty
-  const [stickyByType, setStickyByType] = useState<Record<AlertData['type'], AlertData | null>>({
-    air: null,
-    water: null,
-    seismic: null,
-    environmental: null,
-    flood: null,
-    volcanic: null,
-    'natural-event': null,
-    'space-weather': null,
-    biodiversity: null,
-    conservation: null,
+  const [stickyByType, setStickyByType] = useState<Record<AlertType, AlertData | null>>({
+    air: null, water: null, seismic: null, environmental: null,
   })
-  const [overlayAlerts, setOverlayAlerts] = useState<OverlayAlert[]>([])
+  const [topOverlayAlert, setTopOverlayAlert] = useState<OverlayAlert | null>(null)
 
   const processDataIntoAlerts = (data: any): AlertData[] => {
     const alerts: AlertData[] = []
@@ -191,26 +183,12 @@ export function LiveDashboard() {
     return alerts
   }
 
-  const overlayFamilyToType = (family: string): AlertData['type'] => {
-    const map: Record<string, AlertData['type']> = {
-      flood_risk: 'flood',
-      volcanic_activity: 'volcanic',
-      natural_events: 'natural-event',
-      space_weather: 'space-weather',
-      biodiversity: 'biodiversity',
-      conservation_status: 'conservation',
-      seismic_activity: 'seismic',
-      air_quality: 'air',
-      water_levels: 'water',
-    }
-    return map[family] ?? 'environmental'
-  }
-
-  const overlaySeverityToLevel = (score: number): 'low' | 'moderate' | 'high' | 'critical' => {
-    if (score >= 80) return 'critical'
-    if (score >= 60) return 'high'
-    if (score >= 40) return 'moderate'
-    return 'low'
+  const worstAlert = (type: AlertType): AlertData | null => {
+    const current = alerts.filter(a => a.type === type)
+    const sticky = stickyByType[type]
+    const candidates = sticky ? [...current, sticky] : current
+    if (candidates.length === 0) return null
+    return candidates.reduce((best, a) => SEVERITY_RANK[a.severity] > SEVERITY_RANK[best.severity] ? a : best, candidates[0])
   }
 
   const fetchData = async () => {
@@ -263,27 +241,18 @@ export function LiveDashboard() {
       }
       
       setData(processedData)
-      let newAlerts = processDataIntoAlerts(processedData)
+      const newAlerts = processDataIntoAlerts(processedData)
 
       if (priorityAlertsRes.ok) {
         const priorityJson = await priorityAlertsRes.json()
-        if (priorityJson?.success && Array.isArray(priorityJson.alerts)) {
-          setOverlayAlerts(priorityJson.alerts)
-          const overlayAsAlerts: AlertData[] = priorityJson.alerts.map((a: OverlayAlert) => ({
-            type: overlayFamilyToType(a.family),
-            severity: overlaySeverityToLevel(a.severity),
-            value: Number(a.value) || 0,
-            location: a.location,
-            timestamp: a.timestamp,
-            source: 'overlay',
-            details: a.value ? `${a.label}: ${a.value}` : a.label,
-            txid: a.txid,
-            verifiedOnChain: a.confirmed ?? true,
-          }))
-          newAlerts = [...newAlerts, ...overlayAsAlerts]
+        if (priorityJson?.success && Array.isArray(priorityJson.alerts) && priorityJson.alerts.length > 0) {
+          const sorted = [...priorityJson.alerts].sort((a: OverlayAlert, b: OverlayAlert) => (b.severity ?? 0) - (a.severity ?? 0))
+          setTopOverlayAlert(sorted[0])
+        } else {
+          setTopOverlayAlert(null)
         }
       } else {
-        setOverlayAlerts([])
+        setTopOverlayAlert(null)
       }
 
       setAlerts(newAlerts)
@@ -291,7 +260,9 @@ export function LiveDashboard() {
         const next = { ...prev }
         for (const a of newAlerts) {
           if (a.severity === 'high' || a.severity === 'critical') {
-            next[a.type] = a
+            if (!next[a.type] || SEVERITY_RANK[a.severity] > SEVERITY_RANK[next[a.type]!.severity]) {
+              next[a.type] = a
+            }
           }
         }
         return next
@@ -323,244 +294,94 @@ export function LiveDashboard() {
 
           
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-            {/* Air Quality */}
-            <GlowCard glowColor="blue" customSize className="flex flex-col">
-              <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
-                <Database className="h-4 w-4 text-blue-400" />
-                <span className="font-semibold text-sm text-blue-400">Air Quality Alerts</span>
-              </div>
-              <div className="flex-1 flex flex-col justify-center py-3">
-              {(() => {
-                const current = alerts.filter(a => a.type === 'air')
-                const toShow = current.length > 0 ? current : (stickyByType.air ? [stickyByType.air] : [])
-                return toShow.length > 0 ? (
-                  toShow.map((alert, index) => (
-                  <div key={index} className="text-center">
-                    <div className="flex items-center justify-center space-x-2 mb-2">
-                      {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
-                      {alert.severity === 'high' && <AlertTriangle className="h-4 w-4 text-orange-500" />}
-                      {alert.severity === 'moderate' && <AlertCircle className="h-4 w-4 text-yellow-500" />}
-                      <span className={`text-lg font-bold ${
-                        alert.severity === 'critical' ? 'text-red-400' :
-                        alert.severity === 'high' ? 'text-orange-400' :
-                        alert.severity === 'moderate' ? 'text-yellow-400' : 'text-green-400'
-                      }`}>
-                        {alert.severity.toUpperCase()}
-                      </span>
-                    </div>
-                    <div className="text-sm text-slate-400 mb-2">{alert.details}</div>
-                    <div className="text-xs text-slate-500 mb-1">📍 {alert.location}</div>
-                    <div className="text-xs text-slate-600">🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
+            {([
+              { type: 'air' as AlertType, label: 'Air Quality', icon: Database, color: 'blue', fallbackData: data?.airQuality, fallbackLine: data?.airQuality ? `AQI: ${data.airQuality.aqi} • PM2.5: ${data.airQuality.pm25} μg/m³` : null },
+              { type: 'water' as AlertType, label: 'Water Levels', icon: Droplets, color: 'blue', fallbackData: data?.waterLevels, fallbackLine: data?.waterLevels ? `Level: ${data.waterLevels.river_level}m` : null },
+              { type: 'seismic' as AlertType, label: 'Seismic', icon: Activity, color: 'blue', fallbackData: data?.seismic, fallbackLine: data?.seismic ? `Magnitude: ${data.seismic.magnitude}M` : null },
+              { type: 'environmental' as AlertType, label: 'Environmental', icon: Thermometer, color: 'blue', fallbackData: data?.advancedMetrics, fallbackLine: data?.advancedMetrics ? `Score: ${typeof data.advancedMetrics.scoreDisplay === 'number' ? data.advancedMetrics.scoreDisplay.toFixed(1) : data.advancedMetrics.environmental_quality_score}/100` : null },
+            ]).map(({ type, label, icon: Icon, fallbackData, fallbackLine }) => {
+              const alert = worstAlert(type)
+              return (
+                <GlowCard key={type} glowColor="blue" customSize className="flex flex-col">
+                  <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
+                    <Icon className="h-4 w-4 text-blue-400" />
+                    <span className="font-semibold text-sm text-blue-400">{label}</span>
                   </div>
-                  ))
-                ) : data?.airQuality ? (
-                <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">Good</div>
-                  <div className="text-sm text-slate-400 mb-2">AQI: {data.airQuality.aqi} • PM2.5: {data.airQuality.pm25} μg/m³</div>
-                  <div className="text-xs text-slate-500 mb-1">📍 {data.airQuality.location}</div>
-                  <div className="text-xs text-slate-600">🕒 {new Date(data.airQuality.timestamp).toLocaleString('en-GB')}</div>
-                </div>
-                ) : (
-                <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400">No air quality data available</div>
-                </div>
-                )
-              })()}
-              </div>
-              <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
-                <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
-                  {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
-                </Badge>
-              </div>
-            </GlowCard>
-
-            {/* Water Levels */}
-            <GlowCard glowColor="blue" customSize className="flex flex-col">
-              <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
-                <Droplets className="h-4 w-4 text-blue-400" />
-                <span className="font-semibold text-sm text-blue-400">Water Level Alerts</span>
-              </div>
-              <div className="flex-1 flex flex-col justify-center py-3">
-              {(() => {
-                const current = alerts.filter(a => a.type === 'water')
-                const toShow = current.length > 0 ? current : (stickyByType.water ? [stickyByType.water] : [])
-                return toShow.length > 0 ? (
-                  toShow.map((alert, index) => (
-                  <div key={index} className="text-center">
-                    <div className="flex items-center justify-center space-x-2 mb-2">
-                      {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
-                      {alert.severity === 'high' && <AlertTriangle className="h-4 w-4 text-orange-500" />}
-                      {alert.severity === 'moderate' && <AlertCircle className="h-4 w-4 text-yellow-500" />}
-                      <span className={`text-lg font-bold ${
-                        alert.severity === 'critical' ? 'text-red-400' :
-                        alert.severity === 'high' ? 'text-orange-400' :
-                        alert.severity === 'moderate' ? 'text-yellow-400' : 'text-green-400'
-                      }`}>
-                        {alert.severity.toUpperCase()}
-                      </span>
-                    </div>
-                    <div className="text-sm text-slate-400 mb-2">{alert.details}</div>
-                    <div className="text-xs text-slate-500 mb-1">📍 {alert.location}</div>
-                    <div className="text-xs text-slate-600">🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
-                  </div>
-                  ))
-                ) : data?.waterLevels ? (
-                <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">Good</div>
-                  <div className="text-sm text-slate-400 mb-2">Level: {data.waterLevels.river_level}m</div>
-                  <div className="text-xs text-slate-500 mb-1">📍 {data.waterLevels.location}</div>
-                  <div className="text-xs text-slate-600">🕒 {new Date(data.waterLevels.timestamp).toLocaleString('en-GB')}</div>
-                </div>
-                ) : (
-                <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400">No water level data available</div>
-                </div>
-                )
-              })()}
-              </div>
-              <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
-                <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
-                  {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
-                </Badge>
-              </div>
-            </GlowCard>
-
-            {/* Seismic */}
-            <GlowCard glowColor="blue" customSize className="flex flex-col">
-              <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
-                <Activity className="h-4 w-4 text-blue-400" />
-                <span className="font-semibold text-sm text-blue-400">Seismic Alerts</span>
-              </div>
-              <div className="flex-1 flex flex-col justify-center py-3">
-              {(() => {
-                const current = alerts.filter(a => a.type === 'seismic')
-                const toShow = current.length > 0 ? current : (stickyByType.seismic ? [stickyByType.seismic] : [])
-                return toShow.length > 0 ? (
-                  toShow.map((alert, index) => (
-                  <div key={index} className="text-center">
-                    <div className="flex items-center justify-center space-x-2 mb-2">
-                      {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
-                      {alert.severity === 'high' && <AlertTriangle className="h-4 w-4 text-orange-500" />}
-                      {alert.severity === 'moderate' && <AlertCircle className="h-4 w-4 text-yellow-500" />}
-                      <span className={`text-lg font-bold ${
-                        alert.severity === 'critical' ? 'text-red-400' :
-                        alert.severity === 'high' ? 'text-orange-400' :
-                        alert.severity === 'moderate' ? 'text-yellow-400' : 'text-green-400'
-                      }`}>
-                        {alert.severity.toUpperCase()}
-                      </span>
-                    </div>
-                    <div className="text-sm text-slate-400 mb-2">{alert.details}</div>
-                    <div className="text-xs text-slate-500 mb-1">📍 {alert.location}</div>
-                    <div className="text-xs text-slate-600">🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
-                  </div>
-                  ))
-                ) : data?.seismic ? (
-                <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">Good</div>
-                  <div className="text-sm text-slate-400 mb-2">Magnitude: {data.seismic.magnitude}M • Depth: {data.seismic.depth ? `${data.seismic.depth} miles` : 'Unknown'}</div>
-                  <div className="text-xs text-slate-500 mb-1">📍 {data.seismic.location}</div>
-                  <div className="text-xs text-slate-600">🕒 {new Date(data.seismic.timestamp).toLocaleString('en-GB')}</div>
-                </div>
-                ) : (
-                <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400">No seismic data available</div>
-                </div>
-                )
-              })()}
-              </div>
-              <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
-                <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
-                  {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
-                </Badge>
-              </div>
-            </GlowCard>
-
-            {/* Environmental */}
-            <GlowCard glowColor="blue" customSize className="flex flex-col">
-              <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
-                <Thermometer className="h-4 w-4 text-blue-400" />
-                <span className="font-semibold text-sm text-blue-400">Environmental Alerts</span>
-              </div>
-              <div className="flex-1 flex flex-col justify-center py-3">
-              {(() => {
-                const current = alerts.filter(a => a.type === 'environmental')
-                const toShow = current.length > 0 ? current : (stickyByType.environmental ? [stickyByType.environmental] : [])
-                return toShow.length > 0 ? (
-                  toShow.map((alert, index) => (
-                  <div key={index} className="text-center">
-                    <div className="flex items-center justify-center space-x-2 mb-2">
-                      {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
-                      {alert.severity === 'high' && <AlertTriangle className="h-4 w-4 text-orange-500" />}
-                      {alert.severity === 'moderate' && <AlertCircle className="h-4 w-4 text-yellow-500" />}
-                      <span className={`text-lg font-bold ${
-                        alert.severity === 'critical' ? 'text-red-400' :
-                        alert.severity === 'high' ? 'text-orange-400' :
-                        alert.severity === 'moderate' ? 'text-yellow-400' : 'text-green-400'
-                      }`}>
-                        {alert.severity.toUpperCase()}
-                      </span>
-                    </div>
-                    <div className="text-sm text-slate-400 mb-2">{alert.details}</div>
-                    <div className="text-xs text-slate-500 mb-1">📍 {alert.location}</div>
-                    <div className="text-xs text-slate-600">🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
-                  </div>
-                  ))
-                ) : data?.advancedMetrics ? (
-                <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">Good</div>
-                  <div className="text-sm text-slate-400 mb-2">Score: {typeof data.advancedMetrics.scoreDisplay === 'number' ? data.advancedMetrics.scoreDisplay.toFixed(1) : data.advancedMetrics.environmental_quality_score}/100 • UV: {typeof data.advancedMetrics.uvDisplay === 'number' ? data.advancedMetrics.uvDisplay.toFixed(1) : data.advancedMetrics.uv_index}</div>
-                  <div className="text-xs text-slate-500 mb-1">📍 {data.advancedMetrics.location}</div>
-                  <div className="text-xs text-slate-600">🕒 {new Date(data.advancedMetrics.timestamp).toLocaleString('en-GB')}</div>
-                </div>
-                ) : (
-                <div className="text-green-400 text-center">
-                  <div className="text-lg font-bold mb-1">Great! No alerts</div>
-                  <div className="text-sm text-slate-400">No environmental data available</div>
-                </div>
-                )
-              })()}
-              </div>
-              <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
-                <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
-                  {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
-                </Badge>
-              </div>
-            </GlowCard>
-
-            {/* Overlay / Verified on-chain alerts */}
-            {overlayAlerts.length > 0 && (
-              <GlowCard glowColor="green" customSize className="flex flex-col md:col-span-2">
-                <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
-                  <Shield className="h-4 w-4 text-green-400" />
-                  <span className="font-semibold text-sm text-green-400">Verified on-chain Alerts</span>
-                </div>
-                <div className="flex-1 flex flex-col justify-center py-3 space-y-3">
-                  {overlayAlerts.slice(0, 4).map((alert, index) => (
-                    <div key={alert.txid || index} className="text-center border-b border-slate-700/30 last:border-0 pb-2 last:pb-0">
-                      <div className="flex items-center justify-center space-x-2 mb-1">
-                        {alert.severity >= 80 && <AlertOctagon className="h-4 w-4 text-red-500" />}
-                        {alert.severity >= 60 && alert.severity < 80 && <AlertTriangle className="h-4 w-4 text-orange-500" />}
-                        {alert.severity >= 40 && alert.severity < 60 && <AlertCircle className="h-4 w-4 text-yellow-500" />}
-                        <span className="text-sm font-bold text-white">{alert.label}</span>
+                  <div className="flex-1 flex flex-col justify-center py-3">
+                    {alert ? (
+                      <div className="text-center">
+                        <div className="flex items-center justify-center space-x-2 mb-2">
+                          {alert.severity === 'critical' && <AlertOctagon className="h-4 w-4 text-red-500" />}
+                          {alert.severity === 'high' && <AlertTriangle className="h-4 w-4 text-orange-500" />}
+                          {alert.severity === 'moderate' && <AlertCircle className="h-4 w-4 text-yellow-500" />}
+                          <span className={`text-lg font-bold ${
+                            alert.severity === 'critical' ? 'text-red-400' :
+                            alert.severity === 'high' ? 'text-orange-400' :
+                            alert.severity === 'moderate' ? 'text-yellow-400' : 'text-green-400'
+                          }`}>
+                            {alert.severity.toUpperCase()}
+                          </span>
+                        </div>
+                        <div className="text-sm text-slate-400 mb-2">{alert.details}</div>
+                        <div className="text-xs text-slate-500 mb-1">📍 {alert.location}</div>
+                        <div className="text-xs text-slate-600">🕒 {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
                       </div>
-                      <div className="text-xs text-slate-400">{alert.value ?? 'Alert'}</div>
-                      <div className="text-xs text-slate-500">📍 {alert.location}</div>
-                      <div className="text-xs text-green-500/80">✓ On-chain • {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
+                    ) : fallbackData ? (
+                      <div className="text-green-400 text-center">
+                        <div className="text-lg font-bold mb-1">Good</div>
+                        <div className="text-sm text-slate-400 mb-2">{fallbackLine}</div>
+                        <div className="text-xs text-slate-500 mb-1">📍 {fallbackData.location}</div>
+                        <div className="text-xs text-slate-600">🕒 {new Date(fallbackData.timestamp).toLocaleString('en-GB')}</div>
+                      </div>
+                    ) : (
+                      <div className="text-green-400 text-center">
+                        <div className="text-lg font-bold mb-1">No alerts</div>
+                        <div className="text-sm text-slate-400">No data available</div>
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
+                    <Badge variant="secondary" className="bg-blue-900/50 text-blue-400">
+                      {data?.lastUpdated ? `Updated: ${data.lastUpdated}` : 'No data'}
+                    </Badge>
+                  </div>
+                </GlowCard>
+              )
+            })}
+
+            {/* Verified on-chain */}
+            <GlowCard glowColor="green" customSize className="flex flex-col">
+              <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
+                <Shield className="h-4 w-4 text-green-400" />
+                <span className="font-semibold text-sm text-green-400">On-chain</span>
+              </div>
+              <div className="flex-1 flex flex-col justify-center py-3">
+                {topOverlayAlert ? (
+                  <div className="text-center">
+                    <div className="flex items-center justify-center space-x-2 mb-2">
+                      {topOverlayAlert.severity >= 80 && <AlertOctagon className="h-4 w-4 text-red-500" />}
+                      {topOverlayAlert.severity >= 60 && topOverlayAlert.severity < 80 && <AlertTriangle className="h-4 w-4 text-orange-500" />}
+                      {topOverlayAlert.severity < 60 && <AlertCircle className="h-4 w-4 text-yellow-500" />}
+                      <span className="text-sm font-bold text-white">{topOverlayAlert.label}</span>
                     </div>
-                  ))}
-                </div>
-                <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
-                  <Badge variant="secondary" className="bg-green-900/30 text-green-400">
-                    {overlayAlerts.length} overlay alert{overlayAlerts.length === 1 ? '' : 's'}
-                  </Badge>
-                </div>
-              </GlowCard>
-            )}
+                    <div className="text-xs text-slate-400">{topOverlayAlert.value ?? 'Alert'}</div>
+                    <div className="text-xs text-slate-500 mb-1">📍 {topOverlayAlert.location}</div>
+                    <div className="text-xs text-green-500/80">✓ Verified • {new Date(topOverlayAlert.timestamp).toLocaleString('en-GB')}</div>
+                  </div>
+                ) : (
+                  <div className="text-green-400 text-center">
+                    <div className="text-lg font-bold mb-1">All clear</div>
+                    <div className="text-sm text-slate-400">No priority alerts</div>
+                  </div>
+                )}
+              </div>
+              <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
+                <Badge variant="secondary" className="bg-green-900/30 text-green-400">
+                  {topOverlayAlert ? 'Blockchain verified' : 'No alerts'}
+                </Badge>
+              </div>
+            </GlowCard>
           </div>
 
           <div className="text-center mt-6">

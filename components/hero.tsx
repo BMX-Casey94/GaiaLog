@@ -2,90 +2,46 @@
 
 import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
-import { ArrowRight, Database, Shield, Globe, Droplets, Activity, Flame, Mountain, AlertTriangle, Thermometer } from "lucide-react"
+import { ArrowRight, AlertTriangle, Shield, Globe } from "lucide-react"
 import { SparklesCore } from "@/components/ui/sparkles"
 import { MeshCanvas } from "@/components/ui/gravitational-mesh"
 
 interface HeroStats {
-  airQuality: {
-    aqi: number | null
-    lastUpdated: string | null
-    location: string | null
-  }
-  blockchain: {
-    totalTransactions: number
-    lastTransaction: string | null
-  }
   overlay: {
     totalReadings: number | null
-    byType: Record<string, number>
     providerCount: number | null
   }
-  priorityAlerts: Array<{
-    family: string
+  topAlert: {
     label: string
-    severity: number
-    value: string | null
+    value: string
     location: string
     timestamp: string
-    txid: string
-  }>
-}
-
-const FAMILY_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
-  air_quality: Database,
-  water_levels: Droplets,
-  seismic_activity: Activity,
-  flood_risk: AlertTriangle,
-  volcanic_activity: Mountain,
-  natural_events: Flame,
-  space_weather: Activity,
-  advanced_metrics: Thermometer,
-  default: Database,
+  } | null
 }
 
 export function Hero() {
   const [stats, setStats] = useState<HeroStats>({
-    airQuality: { aqi: null, lastUpdated: null, location: null },
-    blockchain: { totalTransactions: 0, lastTransaction: null },
-    overlay: { totalReadings: null, byType: {}, providerCount: null },
-    priorityAlerts: [],
+    overlay: { totalReadings: null, providerCount: null },
+    topAlert: null,
   })
   const [loading, setLoading] = useState(true)
   const [randomSecondsAgo, setRandomSecondsAgo] = useState(1)
 
-  const generateRandomSeconds = (): number => Math.floor(Math.random() * 5) + 1
-
   useEffect(() => {
-    const updateRandomTime = () => setRandomSecondsAgo(generateRandomSeconds())
-    updateRandomTime()
-    const interval = setInterval(updateRandomTime, 5000)
-    return () => clearInterval(interval)
+    const tick = () => setRandomSecondsAgo(Math.floor(Math.random() * 5) + 1)
+    tick()
+    const id = setInterval(tick, 5000)
+    return () => clearInterval(id)
   }, [])
 
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const [airRes, explorerRes, alertsRes, providersRes] = await Promise.allSettled([
-          fetch('/api/air-quality/latest', { cache: 'no-store' }),
+        const [explorerRes, alertsRes, providersRes] = await Promise.allSettled([
           fetch('/api/explorer/stats', { cache: 'no-store' }),
-          fetch('/api/explorer/priority-alerts?limit=8', { cache: 'no-store' }),
+          fetch('/api/explorer/priority-alerts?limit=1', { cache: 'no-store' }),
           fetch('/api/providers/status', { cache: 'no-store' }),
         ])
-
-        if (airRes.status === 'fulfilled' && airRes.value.ok) {
-          const airLatest = await airRes.value.json()
-          if (airLatest?.success && airLatest.data) {
-            setStats((prev) => ({
-              ...prev,
-              airQuality: {
-                aqi: airLatest.data.aqi ?? prev.airQuality.aqi,
-                lastUpdated: airLatest.data.timestamp ? new Date(airLatest.data.timestamp).toISOString() : prev.airQuality.lastUpdated,
-                location: airLatest.data.location ?? prev.airQuality.location,
-              },
-            }))
-          }
-        }
 
         if (explorerRes.status === 'fulfilled' && explorerRes.value.ok) {
           const explorer = await explorerRes.value.json()
@@ -96,7 +52,6 @@ export function Hero() {
               overlay: {
                 ...prev.overlay,
                 totalReadings: data.totalReadings ?? data.index?.totalReadings ?? prev.overlay.totalReadings,
-                byType: data.aggregates?.byType ?? data.byType ?? prev.overlay.byType,
               },
             }))
           }
@@ -104,18 +59,16 @@ export function Hero() {
 
         if (alertsRes.status === 'fulfilled' && alertsRes.value.ok) {
           const alerts = await alertsRes.value.json()
-          if (alerts?.success && Array.isArray(alerts.alerts)) {
+          if (alerts?.success && Array.isArray(alerts.alerts) && alerts.alerts.length > 0) {
+            const a = alerts.alerts[0]
             setStats((prev) => ({
               ...prev,
-              priorityAlerts: alerts.alerts.slice(0, 8).map((a: any) => ({
-                family: a.family,
-                label: a.label ?? a.family,
-                severity: a.severity ?? 50,
-                value: a.value ?? null,
+              topAlert: {
+                label: a.label ?? a.family ?? 'Alert',
+                value: a.value ?? '',
                 location: a.location ?? 'Unknown',
                 timestamp: a.timestamp,
-                txid: a.txid,
-              })),
+              },
             }))
           }
         }
@@ -143,107 +96,18 @@ export function Hero() {
     return () => clearInterval(interval)
   }, [])
 
-  const getAQICategory = (aqi: number | null): string => {
-    if (aqi === null || aqi === undefined) return 'Loading...'
-    if (aqi <= 50) return 'Good'
-    if (aqi <= 100) return 'Moderate'
-    if (aqi <= 150) return 'Unhealthy for Sensitive'
-    if (aqi <= 200) return 'Unhealthy'
-    if (aqi <= 300) return 'Very Unhealthy'
-    return 'Hazardous'
-  }
-
-  const formatTimeAgo = (timestamp: string | null): string => {
-    if (!timestamp) return 'N/A'
-    const date = new Date(timestamp)
-    const now = new Date()
-    const diffMs = now.getTime() - date.getTime()
-    const diffMins = Math.floor(diffMs / 60000)
-    
-    if (diffMins < 1) return 'just now'
-    if (diffMins < 60) return `${diffMins} min ago`
-    
-    const diffHours = Math.floor(diffMins / 60)
-    if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`
-    
-    const diffDays = Math.floor(diffHours / 24)
-    return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`
-  }
-
-  const formatNumber = (num: number): string => {
-    return num.toLocaleString('en-GB')
-  }
-
   const formatTotalReadings = (n: number | null): string => {
     if (n == null || n === 0) return '—'
     if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M+`
     if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K+`
-    return formatNumber(n)
+    return n.toLocaleString('en-GB')
   }
 
-  const formatLocation = (location: string | null | undefined): string => {
-    if (!location) return ''
+  const formatLocation = (location: string): string => {
     let cleaned = location.trim()
-    const words = cleaned.split(/\s+/)
-    if (words.length > 0) {
-      const firstWord = words[0]
-      const repeated = new RegExp(`^(${firstWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})+`, 'i')
-      cleaned = cleaned.replace(repeated, firstWord)
-    }
-    if (cleaned.length > 20) {
-      cleaned = cleaned.substring(0, 17) + '...'
-    }
+    if (cleaned.length > 30) cleaned = cleaned.substring(0, 27) + '...'
     return cleaned
   }
-
-  const getDisplayCards = (): Array<{ id: string; label: string; value: string; sub: string; icon: React.ComponentType<{ className?: string }>; onClick?: () => void }> => {
-    const cards: Array<{ id: string; label: string; value: string; sub: string; icon: React.ComponentType<{ className?: string }>; onClick?: () => void }> = []
-
-    stats.priorityAlerts.slice(0, 6).forEach((a) => {
-      const Icon = FAMILY_ICONS[a.family] ?? FAMILY_ICONS.default
-      cards.push({
-        id: a.txid || `${a.family}-${cards.length}`,
-        label: a.label,
-        value: a.value ?? 'Alert',
-        sub: `${formatLocation(a.location)} • ${formatTimeAgo(a.timestamp)}`,
-        icon: Icon,
-        onClick: () => document.getElementById('monitoring')?.scrollIntoView({ behavior: 'smooth' }),
-      })
-    })
-
-    if (cards.length < 4 && (stats.airQuality.aqi != null || stats.airQuality.location)) {
-      cards.push({
-        id: 'air',
-        label: `Air Quality${stats.airQuality.location ? ` (${formatLocation(stats.airQuality.location)})` : ''}`,
-        value: loading ? 'Loading...' : getAQICategory(stats.airQuality.aqi),
-        sub: stats.airQuality.aqi != null ? `AQI: ${stats.airQuality.aqi} • ${formatTimeAgo(stats.airQuality.lastUpdated)}` : 'No data',
-        icon: Database,
-        onClick: () => document.getElementById('dashboard')?.scrollIntoView({ behavior: 'smooth' }),
-      })
-    }
-
-    cards.push({
-      id: 'total',
-      label: 'Total Data Records',
-      value: formatTotalReadings(stats.overlay.totalReadings) || '2M+',
-      sub: `Last TX: ${randomSecondsAgo} second${randomSecondsAgo === 1 ? '' : 's'} ago`,
-      icon: Shield,
-      onClick: () => document.getElementById('blockchain')?.scrollIntoView({ behavior: 'smooth' }),
-    })
-    cards.push({
-      id: 'sources',
-      label: 'Data Sources',
-      value: String(stats.overlay.providerCount ?? 4),
-      sub: 'All systems operational',
-      icon: Globe,
-      onClick: () => document.getElementById('data-sources')?.scrollIntoView({ behavior: 'smooth' }),
-    })
-
-    return cards.slice(0, 8)
-  }
-
-  const displayCards = getDisplayCards()
-
 
   const scrollToMonitoring = (): void => {
     const target = document.getElementById("monitoring")
@@ -321,25 +185,53 @@ export function Hero() {
               <span className="text-slate-400 text-sm ml-4">GaiaLog Dashboard</span>
             </div>
 
-            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-              {displayCards.map((card) => {
-                const Icon = card.icon
-                return (
-                  <button
-                    key={card.id}
-                    id={card.id === 'air' ? 'dashboard' : card.id === 'total' ? 'blockchain-status' : card.id === 'sources' ? 'data-sources-card' : undefined}
-                    className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 hover:border-slate-500/50 hover:bg-slate-800/20 transition-all text-left"
-                    onClick={card.onClick}
-                  >
-                    <div className="flex items-center space-x-2 mb-2">
-                      <Icon className="h-4 w-4 text-blue-400" />
-                      <span className="text-sm text-slate-300 truncate">{card.label}</span>
-                    </div>
-                    <div className="text-xl md:text-2xl font-bold text-white truncate">{card.value}</div>
-                    <div className="text-xs text-slate-400 truncate">{card.sub}</div>
-                  </button>
-                )
-              })}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <button
+                className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 hover:border-slate-500/50 hover:bg-slate-800/20 transition-all text-left"
+                onClick={scrollToMonitoring}
+              >
+                <div className="flex items-center space-x-2 mb-2">
+                  <AlertTriangle className="h-4 w-4 text-red-400" />
+                  <span className="text-sm text-slate-300">Top Alert</span>
+                </div>
+                {stats.topAlert ? (
+                  <>
+                    <div className="text-xl md:text-2xl font-bold text-red-400">{stats.topAlert.label}: {stats.topAlert.value || 'Active'}</div>
+                    <div className="text-xs text-slate-400 truncate">{formatLocation(stats.topAlert.location)}</div>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-xl md:text-2xl font-bold text-green-400">All Clear</div>
+                    <div className="text-xs text-slate-400">No critical alerts</div>
+                  </>
+                )}
+              </button>
+
+              <button
+                id="blockchain-status"
+                className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 hover:border-slate-500/50 hover:bg-slate-800/20 transition-all text-left"
+                onClick={() => document.getElementById('blockchain')?.scrollIntoView({ behavior: 'smooth' })}
+              >
+                <div className="flex items-center space-x-2 mb-2">
+                  <Shield className="h-4 w-4 text-blue-400" />
+                  <span className="text-sm text-slate-300">Total Data Records</span>
+                </div>
+                <div className="text-xl md:text-2xl font-bold text-white">{formatTotalReadings(stats.overlay.totalReadings) || '—'}</div>
+                <div className="text-xs text-slate-400">Last TX: {randomSecondsAgo} second{randomSecondsAgo === 1 ? '' : 's'} ago</div>
+              </button>
+
+              <button
+                id="data-sources-card"
+                className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 hover:border-slate-500/50 hover:bg-slate-800/20 transition-all text-left"
+                onClick={() => document.getElementById('data-sources')?.scrollIntoView({ behavior: 'smooth' })}
+              >
+                <div className="flex items-center space-x-2 mb-2">
+                  <Globe className="h-4 w-4 text-blue-400" />
+                  <span className="text-sm text-slate-300">Data Sources</span>
+                </div>
+                <div className="text-xl md:text-2xl font-bold text-white">{stats.overlay.providerCount ?? '—'}</div>
+                <div className="text-xs text-slate-400">All systems operational</div>
+              </button>
             </div>
           </div>
         </div>
