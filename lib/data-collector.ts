@@ -1861,39 +1861,37 @@ export interface VolcanoAlert {
 const _volcanoWatermark = { ts: 0 }
 
 export async function collectVolcanoAlerts(): Promise<VolcanoAlert[]> {
-  const url = 'https://volcanoes.usgs.gov/vhp/api/v1/activity?format=json'
+  const url = 'https://volcanoes.usgs.gov/vsc/api/volcanoApi/vhpstatus'
   const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'usgs_volcanoes' })
 
-  const items = Array.isArray(data?.features) ? data.features : (Array.isArray(data) ? data : [])
+  const items = Array.isArray(data) ? data : []
   const lastSeen = _volcanoWatermark.ts
   let maxTs = lastSeen
   const out: VolcanoAlert[] = []
 
   for (const item of items) {
-    const props = item?.properties ?? item
-    if (!props) continue
-
-    const dateStr = props.vhp_update_datetime || props.update_datetime || props.datetime
+    const vName = item?.vName ?? item?.volcano_name ?? item?.volcanoName ?? 'Unknown'
+    const vnum = item?.vnum ?? item?.volcano_number ?? ''
+    const dateStr = item?.alertDate ?? item?.colorDate ?? item?.vhp_update_datetime ?? item?.update_datetime ?? ''
     const ts = dateStr ? new Date(dateStr).getTime() : Date.now()
     if (isNaN(ts) || ts <= lastSeen) continue
     if (ts > maxTs) maxTs = ts
 
-    const coords = item?.geometry?.coordinates
-    const lat = coords?.[1] ?? props.latitude ?? 0
-    const lon = coords?.[0] ?? props.longitude ?? 0
+    const lat = Number(item?.lat ?? item?.latitude ?? 0)
+    const lon = Number(item?.long ?? item?.longitude ?? 0)
 
-    const key = `volcano:${props.vnum || props.volcano_number || props.volcanoName}:${dateStr}`
+    const key = `volcano:${vnum || vName}:${dateStr || ts}`
     if (await dedupeStore.add(key)) {
       out.push({
         timestamp: ts,
         source: 'USGS Volcanoes',
-        volcanoName: props.volcano_name || props.volcanoName || 'Unknown',
-        volcanoId: String(props.vnum || props.volcano_number || ''),
+        volcanoName: vName,
+        volcanoId: String(vnum),
         latitude: lat,
         longitude: lon,
-        alertLevel: props.alert_level || props.alertLevel || 'UNASSIGNED',
-        colorCode: props.color_code || props.colorCode || 'UNASSIGNED',
-        observatoryCode: props.obs_code || props.observatory || '',
+        alertLevel: item?.alertLevel ?? item?.alert_level ?? 'UNASSIGNED',
+        colorCode: item?.colorCode ?? item?.color_code ?? 'UNASSIGNED',
+        observatoryCode: item?.obs ?? item?.obs_code ?? item?.observatory ?? '',
       })
     }
   }

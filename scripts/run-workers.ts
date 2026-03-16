@@ -1,9 +1,10 @@
 import 'dotenv/config'
 import dotenv from 'dotenv'
 import { applyPrimaryMutatorRole, getMutatorControlState } from '../lib/mutator-control'
-// Prefer .env.local (Next-style) so workers match the app environment
-dotenv.config({ path: '.env.local' })
-// Fallback to default .env if needed
+// Load .env.local only in development; production/VPS uses .env only to avoid brc104 override
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config({ path: '.env.local' })
+}
 dotenv.config()
 
 applyPrimaryMutatorRole()
