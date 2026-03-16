@@ -197,3 +197,17 @@ export function invalidateAggregateCache(): void {
   _indexStatsCache = null
   _locationCountCache = null
 }
+
+// ─── Priority Alerts ─────────────────────────────────────────────────────────
+
+const PRIORITY_ALERTS_CACHE_TTL_MS = Math.max(5000, Number(process.env.EXPLORER_PRIORITY_ALERTS_CACHE_TTL_MS || 30000))
+let _priorityAlertsCache: CacheEntry<import('./overlay-explorer-repository').PriorityAlertRow[]> | null = null
+
+export async function getPriorityAlerts(limit: number = 8): Promise<import('./overlay-explorer-repository').PriorityAlertRow[]> {
+  if (_priorityAlertsCache && _priorityAlertsCache.expiresAt > Date.now()) {
+    return _priorityAlertsCache.value
+  }
+  const alerts = await repo.getPriorityAlerts(limit)
+  _priorityAlertsCache = { value: alerts, expiresAt: Date.now() + PRIORITY_ALERTS_CACHE_TTL_MS }
+  return alerts
+}

@@ -271,6 +271,67 @@ export async function getDateRange(): Promise<{ min: number | null; max: number 
   }
 }
 
+export interface PriorityAlertRow {
+  txid: string
+  data_family: string
+  location: string | null
+  lat: number | null
+  lon: number | null
+  reading_ts: string
+  metrics_preview: Record<string, unknown>
+  block_height: number
+  confirmed: boolean
+}
+
+export async function getPriorityAlerts(limit: number = 8): Promise<PriorityAlertRow[]> {
+  const result = await query<PriorityAlertRow>(
+    `SELECT txid, data_family, location, lat, lon, reading_ts, metrics_preview, block_height, confirmed
+     FROM overlay_explorer_readings
+     WHERE reading_ts > NOW() - INTERVAL '7 days'
+       AND (
+         (data_family = 'seismic_activity' AND COALESCE((metrics_preview->>'magnitude')::float, 0) >= 5)
+         OR (data_family = 'air_quality' AND (
+           COALESCE((metrics_preview->>'aqi')::int, 0) > 150
+           OR COALESCE((metrics_preview->>'pm25')::float, 0) > 55
+         ))
+         OR (data_family = 'flood_risk')
+         OR (data_family = 'volcanic_activity')
+         OR (data_family = 'natural_events')
+         OR (data_family = 'space_weather')
+       )
+     ORDER BY reading_ts DESC
+     LIMIT $1`,
+    [Math.min(limit, 50)],
+  )
+  return result.rows || []
+}
+
+export async function getRecentReadingsByFamily(
+  families: string[],
+  limitPerFamily: number = 1,
+): Promise<Array<{ txid: string; data_family: string; location: string | null; reading_ts: string; provider_id: string | null; block_height: number; confirmed: boolean }>> {
+  if (families.length === 0) return []
+
+  const result = await query<{
+    txid: string
+    data_family: string
+    location: string | null
+    reading_ts: string
+    provider_id: string | null
+    block_height: number
+    confirmed: boolean
+  }>(
+    `SELECT DISTINCT ON (data_family)
+       txid, data_family, location, reading_ts, provider_id, block_height, confirmed
+     FROM overlay_explorer_readings
+     WHERE data_family = ANY($1::text[])
+       AND reading_ts > NOW() - INTERVAL '7 days'
+     ORDER BY data_family, reading_ts DESC`,
+    [families],
+  )
+  return result.rows || []
+}
+
 // ─── Internal Helpers ────────────────────────────────────────────────────────
 
 function buildWhereClause(params: SearchParams): { whereSql: string; sqlParams: unknown[] } {

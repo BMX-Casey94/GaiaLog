@@ -4,7 +4,7 @@ import { useState, useEffect } from "react"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Database, Droplets, Activity, Thermometer, RefreshCw, AlertTriangle, AlertCircle, AlertOctagon } from "lucide-react"
+import { Database, Droplets, Activity, Thermometer, RefreshCw, AlertTriangle, AlertCircle, AlertOctagon, Flame, Mountain, Shield } from "lucide-react"
 
 interface EnvironmentalData {
   airQuality: any
@@ -15,13 +15,26 @@ interface EnvironmentalData {
 }
 
 interface AlertData {
-  type: 'air' | 'water' | 'seismic' | 'environmental'
+  type: 'air' | 'water' | 'seismic' | 'environmental' | 'flood' | 'volcanic' | 'natural-event' | 'space-weather' | 'biodiversity' | 'conservation'
   severity: 'low' | 'moderate' | 'high' | 'critical'
   value: number
   location: string
   timestamp: string
   source: string
   details: string
+  txid?: string
+  verifiedOnChain?: boolean
+}
+
+interface OverlayAlert {
+  family: string
+  label: string
+  severity: number
+  value: string | null
+  location: string
+  timestamp: string
+  txid: string
+  confirmed?: boolean
 }
 
 export function LiveDashboard() {
@@ -35,7 +48,14 @@ export function LiveDashboard() {
     water: null,
     seismic: null,
     environmental: null,
+    flood: null,
+    volcanic: null,
+    'natural-event': null,
+    'space-weather': null,
+    biodiversity: null,
+    conservation: null,
   })
+  const [overlayAlerts, setOverlayAlerts] = useState<OverlayAlert[]>([])
 
   const processDataIntoAlerts = (data: any): AlertData[] => {
     const alerts: AlertData[] = []
@@ -171,16 +191,38 @@ export function LiveDashboard() {
     return alerts
   }
 
+  const overlayFamilyToType = (family: string): AlertData['type'] => {
+    const map: Record<string, AlertData['type']> = {
+      flood_risk: 'flood',
+      volcanic_activity: 'volcanic',
+      natural_events: 'natural-event',
+      space_weather: 'space-weather',
+      biodiversity: 'biodiversity',
+      conservation_status: 'conservation',
+      seismic_activity: 'seismic',
+      air_quality: 'air',
+      water_levels: 'water',
+    }
+    return map[family] ?? 'environmental'
+  }
+
+  const overlaySeverityToLevel = (score: number): 'low' | 'moderate' | 'high' | 'critical' => {
+    if (score >= 80) return 'critical'
+    if (score >= 60) return 'high'
+    if (score >= 40) return 'moderate'
+    return 'low'
+  }
+
   const fetchData = async () => {
     setLoading(true)
     setError(null)
     try {
-      // Fetch from WoC (no database, rotates across 3 wallets)
-      const [airQualityRes, waterLevelsRes, seismicRes, advancedRes] = await Promise.all([
+      const [airQualityRes, waterLevelsRes, seismicRes, advancedRes, priorityAlertsRes] = await Promise.all([
         fetch('/api/air-quality/latest', { cache: 'no-store' }),
         fetch('/api/water-levels/latest', { cache: 'no-store' }),
         fetch('/api/seismic/latest', { cache: 'no-store' }),
-        fetch('/api/advanced-metrics/latest', { cache: 'no-store' })
+        fetch('/api/advanced-metrics/latest', { cache: 'no-store' }),
+        fetch('/api/explorer/priority-alerts?limit=8', { cache: 'no-store' }),
       ])
       
       // Handle responses: 404 is expected when no data exists yet (not an error)
@@ -221,9 +263,30 @@ export function LiveDashboard() {
       }
       
       setData(processedData)
-      const newAlerts = processDataIntoAlerts(processedData)
+      let newAlerts = processDataIntoAlerts(processedData)
+
+      if (priorityAlertsRes.ok) {
+        const priorityJson = await priorityAlertsRes.json()
+        if (priorityJson?.success && Array.isArray(priorityJson.alerts)) {
+          setOverlayAlerts(priorityJson.alerts)
+          const overlayAsAlerts: AlertData[] = priorityJson.alerts.map((a: OverlayAlert) => ({
+            type: overlayFamilyToType(a.family),
+            severity: overlaySeverityToLevel(a.severity),
+            value: Number(a.value) || 0,
+            location: a.location,
+            timestamp: a.timestamp,
+            source: 'overlay',
+            details: a.value ? `${a.label}: ${a.value}` : a.label,
+            txid: a.txid,
+            verifiedOnChain: a.confirmed ?? true,
+          }))
+          newAlerts = [...newAlerts, ...overlayAsAlerts]
+        }
+      } else {
+        setOverlayAlerts([])
+      }
+
       setAlerts(newAlerts)
-      // Update sticky memory for only high/critical alerts
       setStickyByType(prev => {
         const next = { ...prev }
         for (const a of newAlerts) {
@@ -468,6 +531,36 @@ export function LiveDashboard() {
                 </Badge>
               </div>
             </GlowCard>
+
+            {/* Overlay / Verified on-chain alerts */}
+            {overlayAlerts.length > 0 && (
+              <GlowCard glowColor="green" customSize className="flex flex-col md:col-span-2">
+                <div className="flex items-center justify-center space-x-2 -mx-4 -mt-4 px-4 py-3 bg-slate-800/60 border-b border-slate-700/50 rounded-t-2xl">
+                  <Shield className="h-4 w-4 text-green-400" />
+                  <span className="font-semibold text-sm text-green-400">Verified on-chain Alerts</span>
+                </div>
+                <div className="flex-1 flex flex-col justify-center py-3 space-y-3">
+                  {overlayAlerts.slice(0, 4).map((alert, index) => (
+                    <div key={alert.txid || index} className="text-center border-b border-slate-700/30 last:border-0 pb-2 last:pb-0">
+                      <div className="flex items-center justify-center space-x-2 mb-1">
+                        {alert.severity >= 80 && <AlertOctagon className="h-4 w-4 text-red-500" />}
+                        {alert.severity >= 60 && alert.severity < 80 && <AlertTriangle className="h-4 w-4 text-orange-500" />}
+                        {alert.severity >= 40 && alert.severity < 60 && <AlertCircle className="h-4 w-4 text-yellow-500" />}
+                        <span className="text-sm font-bold text-white">{alert.label}</span>
+                      </div>
+                      <div className="text-xs text-slate-400">{alert.value ?? 'Alert'}</div>
+                      <div className="text-xs text-slate-500">📍 {alert.location}</div>
+                      <div className="text-xs text-green-500/80">✓ On-chain • {new Date(alert.timestamp).toLocaleString('en-GB')}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex justify-center pt-2 -mx-4 -mb-4 px-4 py-2 border-t border-slate-700/30">
+                  <Badge variant="secondary" className="bg-green-900/30 text-green-400">
+                    {overlayAlerts.length} overlay alert{overlayAlerts.length === 1 ? '' : 's'}
+                  </Badge>
+                </div>
+              </GlowCard>
+            )}
           </div>
 
           <div className="text-center mt-6">

@@ -230,7 +230,22 @@ export const SOURCE_RELIABILITY: Record<string, number> = {
   'Copernicus CAMS': 90,
   'NASA POWER': 90,
   'IGRA v2': 92,
-  
+
+  'USGS Water Services': 95,
+  'UK Environment Agency': 90,
+  'GBIF': 85,
+  'iNaturalist': 75,
+  'OBIS': 88,
+  'USFWS ECOS': 93,
+  'NatureServe': 85,
+  'NASA EONET': 92,
+  'Global Forest Watch': 88,
+  'USGS MRDS': 90,
+  'OpenSky Network': 80,
+  'AISStream': 78,
+  'Movebank': 82,
+  'UK Planning Data': 85,
+
   // Default for unknown sources
   'unknown': 50,
 }

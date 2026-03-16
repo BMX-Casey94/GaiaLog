@@ -1,43 +1,77 @@
 "use client"
 
+import { useState, useEffect } from "react"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
 import { Database, Droplets, Activity, Cloud, RefreshCw } from "lucide-react"
+import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
+
+const FAMILY_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
+  air_quality: Cloud,
+  water_levels: Droplets,
+  seismic_activity: Activity,
+  advanced_metrics: Database,
+  default: Database,
+}
+
+function formatIntervalMs(ms: number): string {
+  if (ms >= 60 * 60 * 1000) return `${Math.round(ms / (60 * 60 * 1000))} hour${ms >= 2 * 60 * 60 * 1000 ? 's' : ''}`
+  if (ms >= 60 * 1000) return `${Math.round(ms / 60000)} min`
+  if (ms >= 1000) return `${Math.round(ms / 1000)} sec`
+  return `${ms}ms`
+}
+
+interface ProviderSource {
+  id: string
+  name: string
+  type: string
+  icon: React.ComponentType<{ className?: string }>
+  refreshRate: string
+  coverage: string
+  status: string
+}
 
 export function DataSources() {
-  const sources = [
-    {
-      name: "WAQI API",
-      type: "Air Quality",
-      icon: Cloud,
-      refreshRate: "10 minutes",
-      coverage: "Global",
-      status: "operational",
-    },
-    {
-      name: "NOAA Tides & Currents",
-      type: "Water Levels",
-      icon: Droplets,
-      refreshRate: "10 minutes",
-      coverage: "Global",
-      status: "operational",
-    },
-    {
-      name: "USGS Earthquake API",
-      type: "Seismic Activity",
-      icon: Activity,
-      refreshRate: "10 minutes",
-      coverage: "Global",
-      status: "operational",
-    },
-    {
-      name: "Environmental Monitoring",
-      type: "UV, Soil, Wildfire Risk",
-      icon: Database,
-      refreshRate: "10 minutes",
-      coverage: "Global",
-      status: "operational",
-    },
+  const [sources, setSources] = useState<ProviderSource[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const fetchProviders = async () => {
+      try {
+        const res = await fetch('/api/providers/status', { cache: 'no-store' })
+        const data = await res.json()
+        const providers = data?.controls?.providers ?? []
+        const enabled = providers.filter((p: any) => p.enabled && p.rolloutEnabled)
+        const mapped: ProviderSource[] = enabled.map((p: any) => {
+          const familyLabel = DATA_FAMILY_DESCRIPTORS[p.primaryFamily as keyof typeof DATA_FAMILY_DESCRIPTORS]?.label ?? p.primaryFamily
+          const Icon = FAMILY_ICONS[p.primaryFamily] ?? FAMILY_ICONS.default
+          return {
+            id: p.id,
+            name: p.displayName ?? p.id,
+            type: familyLabel,
+            icon: Icon,
+            refreshRate: formatIntervalMs(p.intervalMs ?? 600000),
+            coverage: 'Global',
+            status: p.enabled ? 'operational' : 'disabled',
+          }
+        })
+        setSources(mapped)
+      } catch {
+        setSources([])
+      } finally {
+        setLoading(false)
+      }
+    }
+    fetchProviders()
+    const interval = setInterval(fetchProviders, 60000)
+    return () => clearInterval(interval)
+  }, [])
+
+  const displaySources = sources.length > 0 ? sources : [
+    { id: 'waqi', name: 'WAQI API', type: 'Air Quality', icon: Cloud, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
+    { id: 'noaa', name: 'NOAA Tides & Currents', type: 'Water Levels', icon: Droplets, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
+    { id: 'usgs', name: 'USGS Earthquake API', type: 'Seismic Activity', icon: Activity, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
+    { id: 'env', name: 'Environmental Monitoring', type: 'UV, Soil, Wildfire Risk', icon: Database, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
   ]
 
   return (
@@ -53,12 +87,14 @@ export function DataSources() {
             </p>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {sources.map((source) => (
-              <GlowCard key={source.name} glowColor="purple" customSize className="h-full">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            {displaySources.map((source) => {
+              const Icon = source.icon
+              return (
+              <GlowCard key={source.id} glowColor="purple" customSize className="h-full">
                 <div className="flex items-center space-x-3 mb-4">
                   <div className="w-10 h-10 bg-slate-950/60 rounded-full flex items-center justify-center">
-                    <source.icon className="h-5 w-5 text-purple-300" />
+                    <Icon className="h-5 w-5 text-purple-300" />
                   </div>
                   <div>
                     <div className="text-white font-semibold">{source.name}</div>
@@ -85,7 +121,7 @@ export function DataSources() {
                   </div>
                 </div>
               </GlowCard>
-            ))}
+            )})}
           </div>
         </div>
       </div>

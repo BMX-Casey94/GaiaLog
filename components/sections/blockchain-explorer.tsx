@@ -4,7 +4,7 @@ import { useEffect, useState } from "react"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { ExternalLink, Clock, Hash, Wallet } from "lucide-react"
+import { ExternalLink, Clock, Hash, Wallet, Shield } from "lucide-react"
 import {
   Dialog,
   DialogContent,
@@ -40,6 +40,7 @@ export function BlockchainExplorer() {
   const [network, setNetwork] = useState<string>('test')
   const [loading, setLoading] = useState(true)
   const [showWalletModal, setShowWalletModal] = useState(false)
+  const [readingsSource, setReadingsSource] = useState<string | null>(null)
 
   const wallets = [
     { name: 'Wallet 1', address: '13S6zUA88PtDNy9DKHZuh3QQmy4d4eN4Se' },
@@ -53,7 +54,7 @@ export function BlockchainExplorer() {
       const result = await response.json()
       
       if (result.success && result.readings) {
-        // Normalise network value to 'main' | 'test'
+        setReadingsSource(result.source ?? null)
         const netStr =
           result.network === 'mainnet' ? 'main'
           : result.network === 'testnet' ? 'test'
@@ -143,6 +144,13 @@ export function BlockchainExplorer() {
               Every environmental measurement is cryptographically secured and stored on the BSV blockchain. Verify any
               data point independently.
             </p>
+            {readingsSource === 'overlay' && transactions.length > 0 && (
+              <div className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-green-900/30 border border-green-700/50">
+                <Shield className="h-4 w-4 text-green-400" />
+                <span className="text-sm font-medium text-green-400">Verified on-chain</span>
+                <span className="text-xs text-slate-400">— Data from overlay index</span>
+              </div>
+            )}
           </div>
 
           <>

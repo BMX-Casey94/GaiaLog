@@ -52,6 +52,27 @@ const METRIC_PREVIEW_KEYS = new Set([
   'alert_level', 'aviation_color_code', 'eruption_probability', 'gas_flux',
   'speed', 'density', 'temperature', 'bz', 'bt',
   'altitude_m', 'wind_kph', 'pressure_mb',
+  // biodiversity
+  'species', 'scientific_name', 'taxon_rank', 'observation_count',
+  'kingdom', 'phylum', 'class', 'order', 'family', 'genus',
+  // conservation
+  'listing_status', 'threat_category', 'population_trend', 'conservation_rank',
+  // hydrology
+  'discharge_cfs', 'gage_height_ft', 'water_temperature_c', 'dissolved_oxygen_mg_l',
+  'specific_conductance', 'ph', 'turbidity_ntu',
+  // flood risk
+  'severity_level', 'flood_area', 'river_level_m', 'is_rising',
+  // land-use change
+  'alert_confidence', 'tree_cover_loss_ha', 'disturbance_type',
+  // natural events
+  'event_type', 'category', 'magnitude_value', 'magnitude_unit',
+  // mining
+  'commodity', 'deposit_type', 'development_status', 'site_name',
+  // transport
+  'callsign', 'origin_country', 'velocity_ms', 'on_ground', 'icao24',
+  'mmsi', 'vessel_name', 'ship_type', 'heading', 'course',
+  // planning & development
+  'application_ref', 'proposal', 'status', 'decision_date',
 ])
 
 // ─── Conversion ──────────────────────────────────────────────────────────────

@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { query } from '../../../../lib/db'
 import { blockchainService } from '@/lib/blockchain'
 import { DATA_FAMILY_DESCRIPTORS } from '@/lib/stream-registry'
+import { getExplorerReadSource } from '@/lib/explorer-read-source'
+import { getRecentReadingsByFamily } from '@/lib/overlay-explorer-repository'
 
 function getBSVNetwork(): 'main' | 'test' {
   return process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
@@ -24,6 +26,29 @@ export async function GET(req: NextRequest) {
   const network = getBSVNetwork()
   const wanted = Object.keys(DATA_FAMILY_DESCRIPTORS)
   try {
+    // Overlay branch: when EXPLORER_READ_SOURCE=overlay, serve from overlay_explorer_readings
+    const readSource = getExplorerReadSource()
+    if (readSource === 'overlay') {
+      try {
+        const overlayRows = await getRecentReadingsByFamily(wanted)
+        if (overlayRows.length > 0) {
+          const readings = overlayRows
+            .filter((r) => r.txid && isValidTxId(r.txid))
+            .map((r) => ({
+              txid: r.txid,
+              type: r.data_family,
+              timestamp: r.reading_ts,
+              status: r.confirmed ? 'confirmed' : 'pending',
+              data: { provider: r.provider_id || 'unknown' },
+            }))
+            .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+          return NextResponse.json({ success: true, network, readings, source: 'overlay' })
+        }
+      } catch (overlayErr) {
+        console.warn('Overlay recent-readings fallback:', overlayErr instanceof Error ? overlayErr.message : overlayErr)
+      }
+    }
+
     // Preferred: Use in-memory broadcast log for fresh TXIDs (no external reads)
     // Always pick the most recent per type; remain fixed until new data appears
     const local = blockchainService.getLocalTransactionLog()
