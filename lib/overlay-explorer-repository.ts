@@ -361,7 +361,8 @@ export async function getLatestReadingsWithMetrics(
      FROM overlay_explorer_readings
      WHERE data_family = ANY($1::text[])
        AND reading_ts > NOW() - INTERVAL '7 days'
-     ORDER BY data_family, reading_ts DESC`,
+       AND (confirmed = true OR reading_ts > NOW() - INTERVAL '2 hours')
+     ORDER BY data_family, confirmed DESC, reading_ts DESC`,
     [families],
   )
   return result.rows || []
@@ -387,10 +388,23 @@ export async function getRecentReadingsByFamily(
      FROM overlay_explorer_readings
      WHERE data_family = ANY($1::text[])
        AND reading_ts > NOW() - INTERVAL '7 days'
-     ORDER BY data_family, reading_ts DESC`,
+       AND (confirmed = true OR reading_ts > NOW() - INTERVAL '2 hours')
+     ORDER BY data_family, confirmed DESC, reading_ts DESC`,
     [families],
   )
   return result.rows || []
+}
+
+/**
+ * Remove an unconfirmed reading whose TXID was never mined (e.g. mempool eviction).
+ * Only deletes if `confirmed = false` to prevent accidental removal of confirmed data.
+ */
+export async function removeUnconfirmedReading(txid: string): Promise<boolean> {
+  const result = await query(
+    `DELETE FROM overlay_explorer_readings WHERE txid = $1 AND confirmed = false`,
+    [txid],
+  )
+  return (result.rowCount ?? 0) > 0
 }
 
 // ─── Internal Helpers ────────────────────────────────────────────────────────

@@ -97,7 +97,8 @@ export async function GET(req: NextRequest) {
          AND LENGTH(txid) = 64
          AND type = ANY($1::text[])
          AND collected_at > NOW() - INTERVAL '7 days'
-       ORDER BY type, collected_at DESC`
+         AND (status = 'confirmed' OR collected_at > NOW() - INTERVAL '2 hours')
+       ORDER BY type, (status = 'confirmed') DESC, collected_at DESC`
     , [wanted])
 
     if (Array.isArray(result.rows) && result.rows.length > 0) {

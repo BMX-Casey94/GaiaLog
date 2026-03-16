@@ -15,6 +15,7 @@ import { createCredibilityBuilder } from './pipeline-integrity'
 import type { CredibilityMetadata } from './types/credibility'
 // Explorer store – routed through the read-source switcher (legacy / dual / overlay)
 import { addReading, canAttemptExplorerWrite, type StoredReading } from './explorer-read-source'
+import { removeUnconfirmedReading } from './overlay-explorer-repository'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress, type SpendableOutput } from './spend-source'
 import { QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
@@ -615,8 +616,11 @@ export class BlockchainService {
 
     if (current.attempts >= MAX_CONFIRMATION_CHECK_ATTEMPTS || (Date.now() - current.firstScheduledAt) >= CONFIRMATION_MAX_TRACK_MS) {
       this.txStatusBatch.retryLimitReached += 1
-      this.recordOperationalError('confirmation-check', current.attempts >= MAX_CONFIRMATION_CHECK_ATTEMPTS ? 'max-attempts-reached' : 'max-track-age-reached')
+      const reason = current.attempts >= MAX_CONFIRMATION_CHECK_ATTEMPTS ? 'max-attempts-reached' : 'max-track-age-reached'
+      this.recordOperationalError('confirmation-check', reason)
       this.pendingConfirmationByTxid.delete(current.txid)
+
+      void this.cleanUpFailedTx(current.txid, current.streamType, reason)
       return
     }
 
@@ -679,6 +683,32 @@ export class BlockchainService {
     } finally {
       clearTimeout(timeoutId)
     }
+  }
+
+  private async cleanUpFailedTx(txid: string, streamType: string, reason: string): Promise<void> {
+    try {
+      await upsertTxLog({
+        txid,
+        type: streamType,
+        provider: 'confirmation-failed',
+        collected_at: new Date(),
+        status: 'failed',
+        onchain_at: null,
+        fee_sats: null,
+        wallet_index: null,
+        retries: null,
+        error: reason,
+      })
+    } catch {}
+    try {
+      const removed = await removeUnconfirmedReading(txid)
+      if (removed) {
+        console.log(`🗑️ Removed stale unconfirmed reading: ${txid.substring(0, 12)}... (${reason})`)
+      }
+    } catch {}
+
+    const logEntry = this.transactionLog.find((l) => l.txid === txid)
+    if (logEntry) logEntry.status = 'failed'
   }
 
   private appendTransactionLog(entry: TransactionLog): void {
