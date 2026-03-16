@@ -98,7 +98,7 @@ module.exports = {
         GAIALOG_WORKER_PROCESS: '1',
         GAIALOG_SINGLE_WRITER_MODE: 'run-workers',
         GAIALOG_MUTATOR_ROLE: 'primary',
-        BSV_OVERLAY_AUTH_MODE: process.env.BSV_OVERLAY_AUTH_MODE || 'none',
+        BSV_OVERLAY_AUTH_MODE: process.env.BSV_OVERLAY_AUTH_MODE || 'none',  // 'none' for localhost; brc104 needs /.well-known/auth
         BSV_OVERLAY_CLIENT_IDENTITY_WIF: process.env.BSV_OVERLAY_CLIENT_IDENTITY_WIF,
         BSV_OVERLAY_TIMEOUT_MS: process.env.BSV_OVERLAY_TIMEOUT_MS || '10000',
         BSV_OVERLAY_MAX_RETRIES: process.env.BSV_OVERLAY_MAX_RETRIES || '1',

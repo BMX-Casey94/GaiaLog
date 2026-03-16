@@ -1721,8 +1721,8 @@ export interface SpaceWeatherReading {
 const _swWatermarks = new Map<string, number>()
 
 export async function collectSpaceWeatherData(): Promise<SpaceWeatherReading[]> {
-  const magUrl = 'https://services.swpc.noaa.gov/json/rtsw/rtsw_mag_1-m.json'
-  const windUrl = 'https://services.swpc.noaa.gov/json/rtsw/rtsw_wind_1-m.json'
+  const magUrl = 'https://services.swpc.noaa.gov/json/rtsw/rtsw_mag_1m.json'
+  const windUrl = 'https://services.swpc.noaa.gov/json/rtsw/rtsw_wind_1m.json'
 
   const [magData, windData] = await Promise.all([
     fetchJsonWithRetry<any[]>(magUrl, { retries: 2, providerId: 'noaa_space_weather' }),
@@ -1970,5 +1970,1409 @@ export async function collectUpperAtmosphereData(): Promise<UpperAtmosphereReadi
     }
   }
   if (maxTs > lastSeen) _igraWatermark.ts = maxTs
+  return out
+}
+
+// ─── openSenseMap Boxes ──────────────────────────────────────────────────────
+
+export interface OpenSenseMapReading {
+  timestamp: number
+  source: string
+  boxId: string
+  boxName: string
+  latitude: number
+  longitude: number
+  temperature?: number | null
+  humidity?: number | null
+  pressure?: number | null
+  pm25?: number | null
+  pm10?: number | null
+  uvIntensity?: number | null
+  illuminance?: number | null
+}
+
+const _osmWatermark = { ts: 0 }
+
+export async function collectOpenSenseMapData(limit: number = 500): Promise<OpenSenseMapReading[]> {
+  const url = 'https://api.opensensemap.org/boxes?minimal=true&limit=1000&date=lastMeasurement'
+  const boxes = await fetchJsonWithRetry<any[]>(url, { retries: 2, providerId: 'opensensemap', timeoutMs: 30000 })
+
+  if (!Array.isArray(boxes)) return []
+  const lastSeen = _osmWatermark.ts
+  let maxTs = lastSeen
+  const out: OpenSenseMapReading[] = []
+
+  for (const box of boxes) {
+    if (out.length >= limit) break
+    if (!box?._id || !box?.currentLocation?.coordinates) continue
+
+    const updated = box.lastMeasurementAt || box.updatedAt
+    const ts = updated ? new Date(updated).getTime() : Date.now()
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const [lon, lat] = box.currentLocation.coordinates
+    const key = `osm:${box._id}:${updated}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const sensors: Record<string, number | null> = {}
+    if (Array.isArray(box.sensors)) {
+      for (const s of box.sensors) {
+        const title = String(s?.title || '').toLowerCase()
+        const val = parseNumericValue(s?.lastMeasurement?.value)
+        if (val === undefined) continue
+        if (title.includes('temperatur')) sensors.temperature = val
+        else if (title.includes('feucht') || title.includes('humid')) sensors.humidity = val
+        else if (title.includes('druck') || title.includes('press')) sensors.pressure = val
+        else if (title.includes('pm2')) sensors.pm25 = val
+        else if (title.includes('pm10')) sensors.pm10 = val
+        else if (title.includes('uv')) sensors.uvIntensity = val
+        else if (title.includes('lux') || title.includes('beleucht') || title.includes('illumin')) sensors.illuminance = val
+      }
+    }
+
+    out.push({
+      timestamp: ts,
+      source: 'openSenseMap',
+      boxId: box._id,
+      boxName: box.name || box._id,
+      latitude: lat,
+      longitude: lon,
+      temperature: sensors.temperature ?? null,
+      humidity: sensors.humidity ?? null,
+      pressure: sensors.pressure ?? null,
+      pm25: sensors.pm25 ?? null,
+      pm10: sensors.pm10 ?? null,
+      uvIntensity: sensors.uvIntensity ?? null,
+      illuminance: sensors.illuminance ?? null,
+    })
+  }
+  if (maxTs > lastSeen) _osmWatermark.ts = maxTs
+  return out
+}
+
+// ─── INTERMAGNET Geomagnetic Observatories ───────────────────────────────────
+
+export interface IntermagnetReading {
+  timestamp: number
+  source: string
+  observatory: string
+  latitude: number
+  longitude: number
+  x: number | null
+  y: number | null
+  z: number | null
+  f: number | null
+}
+
+const _intermagnetWatermark = { ts: 0 }
+
+export async function collectIntermagnetData(): Promise<IntermagnetReading[]> {
+  const now = new Date()
+  const stop = now.toISOString().replace(/\.\d+Z$/, 'Z')
+  const startDate = new Date(now.getTime() - 2 * 60 * 60 * 1000)
+  const start = startDate.toISOString().replace(/\.\d+Z$/, 'Z')
+
+  const capabilitiesUrl = 'https://imag-data.bgs.ac.uk/GIN_V1/hapi/catalog'
+  let datasets: any[] = []
+  try {
+    const catalog = await fetchJsonWithRetry<any>(capabilitiesUrl, { retries: 2, providerId: 'intermagnet', timeoutMs: 20000 })
+    datasets = Array.isArray(catalog?.catalog) ? catalog.catalog : []
+  } catch { return [] }
+
+  const observatories = datasets.slice(0, 30)
+  const lastSeen = _intermagnetWatermark.ts
+  let maxTs = lastSeen
+  const out: IntermagnetReading[] = []
+
+  for (const ds of observatories) {
+    const id = ds?.id
+    if (!id) continue
+    try {
+      const dataUrl = `https://imag-data.bgs.ac.uk/GIN_V1/hapi/data?id=${encodeURIComponent(id)}&time.min=${start}&time.max=${stop}&format=json`
+      const resp = await fetchJsonWithRetry<any>(dataUrl, { retries: 1, providerId: 'intermagnet', timeoutMs: 15000 })
+      const records = Array.isArray(resp?.data) ? resp.data : []
+      if (records.length === 0) continue
+      const last = records[records.length - 1]
+      const tsStr = Array.isArray(last) ? last[0] : last?.Time || last?.timestamp
+      const ts = tsStr ? new Date(tsStr).getTime() : Date.now()
+      if (isNaN(ts) || ts <= lastSeen) continue
+      if (ts > maxTs) maxTs = ts
+
+      const key = `intermagnet:${id}:${tsStr}`
+      if (!(await dedupeStore.add(key))) continue
+
+      const vals = Array.isArray(last) ? last : [last?.Time, last?.X, last?.Y, last?.Z, last?.F]
+      out.push({
+        timestamp: ts,
+        source: 'INTERMAGNET',
+        observatory: id,
+        latitude: resp?.parameters?.[0]?.latitude ?? 0,
+        longitude: resp?.parameters?.[0]?.longitude ?? 0,
+        x: parseNumericValue(vals[1]) ?? null,
+        y: parseNumericValue(vals[2]) ?? null,
+        z: parseNumericValue(vals[3]) ?? null,
+        f: parseNumericValue(vals[4]) ?? null,
+      })
+    } catch { /* skip failed observatory */ }
+  }
+  if (maxTs > lastSeen) _intermagnetWatermark.ts = maxTs
+  return out
+}
+
+// ─── IRIS EarthScope Seismic Events ──────────────────────────────────────────
+
+export interface IrisSeismicEvent {
+  timestamp: number
+  source: string
+  eventId: string
+  magnitude: number
+  depth: number
+  location: string
+  latitude: number
+  longitude: number
+}
+
+const _irisWatermark = { ts: 0 }
+
+export async function collectIrisEvents(minutesBack: number = 60, limit: number = 500): Promise<IrisSeismicEvent[]> {
+  const now = new Date()
+  const start = new Date(now.getTime() - minutesBack * 60 * 1000)
+  const url = `https://service.iris.edu/fdsnws/event/1/query?format=geojson&starttime=${start.toISOString()}&endtime=${now.toISOString()}&minmagnitude=2&limit=${limit}&orderby=time-asc`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'iris', timeoutMs: 20000 })
+  const features = Array.isArray(data?.features) ? data.features : []
+
+  const lastSeen = _irisWatermark.ts
+  let maxTs = lastSeen
+  const out: IrisSeismicEvent[] = []
+
+  for (const f of features) {
+    const props = f?.properties
+    const coords = f?.geometry?.coordinates
+    if (!props || !coords) continue
+
+    const ts = props.time ? new Date(props.time).getTime() : Date.now()
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const eventId = f.id || props.eventid || props.publicid || ''
+    const key = `iris:${eventId}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'IRIS EarthScope',
+      eventId,
+      magnitude: parseFloat(props.mag) || 0,
+      depth: parseFloat(coords[2]) || 0,
+      location: props.place || props.description || 'Unknown',
+      latitude: coords[1] || 0,
+      longitude: coords[0] || 0,
+    })
+  }
+  if (maxTs > lastSeen) _irisWatermark.ts = maxTs
+  return out
+}
+
+// ─── NASA POWER Surface Meteorology ──────────────────────────────────────────
+
+export interface NasaPowerReading {
+  timestamp: number
+  source: string
+  latitude: number
+  longitude: number
+  temperature2m?: number | null
+  relativeHumidity2m?: number | null
+  windSpeed10m?: number | null
+  precipitation?: number | null
+  solarIrradiance?: number | null
+  surfacePressure?: number | null
+}
+
+export async function collectNasaPowerData(points?: Array<{ lat: number; lon: number }>): Promise<NasaPowerReading[]> {
+  const defaultPoints = [
+    { lat: 51.5, lon: -0.1 },
+    { lat: 40.7, lon: -74.0 },
+    { lat: 35.7, lon: 139.7 },
+    { lat: -33.9, lon: 18.4 },
+    { lat: -23.5, lon: -46.6 },
+  ]
+  const targets = points || defaultPoints
+  const now = new Date()
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+  const dateStr = yesterday.toISOString().slice(0, 10).replace(/-/g, '')
+  const out: NasaPowerReading[] = []
+
+  for (const pt of targets) {
+    try {
+      const url = `https://power.larc.nasa.gov/api/temporal/daily/point?parameters=T2M,RH2M,WS10M,PRECTOTCORR,ALLSKY_SFC_SW_DWN,PS&community=RE&longitude=${pt.lon}&latitude=${pt.lat}&start=${dateStr}&end=${dateStr}&format=JSON`
+      const data = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'nasa_power', timeoutMs: 30000 })
+      const params = data?.properties?.parameter
+      if (!params) continue
+
+      const key = `nasapower:${pt.lat}:${pt.lon}:${dateStr}`
+      if (!(await dedupeStore.add(key))) continue
+
+      const val = (obj: any) => {
+        if (!obj) return null
+        const vals = Object.values(obj) as number[]
+        const last = vals[vals.length - 1]
+        return last != null && last !== -999 ? last : null
+      }
+
+      out.push({
+        timestamp: yesterday.getTime(),
+        source: 'NASA POWER',
+        latitude: pt.lat,
+        longitude: pt.lon,
+        temperature2m: val(params.T2M),
+        relativeHumidity2m: val(params.RH2M),
+        windSpeed10m: val(params.WS10M),
+        precipitation: val(params.PRECTOTCORR),
+        solarIrradiance: val(params.ALLSKY_SFC_SW_DWN),
+        surfacePressure: val(params.PS),
+      })
+    } catch { /* skip failed point */ }
+  }
+  return out
+}
+
+// ─── Copernicus CAMS Atmospheric Composition ─────────────────────────────────
+
+export interface CamsReading {
+  timestamp: number
+  source: string
+  latitude: number
+  longitude: number
+  pm25?: number | null
+  pm10?: number | null
+  ozone?: number | null
+  no2?: number | null
+  so2?: number | null
+  co?: number | null
+}
+
+export async function collectCamsData(): Promise<CamsReading[]> {
+  const apiKey = process.env.COPERNICUS_CAMS_API_KEY
+  if (!apiKey) return []
+
+  const points = [
+    { lat: 51.5, lon: -0.1, name: 'London' },
+    { lat: 48.9, lon: 2.3, name: 'Paris' },
+    { lat: 52.5, lon: 13.4, name: 'Berlin' },
+    { lat: 40.4, lon: -3.7, name: 'Madrid' },
+    { lat: 41.9, lon: 12.5, name: 'Rome' },
+  ]
+  const out: CamsReading[] = []
+
+  for (const pt of points) {
+    try {
+      const url = `https://ads.atmosphere.copernicus.eu/api/v2/resources/cams-europe-air-quality-forecasts?type=forecast&variable=particulate_matter_2.5um,particulate_matter_10um,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide&latitude=${pt.lat}&longitude=${pt.lon}&format=json`
+      const data = await fetchJsonWithRetry<any>(url, {
+        retries: 1,
+        providerId: 'copernicus_cams',
+        timeoutMs: 30000,
+        headers: { 'Authorization': `Bearer ${apiKey}` },
+      })
+
+      const vals = data?.values || data?.data || data
+      if (!vals) continue
+
+      const key = `cams:${pt.lat}:${pt.lon}:${new Date().toISOString().slice(0, 13)}`
+      if (!(await dedupeStore.add(key))) continue
+
+      out.push({
+        timestamp: Date.now(),
+        source: 'Copernicus CAMS',
+        latitude: pt.lat,
+        longitude: pt.lon,
+        pm25: parseNumericValue(vals.pm2_5 ?? vals.particulate_matter_2p5um) ?? null,
+        pm10: parseNumericValue(vals.pm10 ?? vals.particulate_matter_10um) ?? null,
+        ozone: parseNumericValue(vals.ozone ?? vals.o3) ?? null,
+        no2: parseNumericValue(vals.nitrogen_dioxide ?? vals.no2) ?? null,
+        so2: parseNumericValue(vals.sulphur_dioxide ?? vals.so2) ?? null,
+        co: parseNumericValue(vals.carbon_monoxide ?? vals.co) ?? null,
+      })
+    } catch { /* skip failed point */ }
+  }
+  return out
+}
+
+// ─── USGS Water Services ─────────────────────────────────────────────────────
+
+export interface UsgsWaterReading {
+  timestamp: number
+  source: string
+  siteId: string
+  siteName: string
+  latitude: number
+  longitude: number
+  dischargeCfs?: number | null
+  gageHeightFt?: number | null
+  waterTemperatureC?: number | null
+  dissolvedOxygenMgL?: number | null
+  specificConductance?: number | null
+  ph?: number | null
+  turbidityNtu?: number | null
+}
+
+const _usgsWaterWm = { ts: 0 }
+
+export async function collectUsgsWaterData(limit: number = 500): Promise<UsgsWaterReading[]> {
+  const paramCodes = '00060,00065,00010,00300,00095,00400,63680'
+  const url = `https://waterservices.usgs.gov/nwis/iv/?format=json&parameterCd=${paramCodes}&siteStatus=active&period=PT2H`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'usgs_water', timeoutMs: 30000 })
+  const timeSeries = data?.value?.timeSeries
+  if (!Array.isArray(timeSeries)) return []
+
+  const lastSeen = _usgsWaterWm.ts
+  let maxTs = lastSeen
+  const siteMap = new Map<string, UsgsWaterReading>()
+
+  for (const ts of timeSeries) {
+    const siteCode = ts?.sourceInfo?.siteCode?.[0]?.value
+    if (!siteCode) continue
+    const siteName = ts?.sourceInfo?.siteName || siteCode
+    const lat = parseFloat(ts?.sourceInfo?.geoLocation?.geogLocation?.latitude) || 0
+    const lon = parseFloat(ts?.sourceInfo?.geoLocation?.geogLocation?.longitude) || 0
+    const paramCode = ts?.variable?.variableCode?.[0]?.value
+    const values = ts?.values?.[0]?.value
+    if (!Array.isArray(values) || values.length === 0) continue
+
+    const latest = values[values.length - 1]
+    const tsMs = latest?.dateTime ? new Date(latest.dateTime).getTime() : Date.now()
+    if (isNaN(tsMs) || tsMs <= lastSeen) continue
+    if (tsMs > maxTs) maxTs = tsMs
+
+    if (!siteMap.has(siteCode)) {
+      siteMap.set(siteCode, {
+        timestamp: tsMs,
+        source: 'USGS Water Services',
+        siteId: siteCode,
+        siteName,
+        latitude: lat,
+        longitude: lon,
+      })
+    }
+    const reading = siteMap.get(siteCode)!
+    if (tsMs > reading.timestamp) reading.timestamp = tsMs
+    const val = parseNumericValue(latest.value)
+    if (val == null) continue
+
+    if (paramCode === '00060') reading.dischargeCfs = val
+    else if (paramCode === '00065') reading.gageHeightFt = val
+    else if (paramCode === '00010') reading.waterTemperatureC = val
+    else if (paramCode === '00300') reading.dissolvedOxygenMgL = val
+    else if (paramCode === '00095') reading.specificConductance = val
+    else if (paramCode === '00400') reading.ph = val
+    else if (paramCode === '63680') reading.turbidityNtu = val
+  }
+
+  const out: UsgsWaterReading[] = []
+  for (const reading of siteMap.values()) {
+    if (out.length >= limit) break
+    const key = `usgswater:${reading.siteId}:${reading.timestamp}`
+    if (!(await dedupeStore.add(key))) continue
+    out.push(reading)
+  }
+  if (maxTs > lastSeen) _usgsWaterWm.ts = maxTs
+  return out
+}
+
+// ─── UK Environment Agency Flood Monitoring ──────────────────────────────────
+
+export interface UkEaFloodWarning {
+  timestamp: number
+  source: string
+  warningId: string
+  description: string
+  severityLevel: number
+  floodArea: string
+  county: string
+  latitude: number
+  longitude: number
+  isRaised: boolean
+  message: string
+}
+
+export interface UkEaFloodReading {
+  timestamp: number
+  source: string
+  stationRef: string
+  stationName: string
+  latitude: number
+  longitude: number
+  riverLevelM?: number | null
+  isRising?: boolean | null
+  typicalRangeHigh?: number | null
+  typicalRangeLow?: number | null
+}
+
+const _ukEaWm = { ts: 0 }
+
+export async function collectUkEaFloodWarnings(): Promise<UkEaFloodWarning[]> {
+  const url = 'https://environment.data.gov.uk/flood-monitoring/id/floods?_limit=200'
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'uk_ea_flood', timeoutMs: 20000 })
+  const items = Array.isArray(data?.items) ? data.items : []
+  const out: UkEaFloodWarning[] = []
+
+  for (const item of items) {
+    const id = item?.floodAreaID || item?.['@id'] || ''
+    const raised = item?.timeRaised || item?.timeMessageChanged
+    const ts = raised ? new Date(raised).getTime() : Date.now()
+    if (isNaN(ts)) continue
+
+    const key = `ukea:warn:${id}:${raised}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'UK Environment Agency',
+      warningId: id,
+      description: item?.description || '',
+      severityLevel: parseInt(item?.severityLevel) || 0,
+      floodArea: item?.floodArea?.label || item?.eaAreaName || '',
+      county: item?.floodArea?.county || '',
+      latitude: parseFloat(item?.floodArea?.lat) || 0,
+      longitude: parseFloat(item?.floodArea?.long) || 0,
+      isRaised: true,
+      message: item?.message || '',
+    })
+  }
+  return out
+}
+
+export async function collectUkEaFloodReadings(limit: number = 500): Promise<UkEaFloodReading[]> {
+  const url = 'https://environment.data.gov.uk/flood-monitoring/data/readings?_sorted&_limit=2000&latest'
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'uk_ea_flood', timeoutMs: 30000 })
+  const items = Array.isArray(data?.items) ? data.items : []
+
+  const lastSeen = _ukEaWm.ts
+  let maxTs = lastSeen
+  const out: UkEaFloodReading[] = []
+
+  for (const item of items) {
+    if (out.length >= limit) break
+    const dateStr = item?.dateTime
+    const ts = dateStr ? new Date(dateStr).getTime() : Date.now()
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const stationRef = item?.measure?.station?.stationReference || ''
+    const key = `ukea:read:${stationRef}:${dateStr}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'UK Environment Agency',
+      stationRef,
+      stationName: item?.measure?.station?.label || stationRef,
+      latitude: parseFloat(item?.measure?.station?.lat) || 0,
+      longitude: parseFloat(item?.measure?.station?.long) || 0,
+      riverLevelM: parseNumericValue(item?.value) ?? null,
+      isRising: null,
+      typicalRangeHigh: parseNumericValue(item?.measure?.station?.typicalRangeHigh) ?? null,
+      typicalRangeLow: parseNumericValue(item?.measure?.station?.typicalRangeLow) ?? null,
+    })
+  }
+  if (maxTs > lastSeen) _ukEaWm.ts = maxTs
+  return out
+}
+
+// ─── GBIF Occurrences ────────────────────────────────────────────────────────
+
+export interface GbifOccurrence {
+  timestamp: number
+  source: string
+  occurrenceKey: string
+  species: string
+  scientificName: string
+  kingdom: string
+  phylum: string
+  taxonClass: string
+  order: string
+  family: string
+  genus: string
+  latitude: number
+  longitude: number
+  country: string
+  basisOfRecord: string
+  datasetName: string
+}
+
+const _gbifWm = { ts: 0 }
+
+export async function collectGbifOccurrences(limit: number = 300): Promise<GbifOccurrence[]> {
+  const now = new Date()
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+  const dateStr = yesterday.toISOString().slice(0, 10)
+  const url = `https://api.gbif.org/v1/occurrence/search?hasCoordinate=true&hasGeospatialIssue=false&eventDate=${dateStr}&limit=${Math.min(limit, 300)}`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'gbif', timeoutMs: 30000 })
+  const results = Array.isArray(data?.results) ? data.results : []
+
+  const lastSeen = _gbifWm.ts
+  let maxTs = lastSeen
+  const out: GbifOccurrence[] = []
+
+  for (const r of results) {
+    if (out.length >= limit) break
+    const eventDate = r?.eventDate || r?.modified
+    const ts = eventDate ? new Date(eventDate).getTime() : Date.now()
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const key = `gbif:${r.key}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'GBIF',
+      occurrenceKey: String(r.key),
+      species: r.species || r.scientificName || 'Unknown',
+      scientificName: r.scientificName || '',
+      kingdom: r.kingdom || '',
+      phylum: r.phylum || '',
+      taxonClass: r.class || '',
+      order: r.order || '',
+      family: r.family || '',
+      genus: r.genus || '',
+      latitude: r.decimalLatitude || 0,
+      longitude: r.decimalLongitude || 0,
+      country: r.country || '',
+      basisOfRecord: r.basisOfRecord || '',
+      datasetName: r.datasetName || '',
+    })
+  }
+  if (maxTs > lastSeen) _gbifWm.ts = maxTs
+  return out
+}
+
+// ─── iNaturalist Observations ────────────────────────────────────────────────
+
+export interface INaturalistObservation {
+  timestamp: number
+  source: string
+  observationId: string
+  species: string
+  scientificName: string
+  taxonRank: string
+  iconicTaxon: string
+  latitude: number
+  longitude: number
+  placeGuess: string
+  qualityGrade: string
+  observedOn: string
+}
+
+const _inatWm = { ts: 0 }
+
+export async function collectINaturalistObservations(limit: number = 200): Promise<INaturalistObservation[]> {
+  const now = new Date()
+  const start = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+  const d1 = start.toISOString().slice(0, 10)
+  const d2 = now.toISOString().slice(0, 10)
+  const url = `https://api.inaturalist.org/v1/observations?d1=${d1}&d2=${d2}&quality_grade=research&has[]=geo&per_page=${Math.min(limit, 200)}&order=desc&order_by=observed_on`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'inaturalist', timeoutMs: 30000 })
+  const results = Array.isArray(data?.results) ? data.results : []
+
+  const lastSeen = _inatWm.ts
+  let maxTs = lastSeen
+  const out: INaturalistObservation[] = []
+
+  for (const r of results) {
+    if (out.length >= limit) break
+    const ts = r.observed_on ? new Date(r.observed_on).getTime() : (r.created_at ? new Date(r.created_at).getTime() : Date.now())
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const key = `inat:${r.id}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const taxon = r.taxon || {}
+    const loc = r.geojson?.coordinates || r.location?.split(',') || [0, 0]
+    const lat = parseFloat(loc[1] ?? loc[0]) || 0
+    const lon = parseFloat(loc[0] ?? loc[1]) || 0
+
+    out.push({
+      timestamp: ts,
+      source: 'iNaturalist',
+      observationId: String(r.id),
+      species: taxon.preferred_common_name || taxon.name || 'Unknown',
+      scientificName: taxon.name || '',
+      taxonRank: taxon.rank || '',
+      iconicTaxon: taxon.iconic_taxon_name || '',
+      latitude: lat,
+      longitude: lon,
+      placeGuess: r.place_guess || '',
+      qualityGrade: r.quality_grade || '',
+      observedOn: r.observed_on || '',
+    })
+  }
+  if (maxTs > lastSeen) _inatWm.ts = maxTs
+  return out
+}
+
+// ─── OBIS Marine Occurrences ─────────────────────────────────────────────────
+
+export interface ObisOccurrence {
+  timestamp: number
+  source: string
+  occurrenceId: string
+  species: string
+  scientificName: string
+  phylum: string
+  taxonClass: string
+  order: string
+  family: string
+  latitude: number
+  longitude: number
+  depth?: number | null
+  datasetName: string
+  basisOfRecord: string
+}
+
+const _obisWm = { ts: 0 }
+
+export async function collectObisOccurrences(limit: number = 300): Promise<ObisOccurrence[]> {
+  const now = new Date()
+  const start = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+  const startDate = start.toISOString().slice(0, 10)
+  const url = `https://api.obis.org/v3/occurrence?startdate=${startDate}&size=${Math.min(limit, 300)}&fields=id,species,scientificName,phylum,class,order,family,decimalLatitude,decimalLongitude,depth,eventDate,datasetName,basisOfRecord`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'obis', timeoutMs: 30000 })
+  const results = Array.isArray(data?.results) ? data.results : []
+
+  const lastSeen = _obisWm.ts
+  let maxTs = lastSeen
+  const out: ObisOccurrence[] = []
+
+  for (const r of results) {
+    if (out.length >= limit) break
+    const ts = r.eventDate ? new Date(r.eventDate).getTime() : Date.now()
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const key = `obis:${r.id}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'OBIS',
+      occurrenceId: String(r.id),
+      species: r.species || r.scientificName || 'Unknown',
+      scientificName: r.scientificName || '',
+      phylum: r.phylum || '',
+      taxonClass: r.class || '',
+      order: r.order || '',
+      family: r.family || '',
+      latitude: r.decimalLatitude || 0,
+      longitude: r.decimalLongitude || 0,
+      depth: parseNumericValue(r.depth) ?? null,
+      datasetName: r.datasetName || '',
+      basisOfRecord: r.basisOfRecord || '',
+    })
+  }
+  if (maxTs > lastSeen) _obisWm.ts = maxTs
+  return out
+}
+
+// ─── USFWS ECOS Species ─────────────────────────────────────────────────────
+
+export interface EcosSpeciesListing {
+  timestamp: number
+  source: string
+  speciesCode: string
+  commonName: string
+  scientificName: string
+  listingStatus: string
+  group: string
+  family: string
+  stateRange: string
+}
+
+export async function collectEcosSpecies(limit: number = 200): Promise<EcosSpeciesListing[]> {
+  const url = `https://ecos.fws.gov/ecp/pullreports/catalog/species/report/species/export?format=json&distinct=true&columns=%2Fspecies%40cn%2Csn%2Cstatus%2Cdesc%2Cfamily%2Cspcode%2Cvipcode%2Crangebystate&filter=%2Fspecies%40status+%21%3D+%27Extinct%27`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'usfws_ecos', timeoutMs: 30000 })
+  const rows = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : [])
+  const out: EcosSpeciesListing[] = []
+
+  for (const r of rows) {
+    if (out.length >= limit) break
+    const spCode = r?.spcode || r?.[5] || ''
+    const key = `ecos:${spCode}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: Date.now(),
+      source: 'USFWS ECOS',
+      speciesCode: spCode,
+      commonName: r?.cn || r?.[0] || '',
+      scientificName: r?.sn || r?.[1] || '',
+      listingStatus: r?.status || r?.[2] || '',
+      group: r?.desc || r?.[3] || '',
+      family: r?.family || r?.[4] || '',
+      stateRange: r?.rangebystate || r?.[7] || '',
+    })
+  }
+  return out
+}
+
+// ─── NatureServe Species ─────────────────────────────────────────────────────
+
+export interface NatureServeSpecies {
+  timestamp: number
+  source: string
+  elementGlobalId: string
+  scientificName: string
+  commonName: string
+  globalRank: string
+  roundedGlobalRank: string
+  nation: string
+  nationalRank: string
+}
+
+export async function collectNatureServeSpecies(limit: number = 100): Promise<NatureServeSpecies[]> {
+  const url = `https://explorer.natureserve.org/api/data/speciesSearch`
+  const body = {
+    criteriaType: 'species',
+    textCriteria: [],
+    statusCriteria: [{ type: 'globalRank', paramType: 'rank', ranks: ['G1', 'G2', 'G3', 'T1', 'T2', 'T3'] }],
+    locationCriteria: [],
+    pagingOptions: { page: 0, recordsPerPage: Math.min(limit, 100) },
+  }
+
+  let data: any
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30000),
+    })
+    if (!resp.ok) return []
+    data = await resp.json()
+  } catch { return [] }
+
+  const results = Array.isArray(data?.results) ? data.results : []
+  const out: NatureServeSpecies[] = []
+
+  for (const r of results) {
+    if (out.length >= limit) break
+    const id = r?.elementGlobalId || r?.uniqueId || ''
+    const key = `nsrv:${id}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const nations = Array.isArray(r?.nations) ? r.nations : []
+    const firstNation = nations[0] || {}
+
+    out.push({
+      timestamp: Date.now(),
+      source: 'NatureServe',
+      elementGlobalId: id,
+      scientificName: r?.scientificName || '',
+      commonName: r?.primaryCommonName || '',
+      globalRank: r?.gRank || '',
+      roundedGlobalRank: r?.roundedGRank || '',
+      nation: firstNation?.nationCode || '',
+      nationalRank: firstNation?.nRank || '',
+    })
+  }
+  return out
+}
+
+// ─── NASA EONET Natural Events ───────────────────────────────────────────────
+
+export interface NasaEonetEvent {
+  timestamp: number
+  source: string
+  eventId: string
+  title: string
+  category: string
+  latitude: number
+  longitude: number
+  magnitudeValue?: number | null
+  magnitudeUnit?: string | null
+  link: string
+}
+
+const _eonetWm = { ts: 0 }
+
+export async function collectNasaEonetEvents(limit: number = 100): Promise<NasaEonetEvent[]> {
+  const url = `https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=${Math.min(limit, 100)}`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'nasa_eonet', timeoutMs: 20000 })
+  const events = Array.isArray(data?.events) ? data.events : []
+
+  const lastSeen = _eonetWm.ts
+  let maxTs = lastSeen
+  const out: NasaEonetEvent[] = []
+
+  for (const ev of events) {
+    if (out.length >= limit) break
+    const geom = Array.isArray(ev?.geometry) ? ev.geometry[ev.geometry.length - 1] : null
+    if (!geom) continue
+
+    const ts = geom.date ? new Date(geom.date).getTime() : Date.now()
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const key = `eonet:${ev.id}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const coords = geom.coordinates || [0, 0]
+    const categories = Array.isArray(ev.categories) ? ev.categories : []
+
+    out.push({
+      timestamp: ts,
+      source: 'NASA EONET',
+      eventId: ev.id,
+      title: ev.title || '',
+      category: categories[0]?.title || '',
+      latitude: coords[1] || 0,
+      longitude: coords[0] || 0,
+      magnitudeValue: geom.magnitudeValue != null ? parseFloat(geom.magnitudeValue) : null,
+      magnitudeUnit: geom.magnitudeUnit || null,
+      link: ev.link || '',
+    })
+  }
+  if (maxTs > lastSeen) _eonetWm.ts = maxTs
+  return out
+}
+
+// ─── Global Forest Watch Alerts ──────────────────────────────────────────────
+
+export interface GfwAlert {
+  timestamp: number
+  source: string
+  alertId: string
+  alertType: string
+  confidence: string
+  latitude: number
+  longitude: number
+  treeCoverLossHa?: number | null
+  isoCountry: string
+}
+
+export async function collectGfwAlerts(limit: number = 200): Promise<GfwAlert[]> {
+  const apiKey = process.env.GFW_API_KEY
+  if (!apiKey) return []
+
+  const now = new Date()
+  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+  const startDate = weekAgo.toISOString().slice(0, 10)
+  const endDate = now.toISOString().slice(0, 10)
+  const url = `https://data-api.globalforestwatch.org/dataset/gfw_integrated_alerts/latest/query?sql=SELECT latitude, longitude, gfw_integrated_alerts__confidence, gfw_integrated_alerts__date, iso, umd_tree_cover_loss__ha FROM results WHERE gfw_integrated_alerts__date >= '${startDate}' AND gfw_integrated_alerts__date <= '${endDate}' LIMIT ${limit}`
+
+  const data = await fetchJsonWithRetry<any>(url, {
+    retries: 1,
+    providerId: 'global_forest_watch',
+    timeoutMs: 30000,
+    headers: { 'x-api-key': apiKey },
+  })
+
+  const rows = Array.isArray(data?.data) ? data.data : []
+  const out: GfwAlert[] = []
+
+  for (const r of rows) {
+    if (out.length >= limit) break
+    const dateStr = r?.gfw_integrated_alerts__date || r?.date
+    const ts = dateStr ? new Date(dateStr).getTime() : Date.now()
+    if (isNaN(ts)) continue
+
+    const lat = r.latitude || 0
+    const lon = r.longitude || 0
+    const key = `gfw:${lat}:${lon}:${dateStr}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'Global Forest Watch',
+      alertId: key,
+      alertType: 'integrated_alert',
+      confidence: r?.gfw_integrated_alerts__confidence || 'nominal',
+      latitude: lat,
+      longitude: lon,
+      treeCoverLossHa: parseNumericValue(r?.umd_tree_cover_loss__ha) ?? null,
+      isoCountry: r?.iso || '',
+    })
+  }
+  return out
+}
+
+// ─── USGS MRDS Mining Sites ──────────────────────────────────────────────────
+
+export interface UsgsMrdsSite {
+  timestamp: number
+  source: string
+  depId: string
+  siteName: string
+  commodity: string
+  depositType: string
+  developmentStatus: string
+  latitude: number
+  longitude: number
+  state: string
+  country: string
+}
+
+export async function collectUsgsMrdsSites(limit: number = 500): Promise<UsgsMrdsSite[]> {
+  const url = `https://mrdata.usgs.gov/mrds/mrds-us.json`
+
+  let data: any
+  try {
+    data = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'usgs_mrds', timeoutMs: 60000, jsonFallbackValue: [] })
+  } catch { return [] }
+
+  const features = Array.isArray(data?.features) ? data.features : (Array.isArray(data) ? data : [])
+  const out: UsgsMrdsSite[] = []
+
+  for (const f of features) {
+    if (out.length >= limit) break
+    const props = f?.properties || f
+    const coords = f?.geometry?.coordinates || [props?.longitude, props?.latitude]
+    const depId = props?.dep_id || props?.id || ''
+
+    const key = `mrds:${depId}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: Date.now(),
+      source: 'USGS MRDS',
+      depId: String(depId),
+      siteName: props?.site_name || props?.name || '',
+      commodity: props?.commod1 || props?.commodity || '',
+      depositType: props?.dep_type || '',
+      developmentStatus: props?.dev_stat || props?.development_status || '',
+      latitude: parseFloat(coords[1] ?? props?.latitude) || 0,
+      longitude: parseFloat(coords[0] ?? props?.longitude) || 0,
+      state: props?.state || '',
+      country: props?.country || 'US',
+    })
+  }
+  return out
+}
+
+// ─── UK Planning Data (England) ──────────────────────────────────────────────
+
+export interface UkPlanningApplication {
+  timestamp: number
+  source: string
+  entityId: string
+  applicationRef: string
+  proposal: string
+  decisionDate: string | null
+  entryDate: string
+  organisationEntity: string
+  latitude: number | null
+  longitude: number | null
+}
+
+const _ukPlanningWm = { offset: 0 }
+
+export async function collectUkPlanningApplications(limit: number = 200): Promise<UkPlanningApplication[]> {
+  const baseUrl = 'https://www.planning.data.gov.uk/entity.json'
+  const params = new URLSearchParams({
+    dataset: 'planning-application',
+    limit: String(Math.min(limit, 200)),
+    offset: String(_ukPlanningWm.offset),
+  })
+  const url = `${baseUrl}?${params}`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'uk_planning', timeoutMs: 30000 })
+  const entities = Array.isArray(data?.entities) ? data.entities : []
+
+  const out: UkPlanningApplication[] = []
+
+  for (const e of entities) {
+    if (out.length >= limit) break
+    const entityId = String(e?.entity ?? '')
+    const key = `ukplanning:${entityId}`
+    if (!(await dedupeStore.add(key))) continue
+
+    let lat: number | null = null
+    let lon: number | null = null
+    const point = e?.point
+    if (point && typeof point === 'string') {
+      const coords = point.split(',').map(parseFloat)
+      if (coords.length >= 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
+        lon = coords[0]
+        lat = coords[1]
+      }
+    } else if (point && typeof point === 'object' && 'lat' in point && 'lon' in point) {
+      lat = parseFloat((point as any).lat)
+      lon = parseFloat((point as any).lon)
+    }
+
+    const entryDate = e?.entry_date ?? e?.['entry-date'] ?? ''
+    const ts = entryDate ? new Date(entryDate).getTime() : Date.now()
+    if (isNaN(ts)) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'UK Planning Data',
+      entityId,
+      applicationRef: e?.reference ?? '',
+      proposal: (e?.description ?? '').slice(0, 500),
+      decisionDate: e?.decision_date ?? e?.['decision-date'] ?? null,
+      entryDate,
+      organisationEntity: String(e?.['organisation-entity'] ?? e?.organisation_entity ?? ''),
+      latitude: lat,
+      longitude: lon,
+    })
+  }
+
+  if (entities.length > 0) {
+    _ukPlanningWm.offset = (_ukPlanningWm.offset + entities.length) % 100000
+  }
+  return out
+}
+
+// ─── Scotland Planning (Spatial Hub WFS) ──────────────────────────────────────
+
+export interface ScotlandPlanningApplication {
+  timestamp: number
+  source: string
+  applicationRef: string
+  proposal: string
+  decisionDate: string | null
+  entryDate: string
+  organisationEntity: string
+  latitude: number | null
+  longitude: number | null
+}
+
+const _scotlandPlanningWm = { offset: 0 }
+
+export async function collectScotlandPlanningApplications(limit: number = 200): Promise<ScotlandPlanningApplication[]> {
+  const baseUrl = 'https://geo.spatialhub.scot/geoserver/sh_plnapp/wfs'
+  const params = new URLSearchParams({
+    service: 'WFS',
+    version: '2.0.0',
+    request: 'GetFeature',
+    typeName: 'sh_plnapp:pub_plnapppnt',
+    outputFormat: 'application/json',
+    count: String(Math.min(limit, 500)),
+    startIndex: String(_scotlandPlanningWm.offset),
+  })
+  const url = `${baseUrl}?${params}`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'scotland_planning', timeoutMs: 45000 })
+  const features = Array.isArray(data?.features) ? data.features : []
+
+  const out: ScotlandPlanningApplication[] = []
+
+  for (const f of features) {
+    if (out.length >= limit) break
+    const props = f?.properties ?? {}
+    const ref = String(props.reference ?? props.local_auth ?? f?.id ?? '')
+    const key = `scotlandplanning:${ref}`
+    if (!(await dedupeStore.add(key))) continue
+
+    let lat: number | null = null
+    let lon: number | null = null
+    const geom = f?.geometry
+    if (geom?.type === 'Point' && Array.isArray(geom.coordinates)) {
+      if (geom.coordinates.length >= 2) {
+        lon = geom.coordinates[0]
+        lat = geom.coordinates[1]
+      }
+    }
+
+    const entryDate = props.date_received ?? props.date_submitted ?? ''
+    const ts = entryDate ? new Date(entryDate).getTime() : Date.now()
+    if (isNaN(ts)) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'Scotland Planning',
+      applicationRef: ref,
+      proposal: props.description ?? props.development ?? '',
+      decisionDate: props.decision_date ?? null,
+      entryDate,
+      organisationEntity: String(props.local_auth ?? props.local_authority ?? ''),
+      latitude: lat,
+      longitude: lon,
+    })
+  }
+
+  if (features.length > 0) {
+    _scotlandPlanningWm.offset = (_scotlandPlanningWm.offset + features.length) % 50000
+  }
+  return out
+}
+
+// ─── NSW Planning (Planning Alerts AU) ───────────────────────────────────────
+
+export interface NswPlanningApplication {
+  timestamp: number
+  source: string
+  applicationRef: string
+  proposal: string
+  decisionDate: string | null
+  entryDate: string
+  organisationEntity: string
+  latitude: number | null
+  longitude: number | null
+}
+
+export async function collectNswPlanningApplications(limit: number = 200): Promise<NswPlanningApplication[]> {
+  const apiKey = process.env.PLANNING_ALERTS_AU_API_KEY
+  if (!apiKey?.trim()) return []
+
+  const url = `https://api.planningalerts.org.au/applications.json?key=${encodeURIComponent(apiKey)}&lat=-33.8688&lng=151.2093&radius=50000&count=${Math.min(limit, 100)}`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'nsw_planning', timeoutMs: 30000 })
+  const applications = Array.isArray(data?.applications) ? data.applications : []
+
+  const out: NswPlanningApplication[] = []
+
+  for (const a of applications) {
+    if (out.length >= limit) break
+    const ref = String(a?.id ?? a?.council_reference ?? '')
+    const key = `nswplanning:${ref}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const lat = typeof a?.lat === 'number' && !isNaN(a.lat) ? a.lat : null
+    const lon = typeof a?.lng === 'number' && !isNaN(a.lng) ? a.lng : null
+
+    const dateReceived = a?.date_received ?? a?.date_scraped ?? ''
+    const ts = dateReceived ? new Date(dateReceived).getTime() : Date.now()
+    if (isNaN(ts)) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'NSW Planning',
+      applicationRef: ref,
+      proposal: (a?.description ?? '').slice(0, 500),
+      decisionDate: a?.date_decided ?? null,
+      entryDate: dateReceived,
+      organisationEntity: String(a?.authority ?? a?.council ?? ''),
+      latitude: lat,
+      longitude: lon,
+    })
+  }
+
+  return out
+}
+
+// ─── OpenSky Network Aircraft States ─────────────────────────────────────────
+
+export interface OpenSkyState {
+  timestamp: number
+  source: string
+  icao24: string
+  callsign: string
+  originCountry: string
+  latitude: number
+  longitude: number
+  altitudeM: number
+  velocityMs: number
+  heading: number
+  verticalRate: number
+  onGround: boolean
+}
+
+const _openskyWm = { ts: 0 }
+
+export async function collectOpenSkyStates(limit: number = 1000): Promise<OpenSkyState[]> {
+  const url = 'https://opensky-network.org/api/states/all'
+  const headers: Record<string, string> = {}
+  const user = process.env.OPENSKY_USERNAME
+  const pass = process.env.OPENSKY_PASSWORD
+  if (user && pass) {
+    headers['Authorization'] = `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`
+  }
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'opensky', timeoutMs: 30000, headers })
+  const states = Array.isArray(data?.states) ? data.states : []
+
+  const lastSeen = _openskyWm.ts
+  const apiTime = data?.time ? data.time * 1000 : Date.now()
+  let maxTs = lastSeen
+  const out: OpenSkyState[] = []
+
+  for (const s of states) {
+    if (out.length >= limit) break
+    if (!Array.isArray(s) || s.length < 17) continue
+
+    const icao24 = s[0]
+    const lat = s[6]
+    const lon = s[5]
+    if (lat == null || lon == null) continue
+
+    const ts = s[3] ? s[3] * 1000 : apiTime
+    if (ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const key = `osky:${icao24}:${Math.floor(ts / 60000)}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'OpenSky Network',
+      icao24,
+      callsign: (s[1] || '').trim(),
+      originCountry: s[2] || '',
+      latitude: lat,
+      longitude: lon,
+      altitudeM: s[13] ?? s[7] ?? 0,
+      velocityMs: s[9] ?? 0,
+      heading: s[10] ?? 0,
+      verticalRate: s[11] ?? 0,
+      onGround: !!s[8],
+    })
+  }
+  if (maxTs > lastSeen) _openskyWm.ts = maxTs
+  return out
+}
+
+// ─── AISStream Vessel Positions ──────────────────────────────────────────────
+
+export interface AisVesselPosition {
+  timestamp: number
+  source: string
+  mmsi: string
+  vesselName: string
+  shipType: number
+  latitude: number
+  longitude: number
+  heading: number
+  course: number
+  speed: number
+  destination: string
+}
+
+const _aisBuffer: AisVesselPosition[] = []
+let _aisConnected = false
+
+export function getAisBufferSnapshot(limit: number = 500): AisVesselPosition[] {
+  const snapshot = _aisBuffer.splice(0, limit)
+  return snapshot
+}
+
+export function startAisStream(): void {
+  const apiKey = process.env.AISSTREAM_API_KEY
+  if (!apiKey || _aisConnected) return
+
+  _aisConnected = true
+
+  const connectWs = () => {
+    try {
+      const WebSocket = require('ws')
+      const ws = new WebSocket('wss://stream.aisstream.io/v0/stream')
+
+      ws.on('open', () => {
+        ws.send(JSON.stringify({
+          APIKey: apiKey,
+          BoundingBoxes: [[[-90, -180], [90, 180]]],
+          FilterMessageTypes: ['PositionReport', 'ShipStaticData'],
+        }))
+      })
+
+      ws.on('message', (raw: Buffer) => {
+        try {
+          const msg = JSON.parse(raw.toString())
+          const meta = msg?.MetaData
+          if (!meta) return
+
+          const pos: AisVesselPosition = {
+            timestamp: meta.time_utc ? new Date(meta.time_utc).getTime() : Date.now(),
+            source: 'AISStream',
+            mmsi: String(meta.MMSI || ''),
+            vesselName: meta.ShipName || '',
+            shipType: meta.ShipType || 0,
+            latitude: meta.latitude || 0,
+            longitude: meta.longitude || 0,
+            heading: msg?.Message?.PositionReport?.TrueHeading || 0,
+            course: msg?.Message?.PositionReport?.Cog || 0,
+            speed: msg?.Message?.PositionReport?.Sog || 0,
+            destination: msg?.Message?.ShipStaticData?.Destination || '',
+          }
+
+          if (_aisBuffer.length < 10000) {
+            _aisBuffer.push(pos)
+          }
+        } catch { /* malformed message */ }
+      })
+
+      ws.on('close', () => {
+        _aisConnected = false
+        setTimeout(connectWs, 30000)
+      })
+
+      ws.on('error', () => {
+        _aisConnected = false
+        setTimeout(connectWs, 60000)
+      })
+    } catch {
+      _aisConnected = false
+    }
+  }
+
+  connectWs()
+}
+
+// ─── Movebank Animal Tracking ────────────────────────────────────────────────
+
+export interface MovebankTrack {
+  timestamp: number
+  source: string
+  studyId: string
+  studyName: string
+  individualId: string
+  taxon: string
+  latitude: number
+  longitude: number
+  altitudeM?: number | null
+  groundSpeed?: number | null
+  heading?: number | null
+}
+
+export async function collectMovebankTracking(limit: number = 200): Promise<MovebankTrack[]> {
+  const apiKey = process.env.MOVEBANK_API_KEY
+  if (!apiKey) return []
+
+  const url = `https://www.movebank.org/movebank/service/public/json?entity_type=event&max_events_per_individual=1&limit=${limit}`
+  const data = await fetchJsonWithRetry<any>(url, {
+    retries: 1,
+    providerId: 'movebank',
+    timeoutMs: 30000,
+    headers: { 'Authorization': `Bearer ${apiKey}` },
+  })
+
+  const events = Array.isArray(data) ? data : (Array.isArray(data?.individuals) ? data.individuals : [])
+  const out: MovebankTrack[] = []
+
+  for (const ev of events) {
+    if (out.length >= limit) break
+    const lat = ev?.location_lat ?? ev?.latitude
+    const lon = ev?.location_long ?? ev?.longitude
+    if (lat == null || lon == null) continue
+
+    const ts = ev?.timestamp ? new Date(ev.timestamp).getTime() : Date.now()
+    if (isNaN(ts)) continue
+
+    const key = `movebank:${ev.individual_id || ev.id}:${ts}`
+    if (!(await dedupeStore.add(key))) continue
+
+    out.push({
+      timestamp: ts,
+      source: 'Movebank',
+      studyId: String(ev.study_id || ''),
+      studyName: ev.study_name || '',
+      individualId: String(ev.individual_id || ev.id || ''),
+      taxon: ev.individual_taxon_canonical_name || ev.taxon || '',
+      latitude: lat,
+      longitude: lon,
+      altitudeM: parseNumericValue(ev.height_above_ellipsoid) ?? null,
+      groundSpeed: parseNumericValue(ev.ground_speed) ?? null,
+      heading: parseNumericValue(ev.heading) ?? null,
+    })
+  }
   return out
 }
