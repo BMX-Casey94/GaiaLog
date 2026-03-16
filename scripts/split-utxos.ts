@@ -65,8 +65,9 @@ async function fetchJson(url: string, headers: Record<string, string> = {}) {
 async function getUnspent(address: string): Promise<any[]> {
   const h: Record<string, string> = {}
   if (WHATSONCHAIN_API_KEY) h['woc-api-key'] = WHATSONCHAIN_API_KEY
-  const url = `https://api.whatsonchain.com/v1/bsv/${NETWORK}/address/${address}/unspent`
-  return await fetchJson(url, h)
+  const url = `https://api.whatsonchain.com/v1/bsv/${NETWORK}/address/${address}/unspent/all`
+  const payload = await fetchJson(url, h)
+  return Array.isArray(payload?.result) ? payload.result : []
 }
 
 async function broadcastViaArc(rawHex: string): Promise<string> {

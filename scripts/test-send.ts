@@ -5,9 +5,10 @@ config()
 import { PrivateKey, P2PKH, Transaction, ARC, UnlockingScript } from '@bsv/sdk'
 
 async function getWocUtxos(address: string, network: 'main' | 'test') {
-  const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/address/${address}/unspent`)
+  const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/address/${address}/unspent/all`)
   if (!res.ok) throw new Error(`WOC utxo fetch failed: ${res.status} ${await res.text()}`)
-  return (await res.json()) as Array<{ tx_hash: string; tx_pos: number; value: number }>
+  const payload = await res.json()
+  return (Array.isArray(payload?.result) ? payload.result : []) as Array<{ tx_hash: string; tx_pos: number; value: number }>
 }
 
 async function getWocRawTxHex(txid: string, network: 'main' | 'test'): Promise<string> {

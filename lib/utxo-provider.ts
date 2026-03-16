@@ -3,6 +3,7 @@ import { bsvConfig } from './bsv-config'
 type HeadersMap = Record<string, string>
 type GetUnspentOptions = {
   allowDegradedStale?: boolean
+  confirmedOnly?: boolean
 }
 
 const NET = bsvConfig.network === 'mainnet' ? 'main' : 'test'
@@ -94,6 +95,12 @@ function normaliseUtxoShape(list: any[]): any[] {
   }))
 }
 
+function extractUtxoList(payload: any): any[] {
+  if (Array.isArray(payload)) return payload
+  if (Array.isArray(payload?.result)) return payload.result
+  return []
+}
+
 function maybeUseCachedUtxos(address: string, cache: UtxoCacheEntry, now: number, reason: string, options: GetUnspentOptions = {}): any[] | null {
   if (cache.utxos.length === 0 || cache.fetchedAt <= 0) return null
   const ageMs = now - cache.fetchedAt
@@ -136,6 +143,7 @@ export async function getUnspentForAddress(address: string, options: GetUnspentO
   const customTemplate = process.env.BSV_UTXO_ENDPOINT_TEMPLATE || process.env.BSV_ARC_UTXO_URL_TEMPLATE || ''
   const customHeadersJson = process.env.BSV_UTXO_HEADERS_JSON || ''
   let lastError: Error | null = null
+  const wocPath = options.confirmedOnly ? 'confirmed/unspent' : 'unspent/all'
   
   try {
     if (provider === 'custom' || (provider === 'arc' && customTemplate)) {
@@ -149,7 +157,7 @@ export async function getUnspentForAddress(address: string, options: GetUnspentO
       const url = replaceTemplate(customTemplate, address)
       const res = await fetchWithRetry(url, headers)
       const data = await res.json().catch(() => [])
-      const normalized = Array.isArray(data) ? normaliseUtxoShape(data) : []
+      const normalized = normaliseUtxoShape(extractUtxoList(data))
       cache.utxos = normalized
       cache.fetchedAt = Date.now()
       cache.cooldownUntil = 0
@@ -161,10 +169,10 @@ export async function getUnspentForAddress(address: string, options: GetUnspentO
     }
 
     // Default: WhatsOnChain
-    const url = `https://api.whatsonchain.com/v1/bsv/${NET}/address/${address}/unspent`
+    const url = `https://api.whatsonchain.com/v1/bsv/${NET}/address/${address}/${wocPath}`
     const res = await fetchWithRetry(url, buildHeaders())
     const data = await res.json().catch(() => [])
-    const normalized = Array.isArray(data) ? normaliseUtxoShape(data) : []
+    const normalized = normaliseUtxoShape(extractUtxoList(data))
     cache.utxos = normalized
     cache.fetchedAt = Date.now()
     cache.cooldownUntil = 0
@@ -172,9 +180,9 @@ export async function getUnspentForAddress(address: string, options: GetUnspentO
     
     // Log if we got empty results (might indicate an issue)
     if (normalized.length === 0) {
-      console.log(`[UTXO Provider] WhatsOnChain returned 0 UTXOs for ${address.substring(0, 10)}... (status: ${res.status})`)
+      console.log(`[UTXO Provider] WhatsOnChain returned 0 UTXOs for ${address.substring(0, 10)}... (status: ${res.status}, path=${wocPath})`)
     } else if (bsvConfig.logging.level === 'debug') {
-      console.log(`[UTXO Provider] WhatsOnChain returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}...`)
+      console.log(`[UTXO Provider] WhatsOnChain returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}... (path=${wocPath})`)
     }
     
     return normalized
@@ -183,10 +191,10 @@ export async function getUnspentForAddress(address: string, options: GetUnspentO
     // On provider failure, attempt a single fallback to WOC unless we already used WOC
     if (provider !== 'woc') {
       try {
-        const url = `https://api.whatsonchain.com/v1/bsv/${NET}/address/${address}/unspent`
+        const url = `https://api.whatsonchain.com/v1/bsv/${NET}/address/${address}/${wocPath}`
         const res = await fetchWithRetry(url, buildHeaders())
         const data = await res.json().catch(() => [])
-        const normalized = Array.isArray(data) ? normaliseUtxoShape(data) : []
+        const normalized = normaliseUtxoShape(extractUtxoList(data))
         cache.utxos = normalized
         cache.fetchedAt = Date.now()
         cache.cooldownUntil = 0

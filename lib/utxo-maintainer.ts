@@ -136,7 +136,9 @@ function parseArcResponse(responseText: string, providerLabel: string): string |
 // ─── UTXO fetch ─────────────────────────────────────────────────────────────
 async function getUnspent(address: string): Promise<any[]> {
   const { getUnspentForAddress } = await import('./utxo-provider')
-  return getUnspentForAddress(address)
+  return getUnspentForAddress(address, {
+    confirmedOnly: process.env.BSV_UTXO_BOOTSTRAP_FROM_UNCONFIRMED !== 'true',
+  })
 }
 
 // ─── Broadcast with proper ARC + WoC fallback ──────────────────────────────

@@ -57,7 +57,8 @@ async function main() {
   const address = priv.toAddress().toString()
 
   // Get UTXOs
-  const utxos = await fetchJson(`https://api.whatsonchain.com/v1/bsv/${net}/address/${address}/unspent`)
+  const payload = await fetchJson(`https://api.whatsonchain.com/v1/bsv/${net}/address/${address}/unspent/all`)
+  const utxos = Array.isArray(payload?.result) ? payload.result : []
   if (!Array.isArray(utxos) || utxos.length === 0) throw new Error('No UTXOs available')
 
   const u = utxos.sort((a: any, b: any) => (b.value || 0) - (a.value || 0))[0]

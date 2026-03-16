@@ -662,7 +662,10 @@ async function getLegacyWalletSpendables(input: CountSpendableInput): Promise<Le
 
   const minSatoshis = Math.max(0, Number(input.minSatoshis || 0))
   const confirmedOnly = input.confirmedOnly ?? config.confirmedOnlyDefault
-  const utxos = await getUnspentForAddress(address, { allowDegradedStale: input.allowDegradedStale })
+  const utxos = await getUnspentForAddress(address, {
+    allowDegradedStale: input.allowDegradedStale,
+    confirmedOnly,
+  })
   const outputScript = getOutputScriptHex(address)
 
   let spendables: LegacyWalletSpendable[] = (Array.isArray(utxos) ? utxos : [])
