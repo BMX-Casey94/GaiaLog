@@ -115,16 +115,20 @@ export function BlockchainExplorer() {
     switch (type) {
       case 'air_quality':
         return `Air quality data recorded from various sources.`
-      
       case 'water_levels':
         return `Water level measurements from ${provider}`
-      
       case 'seismic_activity':
         return `Seismic activity detected by ${provider}`
-      
       case 'advanced_metrics':
         return `Environmental metrics from various sources, processed via ${provider}`
-      
+      case 'volcanic_activity':
+        return `Volcano alert data from ${provider}`
+      case 'geomagnetism':
+        return `Geomagnetic field data from ${provider}`
+      case 'space_weather':
+        return `Solar wind and interplanetary data from ${provider}`
+      case 'upper_atmosphere':
+        return `Upper atmosphere observations from ${provider}`
       default:
         return `Environmental data recorded from ${provider}`
     }

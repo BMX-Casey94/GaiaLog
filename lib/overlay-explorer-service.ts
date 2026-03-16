@@ -211,3 +211,19 @@ export async function getPriorityAlerts(limit: number = 8): Promise<import('./ov
   _priorityAlertsCache = { value: alerts, expiresAt: Date.now() + PRIORITY_ALERTS_CACHE_TTL_MS }
   return alerts
 }
+
+// ─── Latest Readings With Metrics ────────────────────────────────────────────
+
+const LATEST_METRICS_CACHE_TTL_MS = Math.max(10000, Number(process.env.EXPLORER_LATEST_METRICS_CACHE_TTL_MS || 45000))
+let _latestMetricsCache: CacheEntry<Awaited<ReturnType<typeof repo.getLatestReadingsWithMetrics>>> | null = null
+
+export async function getLatestReadingsWithMetrics(
+  families: string[],
+): Promise<Awaited<ReturnType<typeof repo.getLatestReadingsWithMetrics>>> {
+  if (_latestMetricsCache && _latestMetricsCache.expiresAt > Date.now()) {
+    return _latestMetricsCache.value
+  }
+  const rows = await repo.getLatestReadingsWithMetrics(families)
+  _latestMetricsCache = { value: rows, expiresAt: Date.now() + LATEST_METRICS_CACHE_TTL_MS }
+  return rows
+}

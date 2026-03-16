@@ -294,14 +294,59 @@ export async function getPriorityAlerts(limit: number = 8): Promise<PriorityAler
            COALESCE((metrics_preview->>'aqi')::int, 0) > 150
            OR COALESCE((metrics_preview->>'pm25')::float, 0) > 55
          ))
+         OR (data_family = 'water_levels' AND COALESCE((metrics_preview->>'river_level')::float, COALESCE((metrics_preview->>'sea_level')::float, 0)) > 4)
+         OR (data_family = 'advanced_metrics' AND COALESCE((metrics_preview->>'environmental_quality_score')::float, 1) < 0.5)
          OR (data_family = 'flood_risk')
          OR (data_family = 'volcanic_activity')
          OR (data_family = 'natural_events')
          OR (data_family = 'space_weather')
+         OR (data_family = 'geomagnetism')
+         OR (data_family = 'upper_atmosphere')
+         OR (data_family = 'hydrology')
+         OR (data_family = 'conservation_status')
+         OR (data_family = 'biodiversity')
+         OR (data_family = 'land_use_change')
+         OR (data_family = 'mining_activity')
+         OR (data_family = 'transport_tracking')
+         OR (data_family = 'planning_development')
        )
      ORDER BY reading_ts DESC
      LIMIT $1`,
     [Math.min(limit, 50)],
+  )
+  return result.rows || []
+}
+
+export async function getLatestReadingsWithMetrics(
+  families: string[],
+): Promise<Array<{
+  txid: string
+  data_family: string
+  location: string | null
+  reading_ts: string
+  provider_id: string | null
+  metrics_preview: Record<string, unknown>
+  block_height: number
+  confirmed: boolean
+}>> {
+  if (families.length === 0) return []
+  const result = await query<{
+    txid: string
+    data_family: string
+    location: string | null
+    reading_ts: string
+    provider_id: string | null
+    metrics_preview: Record<string, unknown>
+    block_height: number
+    confirmed: boolean
+  }>(
+    `SELECT DISTINCT ON (data_family)
+       txid, data_family, location, reading_ts, provider_id, metrics_preview, block_height, confirmed
+     FROM overlay_explorer_readings
+     WHERE data_family = ANY($1::text[])
+       AND reading_ts > NOW() - INTERVAL '7 days'
+     ORDER BY data_family, reading_ts DESC`,
+    [families],
   )
   return result.rows || []
 }

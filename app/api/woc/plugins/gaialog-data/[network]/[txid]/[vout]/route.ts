@@ -70,7 +70,11 @@ export async function GET(
 
 		const key = `GET:${network}:${txid}:${vout}`
 		const cached = getCache(key)
-		if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+		if (cached) return new NextResponse(cached, { headers: {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+			'Vary': 'Accept',
+		} })
 
 		const hex = await fetchTxAndFindScriptHex(network, txid, vout)
 		const decoded = validateGaiaLog(hex)
@@ -103,7 +107,11 @@ export async function GET(
 			logoUrl,
 		})
 		setCache(key, html)
-		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+		return new NextResponse(html, { headers: {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+			'Vary': 'Accept',
+		} })
 	} catch (e: any) {
 		let detectedMessage: string | null = null
 		try {
@@ -137,7 +145,11 @@ export async function GET(
 			message: detectedMessage || "Unfortunately, this is not a GaiaLog transaction,|and is not compatible for decoding via this Plugin.",
 			logoUrl,
 		})
-		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' }, status: 200 })
+		return new NextResponse(html, { headers: {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+			'Vary': 'Accept',
+		}, status: 200 })
 	}
 }
 

@@ -45,8 +45,46 @@ function computeSeverityScore(
     case 'space_weather':
       score = 70
       break
-    default:
+    case 'water_levels': {
+      const level = Number(metrics.river_level ?? metrics.sea_level ?? 0)
+      score = level > 6 ? 85 : level > 4 ? 70 : 55
+      break
+    }
+    case 'advanced_metrics': {
+      const envScore = Number(metrics.environmental_quality_score ?? metrics.environmental_score ?? 1)
+      const norm = envScore <= 1 ? envScore * 100 : envScore
+      score = norm < 30 ? 90 : norm < 50 ? 75 : 55
+      break
+    }
+    case 'geomagnetism':
+      score = 55
+      break
+    case 'upper_atmosphere':
+      score = 50
+      break
+    case 'hydrology':
       score = 60
+      break
+    case 'conservation_status':
+      score = 65
+      break
+    case 'biodiversity':
+      score = 50
+      break
+    case 'land_use_change':
+      score = 70
+      break
+    case 'mining_activity':
+      score = 50
+      break
+    case 'transport_tracking':
+      score = 45
+      break
+    case 'planning_development':
+      score = 40
+      break
+    default:
+      score = 50
   }
   return Math.round(score)
 }

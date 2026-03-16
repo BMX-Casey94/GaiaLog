@@ -195,51 +195,59 @@ export function LiveDashboard() {
     setLoading(true)
     setError(null)
     try {
-      const [airQualityRes, waterLevelsRes, seismicRes, advancedRes, priorityAlertsRes] = await Promise.all([
-        fetch('/api/air-quality/latest', { cache: 'no-store' }),
-        fetch('/api/water-levels/latest', { cache: 'no-store' }),
-        fetch('/api/seismic/latest', { cache: 'no-store' }),
-        fetch('/api/advanced-metrics/latest', { cache: 'no-store' }),
-        fetch('/api/explorer/priority-alerts?limit=8', { cache: 'no-store' }),
+      const [latestRes, priorityAlertsRes] = await Promise.all([
+        fetch('/api/explorer/latest-readings', { cache: 'no-store' }),
+        fetch('/api/explorer/priority-alerts?limit=12', { cache: 'no-store' }),
       ])
-      
-      // Handle responses: 404 is expected when no data exists yet (not an error)
-      const airQuality = airQualityRes.ok ? await airQualityRes.json() : { success: false }
-      const waterLevels = waterLevelsRes.ok ? await waterLevelsRes.json() : { success: false }
-      const seismic = seismicRes.ok ? await seismicRes.json() : { success: false }
-      const advanced = advancedRes.ok ? await advancedRes.json() : { success: false }
-      
-      const processedData = {
-        airQuality: airQuality.success ? airQuality.data : null,
-        waterLevels: waterLevels.success ? {
-          ...waterLevels.data,
-          river_level: waterLevels.data.river_level ?? waterLevels.data.level ?? 0,
-          location: waterLevels.data.location,
-          timestamp: waterLevels.data.timestamp,
-          source: waterLevels.data.source
+
+      const latestJson = latestRes.ok ? await latestRes.json() : { success: false, readings: [] }
+      const readings: Array<{ family: string; location: string; timestamp: string; provider: string; metrics: Record<string, any> }> =
+        latestJson?.success ? (latestJson.readings ?? []) : []
+
+      const byFamily = (f: string) => readings.find(r => r.family === f) ?? null
+
+      const airRow = byFamily('air_quality')
+      const waterRow = byFamily('water_levels')
+      const seismicRow = byFamily('seismic_activity')
+      const advRow = byFamily('advanced_metrics')
+
+      const processedData: EnvironmentalData = {
+        airQuality: airRow ? {
+          aqi: airRow.metrics.aqi ?? airRow.metrics.air_quality_index ?? null,
+          pm25: airRow.metrics.pm25 ?? airRow.metrics.fine_particulate_matter_pm25 ?? null,
+          location: airRow.location,
+          timestamp: airRow.timestamp,
+          source: airRow.provider ?? 'overlay',
         } : null,
-        seismic: seismic.success ? {
-          ...seismic.data,
-          depth: seismic.data.depth_miles ?? seismic.data.depth,
-          timestamp: seismic.data.timestamp,
-          source: seismic.data.source
+        waterLevels: waterRow ? {
+          river_level: waterRow.metrics.river_level ?? waterRow.metrics.sea_level ?? waterRow.metrics.level ?? 0,
+          location: waterRow.location,
+          timestamp: waterRow.timestamp,
+          source: waterRow.provider ?? 'overlay',
         } : null,
-        advancedMetrics: advanced.success ? (() => {
-          const rawScore = advanced.data.environmental_quality_score
+        seismic: seismicRow ? {
+          magnitude: seismicRow.metrics.magnitude ?? null,
+          depth: seismicRow.metrics.depth ?? seismicRow.metrics.depth_km ?? null,
+          location: seismicRow.location,
+          timestamp: seismicRow.timestamp,
+          source: seismicRow.provider ?? 'overlay',
+        } : null,
+        advancedMetrics: advRow ? (() => {
+          const rawScore = advRow.metrics.environmental_quality_score ?? advRow.metrics.environmental_score
           const normalized = typeof rawScore === 'number' && rawScore <= 1 ? rawScore * 100 : rawScore
           return {
-            ...advanced.data,
-            // Normalise for display so users don't see 0.71/100 style values
-            environmental_quality_score: normalized,
+            environmental_quality_score: normalized ?? null,
             scoreDisplay: typeof normalized === 'number' ? normalized : null,
-            uvDisplay: typeof advanced.data.uv_index === 'number' ? advanced.data.uv_index : Number(advanced.data.uv_index) || null,
-            timestamp: advanced.data.timestamp,
-            source: advanced.data.source
+            uv_index: advRow.metrics.uv_index ?? null,
+            uvDisplay: typeof advRow.metrics.uv_index === 'number' ? advRow.metrics.uv_index : null,
+            location: advRow.location,
+            timestamp: advRow.timestamp,
+            source: advRow.provider ?? 'overlay',
           }
         })() : null,
-        lastUpdated: new Date().toLocaleTimeString('en-GB')
+        lastUpdated: new Date().toLocaleTimeString('en-GB'),
       }
-      
+
       setData(processedData)
       const newAlerts = processDataIntoAlerts(processedData)
 

@@ -323,7 +323,7 @@ export function renderHomeHtml(opts: {
 				<div class="gl-home-content">
 					<p style="margin-bottom:20px;font-size:12px;font-style:italic">
 						This plugin decodes GaiaLog OP_RETURN transactions stored on the BSV blockchain.<br>
-						It displays environmental data including air quality, water levels, seismic activity, and advanced metrics.
+						It displays immutable Earth data including air quality, water levels, seismic &amp; volcanic activity, geomagnetism, space weather, and more.
 					</p>
 				</div>
 				<div class="gl-showcase-grid">
@@ -331,32 +331,56 @@ export function renderHomeHtml(opts: {
 						<div class="gl-showcase-card-title">Air Quality</div>
 						<div class="gl-showcase-card-desc">
 							Real-time air quality metrics including AQI, PM2.5, PM10, and pollutant levels. 
-							Track carbon monoxide, nitrogen dioxide, and ozone concentrations. 
-							Monitor air quality with location and timestamp data.
+							Track carbon monoxide, nitrogen dioxide, and ozone concentrations.
 						</div>
 					</div>
 					<div class="gl-showcase-card">
 						<div class="gl-showcase-card-title">Water Levels</div>
 						<div class="gl-showcase-card-desc">
-							River and sea level measurements with station data and timestamps. 
-							Monitor water temperature, tide height, wind speed, and wind direction. 
-							View detailed station information and environmental conditions.
+							River and sea level measurements with station data. 
+							Monitor water temperature, tide height, salinity, and wind conditions.
 						</div>
 					</div>
 					<div class="gl-showcase-card">
 						<div class="gl-showcase-card-title">Seismic Activity</div>
 						<div class="gl-showcase-card-desc">
 							Earthquake data including magnitude, depth, and geographic coordinates. 
-							Monitor seismic events with location tracking. 
-							Track earthquake depth measurements in miles and coordinates.
+							Monitor seismic events with real-time location tracking.
+						</div>
+					</div>
+					<div class="gl-showcase-card">
+						<div class="gl-showcase-card-title">Volcanic Activity</div>
+						<div class="gl-showcase-card-desc">
+							Volcano alert levels, aviation colour codes, eruption probability, 
+							and gas flux data from USGS monitoring stations.
 						</div>
 					</div>
 					<div class="gl-showcase-card">
 						<div class="gl-showcase-card-title">Advanced Metrics</div>
 						<div class="gl-showcase-card-desc">
-							Comprehensive environmental data including temperature, humidity, and pressure. 
-							Monitor UV index, wind speed, wind direction, and soil moisture. 
-							Track wildfire risk, environmental quality scores, and more.
+							Comprehensive environmental data including temperature, humidity, pressure, 
+							UV index, soil moisture, wildfire risk, and environmental quality scores.
+						</div>
+					</div>
+					<div class="gl-showcase-card">
+						<div class="gl-showcase-card-title">Geomagnetism</div>
+						<div class="gl-showcase-card-desc">
+							Magnetic field component data (X, Y, Z), horizontal intensity, 
+							total intensity, and declination measurements.
+						</div>
+					</div>
+					<div class="gl-showcase-card">
+						<div class="gl-showcase-card-title">Space Weather</div>
+						<div class="gl-showcase-card-desc">
+							Solar wind speed, proton density, magnetic field components (Bz, Bt), 
+							and interplanetary temperature readings.
+						</div>
+					</div>
+					<div class="gl-showcase-card">
+						<div class="gl-showcase-card-title">Upper Atmosphere</div>
+						<div class="gl-showcase-card-desc">
+							Altitude-specific temperature, humidity, wind speed, 
+							and pressure data from upper-atmosphere monitoring.
 						</div>
 					</div>
 				</div>
@@ -575,7 +599,11 @@ export async function GET(req: NextRequest) {
 				return null
 			})()
 			const html = renderHomeHtml({ logoUrl })
-			return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+			return new NextResponse(html, { headers: {
+				'Content-Type': 'text/html; charset=utf-8',
+				'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+				'Vary': 'Accept',
+			} })
 		}
 
 		let key = ''
@@ -584,12 +612,12 @@ export async function GET(req: NextRequest) {
 			if (!txid) throw new Error('Provide script_hex or txid')
 			key = `GET:${network}:${txid}:${vout ?? -1}`
 			const cached = getCache(key)
-			if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+			if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' } })
 			hex = await fetchTxAndFindScriptHex(network, txid, Number.isFinite(vout) ? vout : undefined)
 		} else {
 			key = `GET:hex:${hex.slice(0, 64)}`
 			const cached = getCache(key)
-			if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+			if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' } })
 		}
 
 		const decoded = validateGaiaLog(hex)
@@ -620,7 +648,7 @@ export async function GET(req: NextRequest) {
 			logoUrl,
 		})
 		setCache(key, html)
-		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' } })
 	} catch (e: any) {
 		let message = e?.message || 'Decode error'
 		try {
@@ -657,7 +685,7 @@ export async function GET(req: NextRequest) {
 			}
 		} catch {}
 		const html = renderErrorHtml({ message, logoUrl })
-		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' }, status: 200 })
+		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' }, status: 200 })
 	}
 }
 
@@ -699,7 +727,7 @@ export async function POST(req: NextRequest) {
 
 		const key = `POST:${txid ?? 'hex'}:${hex.slice(0, 64)}`
 		const cached = getCache(key)
-		if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+		if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' } })
 
 		const decoded = validateGaiaLog(hex)
 		const logoUrl = await (async () => {
@@ -729,7 +757,7 @@ export async function POST(req: NextRequest) {
 			logoUrl,
 		})
 		setCache(key, html)
-		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' } })
 	} catch (e: any) {
 		let message = e?.message || 'Decode error'
 		try {
@@ -764,6 +792,6 @@ export async function POST(req: NextRequest) {
 			}
 		} catch {}
 		const html = renderErrorHtml({ message, logoUrl })
-		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' }, status: 200 })
+		return new NextResponse(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' }, status: 200 })
 	}
 }
