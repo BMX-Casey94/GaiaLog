@@ -153,8 +153,15 @@ export async function createOverlayApp() {
 
   const requireAuthorisedPeer = (route: string) => {
     return (req: AuthRequest, res: Response, next: NextFunction) => {
-      const identityKey = getRequestIdentityKey(req)
       const ip = normaliseIp(req.ip || req.socket.remoteAddress)
+
+      // Localhost is inherently trusted — overlay only binds to 127.0.0.1
+      if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') {
+        next()
+        return
+      }
+
+      const identityKey = getRequestIdentityKey(req)
       if (!identityKey) {
         safeAudit({
           event: 'overlay.auth_missing',
