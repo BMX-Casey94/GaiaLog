@@ -339,10 +339,10 @@ const PROVIDER_ROLLOUT_RULES: Record<ProviderId, RolloutRule> = {
   weatherapi: { phase: 1, minimumGate: 'gate_a', note: 'Keep the existing WeatherAPI-derived utility online throughout the rollout.' },
   noaa: { phase: 1, minimumGate: 'gate_a', recommendedOrder: 3, note: 'Expanded NOAA CO-OPS is one of the initial throughput multipliers.' },
   noaa_ndbc: { phase: 1, minimumGate: 'gate_a', recommendedOrder: 2, note: 'NOAA NDBC is a first-wave bulk source for the throughput lane.' },
-  noaa_space_weather: { phase: 2, minimumGate: 'gate_c', note: 'Promote after accepted throughput is healthy and the confirmed gate is close.' },
+  noaa_space_weather: { phase: 1, minimumGate: 'gate_b', note: 'High-value 1-min cadence solar wind sensor from DSCOVR/ACE.' },
   usgs: { phase: 1, minimumGate: 'gate_a', note: 'Keep the existing USGS seismic utility online throughout the rollout.' },
-  usgs_geomagnetism: { phase: 2, minimumGate: 'gate_d', note: 'Deferred specialist geomagnetism feed until the throughput gates are healthy.' },
-  usgs_volcanoes: { phase: 2, minimumGate: 'gate_d', note: 'Deferred lower-yield volcanic feed until later rollout gates.' },
+  usgs_geomagnetism: { phase: 1, minimumGate: 'gate_b', note: '14 USGS observatories with 1-min cadence magnetic field data.' },
+  usgs_volcanoes: { phase: 1, minimumGate: 'gate_b', note: '170+ US volcanoes with alert levels and monitoring data.' },
   owm: { phase: 1, minimumGate: 'gate_a', note: 'Keep the existing OWM-derived utility online throughout the rollout.' },
   sensor_community: { phase: 1, minimumGate: 'gate_a', recommendedOrder: 1, note: 'Highest-yield no-key bulk source for early throughput expansion.' },
   emsc: { phase: 1, minimumGate: 'gate_a', recommendedOrder: 4, note: 'Real-time push seismic source for early throughput expansion.' },
@@ -352,7 +352,7 @@ const PROVIDER_ROLLOUT_RULES: Record<ProviderId, RolloutRule> = {
   intermagnet: { phase: 2, minimumGate: 'gate_d', note: 'Deferred specialist geomagnetism feed until later rollout gates.' },
   copernicus_cams: { phase: 3, minimumGate: 'gate_d', note: 'Deferred lower-ROI gridded air-quality feed.' },
   nasa_power: { phase: 3, minimumGate: 'gate_d', note: 'Deferred lower-ROI gridded meteorology feed.' },
-  igra2: { phase: 3, minimumGate: 'gate_d', note: 'Deferred upper-atmosphere feed until later rollout gates.' },
+  igra2: { phase: 1, minimumGate: 'gate_b', note: '2700+ global radiosonde stations with twice-daily soundings.' },
 }
 
 export const providerConfigs: Record<ProviderId, ProviderConfig> = Object.fromEntries(

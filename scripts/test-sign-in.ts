@@ -10,8 +10,9 @@ import { createClient } from '@supabase/supabase-js'
 async function main() {
 	const url = process.env.NEXT_PUBLIC_SUPABASE_URL
 	const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-	const email = process.env.ADMIN_EMAIL || 'corsacasey@gmail.com'
-	const password = 'Zy2mzx12'
+	const email = process.env.ADMIN_EMAIL
+	const password = process.env.ADMIN_PASSWORD
+	if (!email || !password) throw new Error('Missing ADMIN_EMAIL or ADMIN_PASSWORD in environment')
 	if (!url || !anon) throw new Error('Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY')
 	const supabase = createClient(url, anon)
 	const { data, error } = await supabase.auth.signInWithPassword({ email, password })

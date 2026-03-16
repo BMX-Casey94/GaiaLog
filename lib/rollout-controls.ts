@@ -23,7 +23,7 @@ const ROLLOUT_GATE_DESCRIPTIONS: Record<RolloutGate, string> = {
   gate_d: 'Only widen into lower-yield or higher-complexity sources once the confirmed throughput gate is healthy.',
 }
 
-const DEFAULT_REQUESTED_GATE: RolloutGate = 'gate_a'
+const DEFAULT_REQUESTED_GATE: RolloutGate = 'gate_b'
 
 function normaliseGate(value: string | undefined | null): RolloutGate | null {
   const normalised = String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_')

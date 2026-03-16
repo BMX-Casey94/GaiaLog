@@ -38,63 +38,33 @@ export class WalletManager {
   private initialize(): void {
     try {
       if (bsvConfig.wallets.privateKeys.length === 0) {
-        console.warn('No wallet private keys configured, creating test wallets...')
-        
-        // Create test wallets for development
-        const testPrivateKeys = [
-          'KxAayTuE6JcLfb8hTpvQKahP64wmqE2RRokSv4GF2mTnUvgkeRYc',
-          'L24kCohkqdz9suKmvavLCzJKVL2VzcPQVgB2mPXXA9Sdsh79TShu',
-          'L2EBxsRWif1QPUaAVRrJ3zorsVA7Wj3Ls9xHwhQ3v5PLztncMKNV'
-        ]
-        
-        // Use test private keys
-        this.wallets = testPrivateKeys.map((privateKey, index) => {
-          try {
-            const wallet = PrivateKey.fromWif(privateKey)
-            const publicKey = wallet.toPublicKey()
-            const address = publicKey.toAddress()
-
-            // Initialize wallet info
-            this.walletInfo.set(index, {
-              index,
-              address: address.toString(),
-              publicKey: publicKey.toString(),
-              balance: 100000000, // 1 BSV in satoshis for testing
-              lastUsed: new Date(),
-              transactionCount: 0
-            })
-
-            return wallet
-          } catch (error) {
-            console.error(`Failed to initialize test wallet ${index + 1}:`, error)
-            throw error
-          }
-        })
-      } else {
-        // Initialize wallets from configured private keys
-        this.wallets = bsvConfig.wallets.privateKeys.map((privateKey, index) => {
-          try {
-            const wallet = PrivateKey.fromWif(privateKey)
-            const publicKey = wallet.toPublicKey()
-            const address = publicKey.toAddress()
-
-            // Initialize wallet info
-            this.walletInfo.set(index, {
-              index,
-              address: address.toString(),
-              publicKey: publicKey.toString(),
-              balance: 0,
-              lastUsed: new Date(),
-              transactionCount: 0
-            })
-
-            return wallet
-          } catch (error) {
-            console.error(`Failed to initialize wallet ${index + 1}:`, error)
-            throw error
-          }
-        })
+        throw new Error(
+          'No wallet private keys configured. Set BSV_PRIVATE_KEY_1 (and optionally _2, _3) in your .env file. ' +
+          'Generate keys with: node -e "console.log(require(\'@bsv/sdk\').PrivateKey.fromRandom().toWif())"'
+        )
       }
+
+      this.wallets = bsvConfig.wallets.privateKeys.map((privateKey, index) => {
+        try {
+          const wallet = PrivateKey.fromWif(privateKey)
+          const publicKey = wallet.toPublicKey()
+          const address = publicKey.toAddress()
+
+          this.walletInfo.set(index, {
+            index,
+            address: address.toString(),
+            publicKey: publicKey.toString(),
+            balance: 0,
+            lastUsed: new Date(),
+            transactionCount: 0
+          })
+
+          return wallet
+        } catch (error) {
+          console.error(`Failed to initialize wallet ${index + 1}:`, error)
+          throw error
+        }
+      })
 
       this.isInitialized = true
       console.log(`✅ Wallet Manager initialized with ${this.wallets.length} wallet(s)`)

@@ -82,9 +82,6 @@ const TAAL_ARC_ENDPOINT = (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com
 // GorillaPool/TAAL ARC minimum: 100 sat/kB (0.1 sat/byte)
 // Default to 0.105 sat/byte (105 sat/kB) — 5% margin above ARC floor
 const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.105)
-// #region agent log
-if (process.env.GAIALOG_WORKER_PROCESS === '1') { try { const p={sessionId:'de58de',location:'blockchain.ts:init',message:'FEE_RATE at module load',data:{FEE_RATE_SAT_PER_BYTE,envRaw:process.env.BSV_TX_FEE_RATE,feePerKb:Math.ceil(FEE_RATE_SAT_PER_BYTE*1000)},timestamp:Date.now(),hypothesisId:'fee-init'}; require('fs').appendFileSync('debug-de58de.log',JSON.stringify(p)+'\n'); fetch('http://127.0.0.1:7837/ingest/190a1802-4ad6-4b1b-88b9-1377d3158233',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'de58de'},body:JSON.stringify(p)}).catch(()=>{}); } catch(_){} }
-// #endregion
 // BSV has no dust limit — 1 sat is the minimum viable output
 const DUST_LIMIT = 1
 // UTXO spend policy: default allows all UTXOs (including unconfirmed).
@@ -1143,18 +1140,12 @@ export class BlockchainService {
           serialized = tx.serialize()
         } catch (serializeErr) {
           const serializeMsg = serializeErr instanceof Error ? serializeErr.message : String(serializeErr)
-          // #region agent log
-          try { const p={sessionId:'de58de',location:'blockchain.ts:buildSerialized',message:'TX serialize failed',data:{FEE_RATE_SAT_PER_BYTE,explicitFee,estimatedSize,feeMultiplier,feeToUse,useChangeOutput,inputCount:numInputs,inputSats,availableForFee,changeSats,error:serializeMsg},timestamp:Date.now(),hypothesisId:'fee-selection'}; require('fs').appendFileSync('debug-de58de.log',JSON.stringify(p)+'\n'); fetch('http://127.0.0.1:7837/ingest/190a1802-4ad6-4b1b-88b9-1377d3158233',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'de58de'},body:JSON.stringify(p)}).catch(()=>{}); } catch(_){}
-          // #endregion
           throw serializeErr
         }
         const outputSats = tx.outputs.reduce((s: number, o: any) => s + (o.satoshis || o._satoshis || 0), 0)
         const actualFee = inputSats - outputSats
         const txSizeBytes = serialized.length / 2
         const impliedSatPerKb = txSizeBytes > 0 ? Math.round((actualFee / txSizeBytes) * 1000) : 0
-        // #region agent log
-        try { const p={sessionId:'de58de',location:'blockchain.ts:buildSerialized',message:'TX fee at build',data:{FEE_RATE_SAT_PER_BYTE,explicitFee,estimatedSize,feeMultiplier,feeToUse,useChangeOutput,inputCount:numInputs,actualFee,txSizeBytes,impliedSatPerKb,inputSats,outputSats},timestamp:Date.now(),hypothesisId:'fee-rate'}; require('fs').appendFileSync('debug-de58de.log',JSON.stringify(p)+'\n'); fetch('http://127.0.0.1:7837/ingest/190a1802-4ad6-4b1b-88b9-1377d3158233',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'de58de'},body:JSON.stringify(p)}).catch(()=>{}); } catch(_){}
-        // #endregion
         if (actualFee < 2) {
           console.warn(`⚠️  TX fee sanity check: fee=${actualFee} sats, explicitFee=${explicitFee}, txSize=${txSizeBytes} bytes, input=${inputSats}`)
         }

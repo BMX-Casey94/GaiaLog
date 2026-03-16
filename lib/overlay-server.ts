@@ -144,12 +144,19 @@ export async function createOverlayApp() {
     next()
   })
 
-  app.use(createAuthMiddleware({
-    wallet: getServerWallet() as any,
-    allowUnauthenticated: false,
-    logger: console,
-    logLevel: process.env.BSV_LOG_LEVEL === 'debug' ? 'debug' : 'warn',
-  }))
+  app.use((req: express.Request, res: Response, next: NextFunction) => {
+    const ip = normaliseIp(req.ip || req.socket.remoteAddress)
+    if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') {
+      next()
+      return
+    }
+    createAuthMiddleware({
+      wallet: getServerWallet() as any,
+      allowUnauthenticated: false,
+      logger: console,
+      logLevel: process.env.BSV_LOG_LEVEL === 'debug' ? 'debug' : 'warn',
+    })(req as any, res, next)
+  })
 
   const requireAuthorisedPeer = (route: string) => {
     return (req: AuthRequest, res: Response, next: NextFunction) => {

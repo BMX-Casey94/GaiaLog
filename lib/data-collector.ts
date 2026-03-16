@@ -1691,3 +1691,272 @@ export async function collectWAQIStationsBatch(limit: number = 100): Promise<Air
   await cursorStore.set('waqi', i % stations.length, 'stationIdx')
   return out
 }
+
+// ─── NOAA Space Weather (DSCOVR RTSW) ───────────────────────────────────────
+
+export interface SpaceWeatherReading {
+  timestamp: number
+  source: string
+  bx_gsm: number | null
+  by_gsm: number | null
+  bz_gsm: number | null
+  bt: number | null
+  speed: number | null
+  density: number | null
+  temperature: number | null
+}
+
+const _swWatermarks = new Map<string, number>()
+
+export async function collectSpaceWeatherData(): Promise<SpaceWeatherReading[]> {
+  const magUrl = 'https://services.swpc.noaa.gov/json/rtsw/rtsw_mag_1-m.json'
+  const windUrl = 'https://services.swpc.noaa.gov/json/rtsw/rtsw_wind_1-m.json'
+
+  const [magData, windData] = await Promise.all([
+    fetchJsonWithRetry<any[]>(magUrl, { retries: 2, providerId: 'noaa_space_weather' }),
+    fetchJsonWithRetry<any[]>(windUrl, { retries: 2, providerId: 'noaa_space_weather' }),
+  ])
+
+  const windByTime = new Map<string, any>()
+  for (const w of (windData ?? [])) {
+    if (w.time_tag) windByTime.set(w.time_tag, w)
+  }
+
+  const lastSeen = _swWatermarks.get('rtsw') ?? 0
+  let maxTs = lastSeen
+  const out: SpaceWeatherReading[] = []
+
+  for (const m of (magData ?? [])) {
+    if (!m.time_tag) continue
+    const ts = new Date(m.time_tag).getTime()
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const w = windByTime.get(m.time_tag)
+    const key = `sw:rtsw:${m.time_tag}`
+    if (await dedupeStore.add(key)) {
+      out.push({
+        timestamp: ts,
+        source: 'NOAA Space Weather',
+        bx_gsm: parseFloat(m.bx_gsm) || null,
+        by_gsm: parseFloat(m.by_gsm) || null,
+        bz_gsm: parseFloat(m.bz_gsm) || null,
+        bt: parseFloat(m.bt) || null,
+        speed: w ? parseFloat(w.speed) || null : null,
+        density: w ? parseFloat(w.density) || null : null,
+        temperature: w ? parseFloat(w.temperature) || null : null,
+      })
+    }
+  }
+  if (maxTs > lastSeen) _swWatermarks.set('rtsw', maxTs)
+  return out
+}
+
+// ─── USGS Geomagnetism ──────────────────────────────────────────────────────
+
+export interface GeomagReading {
+  timestamp: number
+  source: string
+  observatory: string
+  latitude: number
+  longitude: number
+  elements: Record<string, number | null>
+}
+
+const GEOMAG_OBSERVATORIES = [
+  { code: 'BOU', name: 'Boulder', lat: 40.137, lon: -105.237 },
+  { code: 'BRW', name: 'Barrow', lat: 71.322, lon: -156.623 },
+  { code: 'BSL', name: 'Stennis', lat: 30.350, lon: -89.637 },
+  { code: 'CMO', name: 'College', lat: 64.874, lon: -147.860 },
+  { code: 'DED', name: 'Deadhorse', lat: 70.356, lon: -148.793 },
+  { code: 'FRD', name: 'Fredericksburg', lat: 38.205, lon: -77.373 },
+  { code: 'FRN', name: 'Fresno', lat: 37.091, lon: -119.719 },
+  { code: 'GUA', name: 'Guam', lat: 13.588, lon: 144.867 },
+  { code: 'HON', name: 'Honolulu', lat: 21.316, lon: -158.000 },
+  { code: 'NEW', name: 'Newport', lat: 48.265, lon: -117.123 },
+  { code: 'SHU', name: 'Shumagin', lat: 55.348, lon: -160.465 },
+  { code: 'SIT', name: 'Sitka', lat: 57.058, lon: -135.327 },
+  { code: 'SJG', name: 'San Juan', lat: 18.113, lon: -66.150 },
+  { code: 'TUC', name: 'Tucson', lat: 32.174, lon: -110.734 },
+]
+
+const _geomagWatermarks = new Map<string, number>()
+
+export async function collectGeomagnetismData(): Promise<GeomagReading[]> {
+  const now = new Date()
+  const end = now.toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const start = new Date(now.getTime() - 10 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const out: GeomagReading[] = []
+
+  for (const obs of GEOMAG_OBSERVATORIES) {
+    try {
+      const url = `https://geomag.usgs.gov/ws/data/?id=${obs.code}&starttime=${start}&endtime=${end}&type=variation&elements=X,Y,Z,F&format=json&sampling_period=60`
+      const data = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'usgs_geomagnetism' })
+
+      const values = data?.values
+      if (!Array.isArray(values) || values.length === 0) continue
+
+      const lastSeen = _geomagWatermarks.get(obs.code) ?? 0
+      let maxTs = lastSeen
+      const elementIds = (data.id || 'X,Y,Z,F').split(',')
+
+      for (const v of values) {
+        if (!v.t) continue
+        const ts = new Date(v.t).getTime()
+        if (isNaN(ts) || ts <= lastSeen) continue
+        if (ts > maxTs) maxTs = ts
+
+        const elements: Record<string, number | null> = {}
+        const vals = Array.isArray(v.v) ? v.v : []
+        for (let i = 0; i < elementIds.length; i++) {
+          elements[elementIds[i].trim()] = vals[i] != null ? vals[i] : null
+        }
+
+        const key = `geomag:${obs.code}:${v.t}`
+        if (await dedupeStore.add(key)) {
+          out.push({
+            timestamp: ts,
+            source: 'USGS Geomagnetism',
+            observatory: `${obs.code} (${obs.name})`,
+            latitude: obs.lat,
+            longitude: obs.lon,
+            elements,
+          })
+        }
+      }
+      if (maxTs > lastSeen) _geomagWatermarks.set(obs.code, maxTs)
+    } catch {
+      // skip observatory on failure, continue with next
+    }
+  }
+  return out
+}
+
+// ─── USGS Volcanoes ─────────────────────────────────────────────────────────
+
+export interface VolcanoAlert {
+  timestamp: number
+  source: string
+  volcanoName: string
+  volcanoId: string
+  latitude: number
+  longitude: number
+  alertLevel: string
+  colorCode: string
+  observatoryCode: string
+}
+
+const _volcanoWatermark = { ts: 0 }
+
+export async function collectVolcanoAlerts(): Promise<VolcanoAlert[]> {
+  const url = 'https://volcanoes.usgs.gov/vhp/api/v1/activity?format=json'
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'usgs_volcanoes' })
+
+  const items = Array.isArray(data?.features) ? data.features : (Array.isArray(data) ? data : [])
+  const lastSeen = _volcanoWatermark.ts
+  let maxTs = lastSeen
+  const out: VolcanoAlert[] = []
+
+  for (const item of items) {
+    const props = item?.properties ?? item
+    if (!props) continue
+
+    const dateStr = props.vhp_update_datetime || props.update_datetime || props.datetime
+    const ts = dateStr ? new Date(dateStr).getTime() : Date.now()
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const coords = item?.geometry?.coordinates
+    const lat = coords?.[1] ?? props.latitude ?? 0
+    const lon = coords?.[0] ?? props.longitude ?? 0
+
+    const key = `volcano:${props.vnum || props.volcano_number || props.volcanoName}:${dateStr}`
+    if (await dedupeStore.add(key)) {
+      out.push({
+        timestamp: ts,
+        source: 'USGS Volcanoes',
+        volcanoName: props.volcano_name || props.volcanoName || 'Unknown',
+        volcanoId: String(props.vnum || props.volcano_number || ''),
+        latitude: lat,
+        longitude: lon,
+        alertLevel: props.alert_level || props.alertLevel || 'UNASSIGNED',
+        colorCode: props.color_code || props.colorCode || 'UNASSIGNED',
+        observatoryCode: props.obs_code || props.observatory || '',
+      })
+    }
+  }
+  if (maxTs > lastSeen) _volcanoWatermark.ts = maxTs
+  return out
+}
+
+// ─── IGRA v2 Upper Atmosphere Soundings ─────────────────────────────────────
+
+export interface UpperAtmosphereReading {
+  timestamp: number
+  source: string
+  stationId: string
+  latitude: number
+  longitude: number
+  numLevels: number
+  surfacePressure: number | null
+  surfaceTemperature: number | null
+  surfaceDewpoint: number | null
+}
+
+const _igraWatermark = { ts: 0 }
+
+export async function collectUpperAtmosphereData(): Promise<UpperAtmosphereReading[]> {
+  const now = new Date()
+  const end = now.toISOString().slice(0, 10)
+  const start = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+
+  const url = `https://www.ncei.noaa.gov/access/services/data/v1?dataset=igra2&stations=USM00072451,USM00072520,USM00072293,USM00072649,USM00072764,USM00072265,USM00072469,USM00072558,USM00072357,USM00072776&startDate=${start}&endDate=${end}&format=json`
+
+  const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'igra2', timeoutMs: 30000 })
+
+  const records = Array.isArray(data) ? data : (data?.data ?? [])
+  const lastSeen = _igraWatermark.ts
+  let maxTs = lastSeen
+  const out: UpperAtmosphereReading[] = []
+
+  const grouped = new Map<string, any[]>()
+  for (const rec of records) {
+    const gKey = `${rec.station || rec.STATION}:${rec.date || rec.DATE}`
+    if (!grouped.has(gKey)) grouped.set(gKey, [])
+    grouped.get(gKey)!.push(rec)
+  }
+
+  for (const [gKey, levels] of grouped) {
+    const first = levels[0]
+    const dateStr = first.date || first.DATE || ''
+    const ts = dateStr ? new Date(dateStr).getTime() : Date.now()
+    if (isNaN(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const stationId = first.station || first.STATION || gKey.split(':')[0]
+    const lat = parseFloat(first.latitude || first.LATITUDE) || 0
+    const lon = parseFloat(first.longitude || first.LONGITUDE) || 0
+
+    const surface = levels.find((l: any) => {
+      const p = parseFloat(l.pressure || l.PRESSURE)
+      return p > 900
+    }) || first
+
+    const key = `igra:${stationId}:${dateStr}`
+    if (await dedupeStore.add(key)) {
+      out.push({
+        timestamp: ts,
+        source: 'IGRA v2',
+        stationId,
+        latitude: lat,
+        longitude: lon,
+        numLevels: levels.length,
+        surfacePressure: parseFloat(surface.pressure || surface.PRESSURE) || null,
+        surfaceTemperature: parseFloat(surface.temperature || surface.TEMPERATURE) || null,
+        surfaceDewpoint: parseFloat(surface.dewpoint || surface.DEWPOINT) || null,
+      })
+    }
+  }
+  if (maxTs > lastSeen) _igraWatermark.ts = maxTs
+  return out
+}

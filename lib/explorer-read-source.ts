@@ -51,19 +51,19 @@ let _cachedWriteMode: ExplorerWriteMode | null = null
 
 export function getExplorerReadSource(): ExplorerReadSource {
   if (_cachedReadSource) return _cachedReadSource
-  const raw = (process.env.EXPLORER_READ_SOURCE || 'legacy').trim().toLowerCase()
+  const raw = (process.env.EXPLORER_READ_SOURCE || 'overlay').trim().toLowerCase()
   _cachedReadSource = VALID_READ_SOURCES.includes(raw as ExplorerReadSource)
     ? (raw as ExplorerReadSource)
-    : 'legacy'
+    : 'overlay'
   return _cachedReadSource
 }
 
 export function getExplorerWriteMode(): ExplorerWriteMode {
   if (_cachedWriteMode) return _cachedWriteMode
-  const raw = (process.env.EXPLORER_WRITE_MODE || 'legacy').trim().toLowerCase()
+  const raw = (process.env.EXPLORER_WRITE_MODE || 'overlay').trim().toLowerCase()
   _cachedWriteMode = VALID_WRITE_MODES.includes(raw as ExplorerWriteMode)
     ? (raw as ExplorerWriteMode)
-    : 'legacy'
+    : 'overlay'
   return _cachedWriteMode
 }
 

@@ -13,8 +13,11 @@ import { createClient } from '@supabase/supabase-js'
 async function main() {
 	const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
 	const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-	const adminEmail = process.env.ADMIN_EMAIL || 'corsacasey@gmail.com'
-	const adminPassword = 'Zy2mzx12'
+	const adminEmail = process.env.ADMIN_EMAIL
+	const adminPassword = process.env.ADMIN_PASSWORD
+	if (!adminEmail || !adminPassword) {
+		throw new Error('Missing ADMIN_EMAIL or ADMIN_PASSWORD in environment')
+	}
 
 	if (!supabaseUrl || !serviceRoleKey) {
 		throw new Error('Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment')

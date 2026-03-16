@@ -9,6 +9,10 @@ import {
   collectSeismicDataBatch,
   collectSensorCommunityDataBatch,
   collectWaterLevelDataBatch,
+  collectSpaceWeatherData,
+  collectGeomagnetismData,
+  collectVolcanoAlerts,
+  collectUpperAtmosphereData,
 } from './data-collector'
 import { TOP_100_CITIES } from './city-seeds'
 import { dedupeStore } from './stores'
@@ -1297,6 +1301,189 @@ export class AdvancedMetricsWorker extends BaseWorker {
   }
 }
 
+// ─── Space Weather Worker ────────────────────────────────────────────────────
+
+export class SpaceWeatherWorker extends BaseWorker {
+  constructor() {
+    super('SpaceWeather-RTSW')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.noaa_space_weather_rtsw?.cadence.intervalMs || 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.noaa_space_weather_rtsw
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectSpaceWeatherData()
+      for (const item of batch) {
+        data.push({
+          type: 'space-weather',
+          timestamp: item.timestamp,
+          location: 'DSCOVR L1 Lagrange Point',
+          measurement: {
+            bx_gsm: item.bx_gsm,
+            by_gsm: item.by_gsm,
+            bz_gsm: item.bz_gsm,
+            bt: item.bt,
+            speed: item.speed,
+            density: item.density,
+            temperature: item.temperature,
+          },
+          source: item.source,
+          priority: (item.bz_gsm !== null && item.bz_gsm < -10) ? 'high' : 'normal',
+          family: 'space_weather',
+          providerId: 'noaa_space_weather',
+          datasetId: 'noaa_space_weather_rtsw',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: 0, lon: 0 },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching space weather data:', error)
+    }
+    return data
+  }
+}
+
+// ─── Geomagnetism Worker ─────────────────────────────────────────────────────
+
+export class GeomagnetismWorker extends BaseWorker {
+  constructor() {
+    super('Geomagnetism-USGS')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.usgs_geomagnetism_observatories?.cadence.intervalMs || 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.usgs_geomagnetism_observatories
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectGeomagnetismData()
+      for (const item of batch) {
+        data.push({
+          type: 'geomagnetism',
+          timestamp: item.timestamp,
+          location: item.observatory,
+          measurement: item.elements,
+          source: item.source,
+          priority: 'normal',
+          family: 'geomagnetism',
+          providerId: 'usgs_geomagnetism',
+          datasetId: 'usgs_geomagnetism_observatories',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching geomagnetism data:', error)
+    }
+    return data
+  }
+}
+
+// ─── Volcanoes Worker ────────────────────────────────────────────────────────
+
+export class VolcanoWorker extends BaseWorker {
+  constructor() {
+    super('Volcanoes-USGS')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.usgs_volcano_alerts?.cadence.intervalMs || 10 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.usgs_volcano_alerts
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectVolcanoAlerts()
+      for (const item of batch) {
+        data.push({
+          type: 'volcanic',
+          timestamp: item.timestamp,
+          location: item.volcanoName,
+          measurement: {
+            alertLevel: item.alertLevel,
+            colorCode: item.colorCode,
+            volcanoId: item.volcanoId,
+            observatoryCode: item.observatoryCode,
+          },
+          source: item.source,
+          priority: item.alertLevel === 'WARNING' || item.alertLevel === 'WATCH' ? 'high' : 'normal',
+          family: 'volcanic_activity',
+          providerId: 'usgs_volcanoes',
+          datasetId: 'usgs_volcano_alerts',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching volcano data:', error)
+    }
+    return data
+  }
+}
+
+// ─── Upper Atmosphere Worker ─────────────────────────────────────────────────
+
+export class UpperAtmosphereWorker extends BaseWorker {
+  constructor() {
+    super('UpperAtmosphere-IGRA')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.igra2_soundings?.cadence.intervalMs || 12 * 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.igra2_soundings
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectUpperAtmosphereData()
+      for (const item of batch) {
+        data.push({
+          type: 'upper-atmosphere',
+          timestamp: item.timestamp,
+          location: item.stationId,
+          measurement: {
+            numLevels: item.numLevels,
+            surfacePressure: item.surfacePressure,
+            surfaceTemperature: item.surfaceTemperature,
+            surfaceDewpoint: item.surfaceDewpoint,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'upper_atmosphere',
+          providerId: 'igra2',
+          datasetId: 'igra2_soundings',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          stationId: item.stationId,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching upper atmosphere data:', error)
+    }
+    return data
+  }
+}
+
 // Worker Manager
 export class WorkerManager {
   private workers: Map<string, BaseWorker> = new Map()
@@ -1316,6 +1503,10 @@ export class WorkerManager {
       const emscWorker = new EMSCRealtimeWorker()
       const geonetWorker = new GeoNetWorker()
       const advWorker = new AdvancedMetricsWorker()
+      const spaceWeatherWorker = new SpaceWeatherWorker()
+      const geomagWorker = new GeomagnetismWorker()
+      const volcanoWorker = new VolcanoWorker()
+      const upperAtmosphereWorker = new UpperAtmosphereWorker()
 
       this.workers.set('waqi-environmental', waqiWorker)
       this.workers.set('noaa-weather', noaaWorker)
@@ -1325,6 +1516,10 @@ export class WorkerManager {
       this.workers.set('emsc-realtime', emscWorker)
       this.workers.set('geonet-seismic', geonetWorker)
       this.workers.set('advanced-metrics', advWorker)
+      this.workers.set('space-weather', spaceWeatherWorker)
+      this.workers.set('geomagnetism', geomagWorker)
+      this.workers.set('volcanoes', volcanoWorker)
+      this.workers.set('upper-atmosphere', upperAtmosphereWorker)
 
       this.isInitialized = true
       try { console.log(`✅ Worker Manager initialized with ${this.workers.size} workers`) } catch {}
