@@ -309,7 +309,6 @@ export class WorkerQueue {
     this.isProcessQueueRunning = true
     try {
       const totalItems = this.highPriorityQueue.length + this.normalPriorityQueue.length
-      // Skip processing if no items in queue
       if (totalItems === 0) {
         return
       }
@@ -321,14 +320,13 @@ export class WorkerQueue {
         return
       }
 
-      // Gate by confirmed UTXOs per wallet to avoid stalling on unconfirmed change
       const nowTs = Date.now()
-      if (nowTs - this.lastUtxoGateCheckedAt > 30000) { // check every 30s
+      if (nowTs - this.lastUtxoGateCheckedAt > 30000) {
         this.lastUtxoGateCheckedAt = nowTs
         try {
           this.lastUtxoGateOk = await this.hasSufficientConfirmedUtxos()
         } catch (e) {
-          this.lastUtxoGateOk = true // don't hard-stop on errors
+          this.lastUtxoGateOk = true
         }
       }
       if (!this.lastUtxoGateOk) {
@@ -339,36 +337,45 @@ export class WorkerQueue {
         return
       }
 
+      const concurrency = Math.max(1, Number(process.env.BSV_QUEUE_CONCURRENCY || 25))
       const maxItemsPerBatch = Math.min(
         bsvConfig.queue.batchSize,
-        bsvConfig.queue.maxTxPerSecond
+        bsvConfig.queue.maxTxPerSecond,
       )
 
-      let processedCount = 0
-      const batchStartTime = Date.now()
-
-      // Process high priority items first
-      while (this.highPriorityQueue.length > 0 && processedCount < maxItemsPerBatch) {
+      const batch: QueueItem[] = []
+      while (this.highPriorityQueue.length > 0 && batch.length < maxItemsPerBatch) {
         const item = this.takeNextItem(this.highPriorityQueue, 'high')
-        if (!item) break
-        markQueueItemProcessing(item.id).catch(() => {})
-        await this.processItem(item)
-        processedCount++
+        if (item) batch.push(item)
       }
-
-      // Then process normal priority items
-      while (this.normalPriorityQueue.length > 0 && processedCount < maxItemsPerBatch) {
+      while (this.normalPriorityQueue.length > 0 && batch.length < maxItemsPerBatch) {
         const item = this.takeNextItem(this.normalPriorityQueue, 'normal')
-        if (!item) break
-        markQueueItemProcessing(item.id).catch(() => {})
-        await this.processItem(item)
-        processedCount++
+        if (item) batch.push(item)
       }
 
-      // Rate limiting: ensure we don't exceed max transactions per second
+      if (batch.length === 0) return
+
+      for (const item of batch) {
+        markQueueItemProcessing(item.id).catch(() => {})
+      }
+
+      const batchStartTime = Date.now()
+      let itemIndex = 0
+      const workers = Array.from(
+        { length: Math.min(concurrency, batch.length) },
+        async () => {
+          while (true) {
+            const idx = itemIndex++
+            if (idx >= batch.length) break
+            await this.processItem(batch[idx])
+          }
+        },
+      )
+      await Promise.all(workers)
+      const processedCount = batch.length
+
       const batchDuration = Date.now() - batchStartTime
       const minBatchDuration = (1000 / bsvConfig.queue.maxTxPerSecond) * processedCount
-      
       if (batchDuration < minBatchDuration) {
         const delay = minBatchDuration - batchDuration
         await new Promise(resolve => setTimeout(resolve, delay))

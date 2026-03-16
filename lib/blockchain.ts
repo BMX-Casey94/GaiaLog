@@ -727,22 +727,22 @@ export class BlockchainService {
     throw new Error('HEAP_PRESSURE_BACKOFF')
   }
 
+  private walletEmptyUntil: Map<number, number> = new Map()
+  private static readonly WALLET_EMPTY_CACHE_MS = 60_000
+
   private async getFirstWalletWithSpendableUtxos(traceId?: string): Promise<{ wif: string; index: number; address: string; utxos: any[] } | null> {
-    // Build list, starting from current rrIndex for fairness
     const list = this.wifsForSend && this.wifsForSend.length > 0
       ? this.wifsForSend
       : (BSV_PRIVATE_KEY ? [BSV_PRIVATE_KEY] : (BSV_FALLBACK_WIF ? [BSV_FALLBACK_WIF] : []))
     if (list.length === 0) return null
-    
-    const diagnostics: Array<{ address: string; spendableCount: number; totalBalance?: number; error?: string; backedOff?: boolean }> = []
-    
-    // Import backoff checker (lazy — non-fatal if module unavailable)
+
     let isBackedOff: ((addr: string) => boolean) | null = null
     try {
       const mod = await import('./utxo-maintainer')
       isBackedOff = mod.isWalletBackedOff
     } catch {}
 
+    const now = Date.now()
     for (let i = 0; i < list.length; i++) {
       const pick = (this.rrIndex + i) % list.length
       const wif = list[pick]
@@ -750,86 +750,25 @@ export class BlockchainService {
         const sdkKey = SDKPrivateKey.fromWif(wif)
         const addr = sdkKey.toPublicKey().toAddress().toString()
 
-        // Skip wallets in mempool-chain backoff (prevents hammering doomed UTXOs)
-        if (isBackedOff && isBackedOff(addr)) {
-          diagnostics.push({ address: addr, spendableCount: 0, backedOff: true })
-          continue
-        }
+        if (isBackedOff && isBackedOff(addr)) continue
+
+        const emptyUntil = this.walletEmptyUntil.get(pick) || 0
+        if (emptyUntil > now) continue
 
         const spendable = await this.getSpendableUtxos(addr, wif, pick, traceId)
-        
-        // Estimate balance from spendable UTXOs for diagnostics (avoid extra WoC calls)
-        let balance: number | undefined
-        try {
-          const totalSats = spendable.reduce((sum: number, u: any) => sum + (u.value || 0), 0)
-          balance = totalSats / 100000000
-        } catch {}
-        
-        diagnostics.push({
-          address: addr,
-          spendableCount: spendable.length,
-          totalBalance: balance
-        })
-        
+
         if (spendable.length > 0) {
-          // Advance rrIndex to the position after the one we used
+          this.walletEmptyUntil.delete(pick)
           this.rrIndex = (pick + 1) % list.length
           return { wif, index: pick, address: addr, utxos: spendable }
         }
-      } catch (e) {
-        const addr = (() => {
-          try {
-            const sdkKey = SDKPrivateKey.fromWif(wif)
-            return sdkKey.toPublicKey().toAddress().toString()
-          } catch {
-            return 'unknown'
-          }
-        })()
-        diagnostics.push({
-          address: addr,
-          spendableCount: 0,
-          error: e instanceof Error ? e.message : String(e)
-        })
+
+        this.walletEmptyUntil.set(pick, now + BlockchainService.WALLET_EMPTY_CACHE_MS)
+      } catch {
+        this.walletEmptyUntil.set(pick, now + BlockchainService.WALLET_EMPTY_CACHE_MS)
       }
     }
-    
-    // Log diagnostics when no UTXOs found
-    console.error('❌ No spendable UTXOs found across wallets. Diagnostics:')
-    diagnostics.forEach((d, idx) => {
-      const balanceStr = d.totalBalance !== undefined 
-        ? `${(d.totalBalance * 100000000).toFixed(0)} sats (${d.totalBalance.toFixed(6)} BSV)`
-        : 'unknown'
-      console.error(`   Wallet ${idx + 1} (${d.address.substring(0, 10)}...): ${d.spendableCount} spendable UTXOs, balance: ${balanceStr}${d.error ? `, error: ${d.error}` : ''}`)
-    })
-    
-    // If wallets have balances but no UTXOs, force refresh and try once more
-    const hasBalances = diagnostics.some(d => d.totalBalance !== undefined && d.totalBalance > 0)
-    if (hasBalances && ENABLE_UTXO_POOL) {
-      console.log('🔄 Wallets have balances but no UTXOs detected. Force refreshing caches...')
-      try {
-        await this.forceRefreshAllUtxoCaches()
-        
-        // Try again after refresh
-        for (let i = 0; i < list.length; i++) {
-          const pick = (this.rrIndex + i) % list.length
-          const wif = list[pick]
-          try {
-            const sdkKey = SDKPrivateKey.fromWif(wif)
-            const addr = sdkKey.toPublicKey().toAddress().toString()
-            const spendable = await this.getSpendableUtxos(addr, wif, pick, traceId)
-            
-            if (spendable.length > 0) {
-              this.rrIndex = (pick + 1) % list.length
-              console.log(`✅ Found ${spendable.length} UTXO(s) after refresh for ${addr.substring(0, 10)}...`)
-              return { wif, index: pick, address: addr, utxos: spendable }
-            }
-          } catch {}
-        }
-      } catch (refreshError) {
-        console.error('Failed to force refresh UTXO caches:', refreshError)
-      }
-    }
-    
+
     return null
   }
 
@@ -1115,12 +1054,10 @@ export class BlockchainService {
           } catch {}
           return null
         }
-        const addrCache = this.utxoCacheByAddress.get(address)
-        const alreadyUsed = addrCache?.usedKeys?.get(key)
+        const addrCache = this.ensureAddressCache(address)
+        const alreadyUsed = addrCache.usedKeys.get(key)
         if (alreadyUsed && alreadyUsed > Date.now()) return null
-        if (ENABLE_UTXO_POOL && addrCache) {
-          addrCache.usedKeys.set(key, Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS))
-        }
+        addrCache.usedKeys.set(key, Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS))
         return key
       }
 
@@ -1536,18 +1473,42 @@ export class BlockchainService {
     }
   }
 
+  private overlayResponseCache: Map<string, { fetchedAt: number; utxos: any[] }> = new Map()
+  private overlayInFlight: Map<string, Promise<any[]>> = new Map()
+  private static readonly OVERLAY_CACHE_TTL_MS = 5_000
+
   private async getSpendableUtxosFromSpendSource(address: string, walletIndex: number): Promise<any[]> {
-    const topic = getTreasuryTopicForWallet(walletIndex)
-    const spendSource = getSpendSourceForWallet(walletIndex)
-    const outputs = await spendSource.listSpendable({
-      topic,
-      limit: SPEND_SOURCE_LIST_LIMIT,
-      order: 'asc',
-      minSatoshis: 0,
-      excludeReserved: false,
-      confirmedOnly: MIN_SPEND_CONF > 0,
-    })
-    return outputs.map(output => this.mapSpendSourceOutputToUtxo(output, address))
+    const now = Date.now()
+    const cached = this.overlayResponseCache.get(address)
+    if (cached && (now - cached.fetchedAt) < BlockchainService.OVERLAY_CACHE_TTL_MS) {
+      return cached.utxos
+    }
+
+    const inflight = this.overlayInFlight.get(address)
+    if (inflight) return inflight
+
+    const fetching = (async () => {
+      const topic = getTreasuryTopicForWallet(walletIndex)
+      const spendSource = getSpendSourceForWallet(walletIndex)
+      const outputs = await spendSource.listSpendable({
+        topic,
+        limit: SPEND_SOURCE_LIST_LIMIT,
+        order: 'asc',
+        minSatoshis: 0,
+        excludeReserved: false,
+        confirmedOnly: MIN_SPEND_CONF > 0,
+      })
+      return outputs.map(output => this.mapSpendSourceOutputToUtxo(output, address))
+    })()
+
+    this.overlayInFlight.set(address, fetching)
+    try {
+      const result = await fetching
+      this.overlayResponseCache.set(address, { fetchedAt: Date.now(), utxos: result })
+      return result
+    } finally {
+      this.overlayInFlight.delete(address)
+    }
   }
 
   private async refreshUtxoCache(address: string, wif: string, force = false): Promise<void> {
@@ -1609,6 +1570,19 @@ export class BlockchainService {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         notes.push(`spend-source fallback=${message}`)
+        const overlayMode = (process.env.BSV_SPEND_SOURCE_MODE || '').toLowerCase() === 'overlay'
+        if (overlayMode) {
+          this.logUtxoLookupTrace({
+            traceId,
+            walletIndex: resolvedWalletIndex ?? undefined,
+            address,
+            source: 'overlay-failed',
+            spendableCount: 0,
+            durationMs: Date.now() - startedAt,
+            note: notes.join('; '),
+          })
+          return []
+        }
         if (bsvConfig.logging.level === 'debug') {
           console.warn(`⚠️ Spend-source lookup failed for ${address.substring(0, 10)}...; falling back to legacy UTXO path: ${message}`)
         }

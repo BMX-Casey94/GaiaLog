@@ -255,7 +255,10 @@ export async function listLookupOutputs(queryInput: OverlayLookupQuery): Promise
   const { whereSql, params } = buildLookupWhere(queryInput)
   const order = queryInput.order === 'desc' ? 'DESC' : 'ASC'
   const sql = `
-    SELECT topic, txid, vout, satoshis, output_script, raw_tx, beef, admitted_at, confirmed, removed, removed_at, spending_txid
+    SELECT topic, txid, vout, satoshis, output_script,
+           '' AS raw_tx, NULL::jsonb AS beef,
+           admitted_at, confirmed,
+           false AS removed, NULL::timestamptz AS removed_at, NULL AS spending_txid
       FROM overlay_admitted_utxos u
      WHERE ${whereSql}
      ORDER BY u.satoshis ${order}, u.txid ${order}, u.vout ${order}
