@@ -1027,7 +1027,8 @@ export class BlockchainService {
       const INPUT_SIGNED = 148 // signed P2PKH input with scriptSig
 
       const estimateExplicitFee = (inputCount: number, feeMultiplier: number): { estimatedSize: number; explicitFee: number } => {
-        const estimatedSize = BASE_WITH_CHANGE + inputCount * INPUT_SIGNED + opReturnBytes
+        const opReturnOutputEnvelope = 8 + (opReturnBytes < 253 ? 1 : 3)
+        const estimatedSize = BASE_WITH_CHANGE + inputCount * INPUT_SIGNED + opReturnOutputEnvelope + opReturnBytes
         const explicitFee = Math.ceil(estimatedSize * FEE_RATE_SAT_PER_BYTE * feeMultiplier)
         return { estimatedSize, explicitFee }
       }
