@@ -13,11 +13,10 @@
  *   pm2 logs           # tail all logs
  *   pm2 monit          # live dashboard
  *
- * Scheduled restart strategy (gaialog-workers):
- *   cron_restart recycles the worker process every 30 minutes (:00 and :30).
- *   This is the most reliable anti-stall mechanism because it is managed entirely
- *   by PM2 — an external process — so it cannot be blocked by a stuck Node.js
- *   event loop or hung timer inside the worker.
+ * Worker restart strategy:
+ *   Provider cursors are now DB-persisted so workers can run continuously
+ *   without losing coverage progress. Periodic restarts are no longer needed
+ *   to work around in-memory cursor resets.
  *
  *   Queue items persist across restarts (worker_queue DB table); any items marked
  *   'processing' at kill-time are automatically reclaimed as 'queued' after 2 minutes
@@ -112,10 +111,6 @@ module.exports = {
         GAIALOG_QUEUE_GATE_SOURCE: process.env.GAIALOG_QUEUE_GATE_SOURCE || 'overlay',
       },
       max_memory_restart: '8G',
-      // Recycle the worker process every 30 minutes to prevent event-loop stalls.
-      // PM2 sends SIGINT, waits kill_timeout ms, then SIGKILL if still alive.
-      // Queue state is persisted in the DB and re-hydrated on each restart.
-      cron_restart: '*/30 * * * *',
       kill_timeout: 8000,
       restart_delay: 10000,
       max_restarts: 100,

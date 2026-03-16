@@ -416,11 +416,13 @@ export async function submitOverlayTransaction(input: unknown): Promise<OverlayS
       steakByTopic[topic] = steak
     }
 
-    // Refresh cached topic counts once per topic at the end of the transaction,
-    // replacing the dropped per-row trigger (migration 0013).
-    const touchedTopics = new Set(normalized.topics)
-    for (const topic of touchedTopics) {
-      await refreshTopicCounts(client, topic)
+    for (const [topic, steak] of Object.entries(steakByTopic)) {
+      const admitted = steak.outputsToAdmit?.length || 0
+      const removed = steak.coinsRemoved?.length || 0
+      const delta = admitted - removed
+      if (delta !== 0) {
+        await refreshTopicCounts(client, topic, delta)
+      }
     }
 
     return steakByTopic

@@ -194,8 +194,15 @@ export async function upsertOverlaySubmission(client: PoolClient, submission: Ov
   )
 }
 
-export async function refreshTopicCounts(client: PoolClient, topic: string): Promise<void> {
-  await client.query(`SELECT refresh_overlay_topic_counts($1)`, [topic])
+export async function refreshTopicCounts(client: PoolClient, topic: string, delta: number = 1): Promise<void> {
+  await client.query(
+    `INSERT INTO overlay_topic_counts (topic, available_count, confirmed_available_count, updated_at)
+     VALUES ($1, $2, 0, now())
+     ON CONFLICT (topic) DO UPDATE
+       SET available_count = GREATEST(0, overlay_topic_counts.available_count + $2),
+           updated_at = now()`,
+    [topic, delta],
+  )
 }
 
 export async function getCachedTopicCount(topic: string, confirmedOnly: boolean): Promise<number | null> {

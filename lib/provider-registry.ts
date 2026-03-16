@@ -214,10 +214,10 @@ const PROVIDER_ENV_OVERRIDES: Partial<Record<ProviderId, {
 }
 
 const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
-  waqi: { perSecond: 1, perDay: 33 },
+  waqi: { perSecond: 2, perDay: 100000 },
   weatherapi: { perSecond: 5 },
-  noaa: { perSecond: 5, perDay: 10000 },
-  noaa_ndbc: { perSecond: 1 },
+  noaa: { perSecond: 10, perDay: 100000 },
+  noaa_ndbc: { perSecond: 5 },
   noaa_space_weather: { perSecond: 1 },
   usgs: { perSecond: 1 },
   usgs_geomagnetism: { perSecond: 1 },
@@ -235,12 +235,12 @@ const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
 }
 
 const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
-  waqi: 2 * 60 * 60 * 1000,
+  waqi: 15 * 60 * 1000,
   weatherapi: 30 * 60 * 1000,
-  noaa: 60 * 60 * 1000,
+  noaa: 6 * 60 * 1000,
   noaa_ndbc: 5 * 60 * 1000,
   noaa_space_weather: 60 * 1000,
-  usgs: 15 * 60 * 1000,
+  usgs: 5 * 60 * 1000,
   usgs_geomagnetism: 60 * 1000,
   usgs_volcanoes: 10 * 60 * 1000,
   owm: 30 * 60 * 1000,
@@ -346,7 +346,7 @@ const PROVIDER_ROLLOUT_RULES: Record<ProviderId, RolloutRule> = {
   owm: { phase: 1, minimumGate: 'gate_a', note: 'Keep the existing OWM-derived utility online throughout the rollout.' },
   sensor_community: { phase: 1, minimumGate: 'gate_a', recommendedOrder: 1, note: 'Highest-yield no-key bulk source for early throughput expansion.' },
   emsc: { phase: 1, minimumGate: 'gate_a', recommendedOrder: 4, note: 'Real-time push seismic source for early throughput expansion.' },
-  geonet: { phase: 2, minimumGate: 'gate_b', recommendedOrder: 5, note: 'Recommended as the first post-Phase-1 widening step once accepted throughput is healthy.' },
+  geonet: { phase: 1, minimumGate: 'gate_a', recommendedOrder: 5, note: 'NZ seismic network, promoted to gate_a for early coverage breadth.' },
   iris: { phase: 3, minimumGate: 'gate_d', note: 'Heavier seismic comparison feed deferred until confirmed throughput is healthy.' },
   opensensemap: { phase: 3, minimumGate: 'gate_d', note: 'Bulk community coverage feed deferred until later rollout gates.' },
   intermagnet: { phase: 2, minimumGate: 'gate_d', note: 'Deferred specialist geomagnetism feed until later rollout gates.' },

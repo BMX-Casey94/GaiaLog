@@ -9,6 +9,8 @@ import {
   insertAdvanced,
   calculateSourceHash,
   upsertTxLog,
+  readCursor,
+  writeCursor,
 } from './repositories'
 import { fetchJsonWithRetry, fetchTextWithRetry } from './provider-fetch'
 import { budgetStore, cursorStore, dedupeStore, cacheStore } from './stores'
@@ -1138,6 +1140,11 @@ export async function collectAirQualityDataBatch(cities: string[], useWAQI: bool
 // so we keep the last successful response and reuse it on HTTP 304.
 let _noaaStationCache: any[] | null = null
 
+// Freshness watermarks: track last-seen provider timestamp per station so
+// snapshot feeds can skip records that haven't changed since the previous cycle.
+const _ndbcWatermarks = new Map<string, string>()
+const _sensorCommunityWatermarks = new Map<string, string>()
+
 export async function collectWaterLevelDataBatch(limit: number = 25): Promise<WaterLevelData[]> {
   const out: WaterLevelData[] = []
   const stations = await fetchJsonWithRetry<any>(
@@ -1164,11 +1171,10 @@ export async function collectWaterLevelDataBatch(limit: number = 25): Promise<Wa
     console.warn('🌊 NOAA: Station list is empty – nothing to collect')
     return out
   }
-  const startIndex = (await cursorStore.get('noaa')) as number | null
-  const cursor = typeof startIndex === 'number' ? startIndex : 0
+  const cursor = await readCursor('noaa', null, 'station_index')
   const selectedStations = buildRotatingSlice(list, cursor, Math.min(limit, total))
   if (selectedStations.length === 0) return out
-  await cursorStore.set('noaa', (cursor + selectedStations.length) % total)
+  await writeCursor('noaa', null, 'station_index', (cursor + selectedStations.length) % total)
 
   const products = getNoaaCoopsProducts()
   const concurrency = Math.max(1, Number(process.env.NOAA_STATION_CONCURRENCY || 4))
@@ -1259,12 +1265,12 @@ export async function collectSensorCommunityDataBatch(limit: number = 5000): Pro
 
   const total = sorted.length
   const useFullSnapshot = isTruthyEnv(process.env.SENSOR_COMMUNITY_USE_FULL_SNAPSHOT, false)
-  const cursor = Number((await cursorStore.get(cursorKey)) ?? 0)
+  const cursor = await readCursor('sensor_community', null, 'snapshot_index')
   const selected = useFullSnapshot || limit >= total
     ? sorted
     : buildRotatingSlice(sorted, Number.isFinite(cursor) ? cursor : 0, limit)
   if (!(useFullSnapshot || limit >= total)) {
-    await cursorStore.set(cursorKey, ((cursor || 0) + selected.length) % total)
+    await writeCursor('sensor_community', null, 'snapshot_index', ((cursor || 0) + selected.length) % total)
   }
 
   const out: AirQualityData[] = []
@@ -1286,6 +1292,11 @@ export async function collectSensorCommunityDataBatch(limit: number = 5000): Pro
 
     const sensorId = record?.sensor?.id != null ? String(record.sensor.id) : String(record?.id || 'unknown')
     const timestamp = normaliseProviderTimestamp(record?.timestamp)
+
+    const lastSeen = _sensorCommunityWatermarks.get(sensorId)
+    if (lastSeen === timestamp) continue
+    _sensorCommunityWatermarks.set(sensorId, timestamp)
+
     const key = `sensor_community:${sensorId}:${timestamp}`
     if (!(await dedupeStore.add(key))) continue
 
@@ -1327,12 +1338,12 @@ export async function collectNdbcLatestObservations(limit: number = 1000): Promi
   if (lines.length === 0) return []
 
   const useFullSnapshot = isTruthyEnv(process.env.NDBC_USE_FULL_SNAPSHOT, false)
-  const cursor = Number((await cursorStore.get('noaa_ndbc')) ?? 0)
+  const cursor = await readCursor('noaa_ndbc', null, 'obs_index')
   const selected = useFullSnapshot || limit >= lines.length
     ? lines
     : buildRotatingSlice(lines, Number.isFinite(cursor) ? cursor : 0, limit)
   if (!(useFullSnapshot || limit >= lines.length)) {
-    await cursorStore.set('noaa_ndbc', ((cursor || 0) + selected.length) % lines.length)
+    await writeCursor('noaa_ndbc', null, 'obs_index', ((cursor || 0) + selected.length) % lines.length)
   }
 
   const out: WaterLevelData[] = []
@@ -1373,6 +1384,11 @@ export async function collectNdbcLatestObservations(limit: number = 1000): Promi
     if (![year, month, day, hour, minute].every(value => Number.isFinite(value))) continue
 
     const timestamp = new Date(Date.UTC(year, month - 1, day, hour, minute)).toISOString()
+
+    const lastSeen = _ndbcWatermarks.get(stationId)
+    if (lastSeen === timestamp) continue
+    _ndbcWatermarks.set(stationId, timestamp)
+
     const key = `noaa_ndbc:${stationId}:${timestamp}`
     if (!(await dedupeStore.add(key))) continue
 
@@ -1454,6 +1470,44 @@ export async function collectEMSCLatestEvents(minutesBack: number = 15, limit: n
       source: 'EMSC',
       event_id: eventId,
     })
+  }
+
+  return out
+}
+
+export async function collectGeoNetLatestEvents(minutesBack: number = 60, limit: number = 500): Promise<SeismicData[]> {
+  const url = `https://api.geonet.org.nz/quake?MMI=-1`
+  const data = await fetchJsonWithRetry<any>(url, {
+    retries: 2,
+    providerId: 'geonet',
+    headers: { Accept: 'application/json' },
+  })
+  const features = Array.isArray(data?.features) ? data.features : []
+  const cutoff = Date.now() - minutesBack * 60 * 1000
+  const out: SeismicData[] = []
+
+  for (const feature of features) {
+    const properties = feature?.properties || {}
+    const coordinates = feature?.geometry?.coordinates || []
+    const eventId = String(properties?.publicID || feature?.id || '')
+    if (!eventId) continue
+    const ts = Date.parse(properties?.time)
+    if (!Number.isFinite(ts) || ts < cutoff) continue
+    const key = `geonet:seis:${eventId}`
+    if (!(await dedupeStore.add(key))) continue
+    out.push({
+      magnitude: Number(properties?.magnitude ?? 0),
+      depth: Number(properties?.depth ?? coordinates?.[2] ?? 0),
+      location: String(properties?.locality || 'New Zealand'),
+      coordinates: {
+        lat: Number(coordinates?.[1] ?? 0),
+        lon: Number(coordinates?.[0] ?? 0),
+      },
+      timestamp: new Date(ts).toISOString(),
+      source: 'GeoNet NZ',
+      event_id: eventId,
+    })
+    if (out.length >= limit) break
   }
 
   return out

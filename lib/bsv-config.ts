@@ -51,11 +51,11 @@ export const bsvConfig: BSVConfig = {
     retryDelayMs: parseInt(process.env.BSV_RETRY_DELAY_MS || '1000'),
   },
   queue: {
-    maxTxPerSecond: parseInt(process.env.BSV_MAX_TX_PER_SECOND || '50'),
+    maxTxPerSecond: parseInt(process.env.BSV_MAX_TX_PER_SECOND || '200'),
     processingIntervalMs: parseInt(process.env.BSV_QUEUE_PROCESSING_INTERVAL_MS || '25'),
-    batchSize: parseInt(process.env.BSV_BATCH_SIZE || '100'),
-    batchIntervalMs: parseInt(process.env.BSV_BATCH_INTERVAL_MS || '2000'),
-    maxQueueSize: parseInt(process.env.BSV_MAX_QUEUE_SIZE || '10000'),
+    batchSize: parseInt(process.env.BSV_BATCH_SIZE || '200'),
+    batchIntervalMs: parseInt(process.env.BSV_BATCH_INTERVAL_MS || '1000'),
+    maxQueueSize: parseInt(process.env.BSV_MAX_QUEUE_SIZE || '100000'),
   },
   api: {
     mainnet: process.env.BSV_API_ENDPOINT || 'https://arc.taal.com',

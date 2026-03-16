@@ -4,6 +4,7 @@ import { bsvConfig } from './bsv-config'
 import {
   collectAirQualityDataBatch,
   collectEMSCLatestEvents,
+  collectGeoNetLatestEvents,
   collectNdbcLatestObservations,
   collectSeismicDataBatch,
   collectSensorCommunityDataBatch,
@@ -374,13 +375,13 @@ export abstract class BaseWorker {
             }
           }
         } else {
-          // Normal queue path (when Supabase is stable)
           const queueId = workerQueue.addToQueue(bsvData, item.priority)
           if (queueId) {
             this.stats.totalTransactions++
             cycleStats.queued++
           } else {
             cycleStats.backpressured++
+            break
           }
           if (queueId && bsvConfig.logging.level === 'debug') {
             console.log(`📥 ${this.workerId}: Queued ${item.type} data (${item.priority} priority): ${queueId}`)
@@ -399,10 +400,13 @@ export abstract class BaseWorker {
       }
 
       if (bsvConfig.logging.level !== 'error') {
+        const novel = cycleStats.submitted + cycleStats.queued
+        const nextRunIn = Math.max(1000, this.getIntervalMs() - processingTime)
         console.log(
           `✅ ${this.workerId}: Processed ${data.length} data points in ${processingTime}ms ` +
           `(submitted=${cycleStats.submitted}, queued=${cycleStats.queued}, duplicate=${cycleStats.duplicateDropped}, ` +
-          `already_on_chain=${cycleStats.alreadyOnChainDropped}, backpressured=${cycleStats.backpressured})`
+          `already_on_chain=${cycleStats.alreadyOnChainDropped}, backpressured=${cycleStats.backpressured}) ` +
+          `novel=${novel} nextRunIn=${(nextRunIn / 1000).toFixed(0)}s`
         )
       }
 
@@ -411,10 +415,14 @@ export abstract class BaseWorker {
       console.error(`❌ ${this.workerId}: Error collecting data:`, error)
     }
 
-    // Schedule next run dynamically based on current interval
     if (this.isRunning) {
       if (this.interval) { clearTimeout(this.interval); this.interval = null }
-      this.interval = setTimeout(() => this.run(), this.getIntervalMs())
+      const elapsed = Date.now() - startTime
+      const backpressureRetryMs = 10_000
+      const delay = cycleStats.backpressured > 0
+        ? backpressureRetryMs
+        : Math.max(1000, this.getIntervalMs() - elapsed)
+      this.interval = setTimeout(() => this.run(), delay)
     }
   }
 
@@ -1014,6 +1022,51 @@ export class EMSCRealtimeWorker extends BaseWorker {
   }
 }
 
+export class GeoNetWorker extends BaseWorker {
+  constructor() {
+    super('GeoNet-Seismic')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.geonet_realtime_events?.cadence.intervalMs || 5 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.geonet_realtime_events
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectGeoNetLatestEvents(60, config.chunkSize)
+      for (const item of batch) {
+        data.push({
+          type: 'seismic',
+          timestamp: Date.parse(item.timestamp) || Date.now(),
+          location: item.location,
+          measurement: {
+            magnitude: item.magnitude,
+            depth: item.depth,
+            latitude: item.coordinates.lat,
+            longitude: item.coordinates.lon,
+          },
+          source: item.source,
+          priority: item.magnitude >= 4 ? 'high' : config.defaultPriority,
+          family: 'seismic_activity',
+          providerId: 'geonet',
+          datasetId: 'geonet_realtime_events',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          eventId: item.event_id,
+          coordinates: item.coordinates,
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching GeoNet data:', error)
+    }
+    return data
+  }
+}
+
 // Worker 4: Advanced Metrics (WeatherAPI primary, OWM fallback)
 export class AdvancedMetricsWorker extends BaseWorker {
   constructor() {
@@ -1261,6 +1314,7 @@ export class WorkerManager {
       const noaaNdbcWorker = new NOAANdbcWorker()
       const usgsWorker = new USGSWorker()
       const emscWorker = new EMSCRealtimeWorker()
+      const geonetWorker = new GeoNetWorker()
       const advWorker = new AdvancedMetricsWorker()
 
       this.workers.set('waqi-environmental', waqiWorker)
@@ -1269,6 +1323,7 @@ export class WorkerManager {
       this.workers.set('noaa-ndbc', noaaNdbcWorker)
       this.workers.set('usgs-seismic', usgsWorker)
       this.workers.set('emsc-realtime', emscWorker)
+      this.workers.set('geonet-seismic', geonetWorker)
       this.workers.set('advanced-metrics', advWorker)
 
       this.isInitialized = true
