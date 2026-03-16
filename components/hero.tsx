@@ -181,6 +181,21 @@ export function Hero() {
     return formatNumber(n)
   }
 
+  const formatLocation = (location: string | null | undefined): string => {
+    if (!location) return ''
+    let cleaned = location.trim()
+    const words = cleaned.split(/\s+/)
+    if (words.length > 0) {
+      const firstWord = words[0]
+      const repeated = new RegExp(`^(${firstWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})+`, 'i')
+      cleaned = cleaned.replace(repeated, firstWord)
+    }
+    if (cleaned.length > 20) {
+      cleaned = cleaned.substring(0, 17) + '...'
+    }
+    return cleaned
+  }
+
   const getDisplayCards = (): Array<{ id: string; label: string; value: string; sub: string; icon: React.ComponentType<{ className?: string }>; onClick?: () => void }> => {
     const cards: Array<{ id: string; label: string; value: string; sub: string; icon: React.ComponentType<{ className?: string }>; onClick?: () => void }> = []
 
@@ -229,28 +244,6 @@ export function Hero() {
 
   const displayCards = getDisplayCards()
 
-  const formatLocation = (location: string | null | undefined): string => {
-    if (!location) return ''
-    
-    // Clean up the location string - remove any repeated text patterns
-    let cleaned = location.trim()
-    
-    // Check for repeated patterns (like "JohannesburgJohannesburg")
-    const words = cleaned.split(/\s+/)
-    if (words.length > 0) {
-      // If first word appears multiple times consecutively, use just one
-      const firstWord = words[0]
-      const repeated = new RegExp(`^(${firstWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})+`, 'i')
-      cleaned = cleaned.replace(repeated, firstWord)
-    }
-    
-    // Limit to 20 characters max
-    if (cleaned.length > 20) {
-      cleaned = cleaned.substring(0, 17) + '...'
-    }
-    
-    return cleaned
-  }
 
   const scrollToMonitoring = (): void => {
     const target = document.getElementById("monitoring")
