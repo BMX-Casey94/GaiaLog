@@ -211,6 +211,86 @@ const PROVIDER_ENV_OVERRIDES: Partial<Record<ProviderId, {
     perDayEnv: 'IGRA2_PER_DAY',
     intervalEnv: 'IGRA2_WORKER_INTERVAL_MS',
   },
+  usgs_water: {
+    rpsEnv: 'USGS_WATER_RPS',
+    perDayEnv: 'USGS_WATER_PER_DAY',
+    intervalEnv: 'USGS_WATER_WORKER_INTERVAL_MS',
+  },
+  uk_ea_flood: {
+    rpsEnv: 'UK_EA_FLOOD_RPS',
+    perDayEnv: 'UK_EA_FLOOD_PER_DAY',
+    intervalEnv: 'UK_EA_FLOOD_WORKER_INTERVAL_MS',
+  },
+  gbif: {
+    rpsEnv: 'GBIF_RPS',
+    perDayEnv: 'GBIF_PER_DAY',
+    intervalEnv: 'GBIF_WORKER_INTERVAL_MS',
+  },
+  inaturalist: {
+    rpsEnv: 'INATURALIST_RPS',
+    perDayEnv: 'INATURALIST_PER_DAY',
+    intervalEnv: 'INATURALIST_WORKER_INTERVAL_MS',
+  },
+  obis: {
+    rpsEnv: 'OBIS_RPS',
+    perDayEnv: 'OBIS_PER_DAY',
+    intervalEnv: 'OBIS_WORKER_INTERVAL_MS',
+  },
+  usfws_ecos: {
+    rpsEnv: 'USFWS_ECOS_RPS',
+    perDayEnv: 'USFWS_ECOS_PER_DAY',
+    intervalEnv: 'USFWS_ECOS_WORKER_INTERVAL_MS',
+  },
+  natureserve: {
+    rpsEnv: 'NATURESERVE_RPS',
+    perDayEnv: 'NATURESERVE_PER_DAY',
+    intervalEnv: 'NATURESERVE_WORKER_INTERVAL_MS',
+  },
+  nasa_eonet: {
+    rpsEnv: 'NASA_EONET_RPS',
+    perDayEnv: 'NASA_EONET_PER_DAY',
+    intervalEnv: 'NASA_EONET_WORKER_INTERVAL_MS',
+  },
+  global_forest_watch: {
+    rpsEnv: 'GFW_RPS',
+    perDayEnv: 'GFW_PER_DAY',
+    intervalEnv: 'GFW_WORKER_INTERVAL_MS',
+  },
+  usgs_mrds: {
+    rpsEnv: 'USGS_MRDS_RPS',
+    perDayEnv: 'USGS_MRDS_PER_DAY',
+    intervalEnv: 'USGS_MRDS_WORKER_INTERVAL_MS',
+  },
+  opensky: {
+    rpsEnv: 'OPENSKY_RPS',
+    perDayEnv: 'OPENSKY_PER_DAY',
+    intervalEnv: 'OPENSKY_WORKER_INTERVAL_MS',
+  },
+  aisstream: {
+    rpsEnv: 'AISSTREAM_RPS',
+    perDayEnv: 'AISSTREAM_PER_DAY',
+    intervalEnv: 'AISSTREAM_WORKER_INTERVAL_MS',
+  },
+  movebank: {
+    rpsEnv: 'MOVEBANK_RPS',
+    perDayEnv: 'MOVEBANK_PER_DAY',
+    intervalEnv: 'MOVEBANK_WORKER_INTERVAL_MS',
+  },
+  uk_planning: {
+    rpsEnv: 'UK_PLANNING_RPS',
+    perDayEnv: 'UK_PLANNING_PER_DAY',
+    intervalEnv: 'UK_PLANNING_WORKER_INTERVAL_MS',
+  },
+  scotland_planning: {
+    rpsEnv: 'SCOTLAND_PLANNING_RPS',
+    perDayEnv: 'SCOTLAND_PLANNING_PER_DAY',
+    intervalEnv: 'SCOTLAND_PLANNING_WORKER_INTERVAL_MS',
+  },
+  nsw_planning: {
+    rpsEnv: 'NSW_PLANNING_RPS',
+    perDayEnv: 'NSW_PLANNING_PER_DAY',
+    intervalEnv: 'NSW_PLANNING_WORKER_INTERVAL_MS',
+  },
 }
 
 const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
@@ -232,6 +312,22 @@ const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
   copernicus_cams: { perSecond: 1 },
   nasa_power: { perSecond: 1, perDay: 30 },
   igra2: { perSecond: 1 },
+  usgs_water: { perSecond: 5, perDay: 50000 },
+  uk_ea_flood: { perSecond: 5, perDay: 50000 },
+  gbif: { perSecond: 3, perDay: 100000 },
+  inaturalist: { perSecond: 1, perDay: 10000 },
+  obis: { perSecond: 2, perDay: 50000 },
+  usfws_ecos: { perSecond: 1, perDay: 5000 },
+  natureserve: { perSecond: 1, perDay: 5000 },
+  nasa_eonet: { perSecond: 1, perDay: 1000 },
+  global_forest_watch: { perSecond: 1, perDay: 5000 },
+  usgs_mrds: { perSecond: 1, perDay: 1000 },
+  opensky: { perSecond: 1, perDay: 10000 },
+  aisstream: { perSecond: 5, perDay: 100000 },
+  movebank: { perSecond: 1, perDay: 1000 },
+  uk_planning: { perSecond: 1, perDay: 5000 },
+  scotland_planning: { perSecond: 1, perDay: 5000 },
+  nsw_planning: { perSecond: 1, perDay: 5000 },
 }
 
 const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
@@ -253,6 +349,22 @@ const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
   copernicus_cams: 6 * 60 * 60 * 1000,
   nasa_power: 12 * 60 * 60 * 1000,
   igra2: 12 * 60 * 60 * 1000,
+  usgs_water: 15 * 60 * 1000,
+  uk_ea_flood: 15 * 60 * 1000,
+  gbif: 30 * 60 * 1000,
+  inaturalist: 30 * 60 * 1000,
+  obis: 60 * 60 * 1000,
+  usfws_ecos: 24 * 60 * 60 * 1000,
+  natureserve: 24 * 60 * 60 * 1000,
+  nasa_eonet: 30 * 60 * 1000,
+  global_forest_watch: 24 * 60 * 60 * 1000,
+  usgs_mrds: 7 * 24 * 60 * 60 * 1000,
+  opensky: 60 * 1000,
+  aisstream: 60 * 1000,
+  movebank: 6 * 60 * 60 * 1000,
+  uk_planning: 24 * 60 * 60 * 1000,
+  scotland_planning: 24 * 60 * 60 * 1000,
+  nsw_planning: 24 * 60 * 60 * 1000,
 }
 
 const PROVIDER_KEY_ENV: Partial<Record<ProviderId, string>> = {
@@ -260,6 +372,10 @@ const PROVIDER_KEY_ENV: Partial<Record<ProviderId, string>> = {
   weatherapi: 'WEATHERAPI_KEY',
   owm: 'OWM_API_KEY',
   copernicus_cams: 'COPERNICUS_CAMS_API_KEY',
+  global_forest_watch: 'GFW_API_KEY',
+  aisstream: 'AISSTREAM_API_KEY',
+  movebank: 'MOVEBANK_API_KEY',
+  nsw_planning: 'PLANNING_ALERTS_AU_API_KEY',
 }
 
 function getProviderEnvOverride(providerId: ProviderId) {
@@ -287,7 +403,15 @@ function isProviderEnabled(providerId: ProviderId): boolean {
   const prefix = toEnvPrefix(providerId)
   const envs = getProviderEnvOverride(providerId)
   const keyEnv = PROVIDER_KEY_ENV[providerId]
-  const defaultEnabled = descriptor.keyRequired ? !!(keyEnv && process.env[keyEnv]) : true
+  let defaultEnabled: boolean
+  if (providerId === 'movebank') {
+    defaultEnabled = !!(
+      process.env.MOVEBANK_API_KEY ||
+      (process.env.MOVEBANK_USERNAME && process.env.MOVEBANK_PASSWORD)
+    )
+  } else {
+    defaultEnabled = descriptor.keyRequired ? !!(keyEnv && process.env[keyEnv]) : true
+  }
   return bool(process.env[envs.enabledEnv || `${prefix}_ENABLED`], defaultEnabled)
 }
 
@@ -353,6 +477,22 @@ const PROVIDER_ROLLOUT_RULES: Record<ProviderId, RolloutRule> = {
   copernicus_cams: { phase: 3, minimumGate: 'gate_d', note: 'Deferred lower-ROI gridded air-quality feed.' },
   nasa_power: { phase: 3, minimumGate: 'gate_d', note: 'Deferred lower-ROI gridded meteorology feed.' },
   igra2: { phase: 1, minimumGate: 'gate_b', note: '2700+ global radiosonde stations with twice-daily soundings.' },
+  usgs_water: { phase: 2, minimumGate: 'gate_c', note: 'USGS real-time inland water data for rivers, lakes, and groundwater.' },
+  uk_ea_flood: { phase: 2, minimumGate: 'gate_c', note: 'UK Environment Agency flood warnings and river/rainfall readings.' },
+  gbif: { phase: 2, minimumGate: 'gate_c', note: 'Global biodiversity species occurrence data.' },
+  inaturalist: { phase: 2, minimumGate: 'gate_c', note: 'Community-sourced wildlife and plant observations.' },
+  obis: { phase: 2, minimumGate: 'gate_c', note: 'Ocean Biodiversity Information System marine species data.' },
+  usfws_ecos: { phase: 3, minimumGate: 'gate_d', note: 'US threatened/endangered species listings and critical habitat.' },
+  natureserve: { phase: 3, minimumGate: 'gate_d', note: 'North American conservation status assessments.' },
+  nasa_eonet: { phase: 2, minimumGate: 'gate_c', note: 'Natural hazard events in real-time GeoJSON.' },
+  global_forest_watch: { phase: 3, minimumGate: 'gate_d', note: 'Forest disturbance alerts and tree cover loss. Requires API key.' },
+  usgs_mrds: { phase: 3, minimumGate: 'gate_d', note: 'Mineral resources data system for mine sites and commodities.' },
+  opensky: { phase: 3, minimumGate: 'gate_d', note: 'Real-time aircraft state vectors from ADS-B network.' },
+  aisstream: { phase: 4, minimumGate: 'gate_d', note: 'Real-time AIS vessel positions. Requires authorised API key.' },
+  movebank: { phase: 4, minimumGate: 'gate_d', note: 'Animal tracking data. Requires per-study authorisation.' },
+  uk_planning: { phase: 3, minimumGate: 'gate_d', note: 'UK planning applications and land-use change decisions.' },
+  scotland_planning: { phase: 3, minimumGate: 'gate_d', note: 'Scotland planning applications from 34 authorities.' },
+  nsw_planning: { phase: 3, minimumGate: 'gate_d', note: 'NSW Planning Portal / Planning Alerts AU. Requires API key.' },
 }
 
 export const providerConfigs: Record<ProviderId, ProviderConfig> = Object.fromEntries(

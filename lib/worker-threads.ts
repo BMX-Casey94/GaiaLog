@@ -23,6 +23,7 @@ import { cursorStore } from './stores'
 import { blockchainService } from './blockchain'
 import { DataFamily, DatasetId, mapWorkerTypeToFamily, ProviderId, QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
+import { applySensitivityControls } from './sensitivity-controls'
 
 export interface WorkerStats {
   workerId: string
@@ -36,7 +37,7 @@ export interface WorkerStats {
 }
 
 export interface EnvironmentalData {
-  type: 'air-quality' | 'weather' | 'seismic' | 'water-level' | 'advanced' | 'geomagnetism' | 'volcanic' | 'space-weather' | 'upper-atmosphere'
+  type: 'air-quality' | 'weather' | 'seismic' | 'water-level' | 'advanced' | 'geomagnetism' | 'volcanic' | 'space-weather' | 'upper-atmosphere' | 'biodiversity' | 'conservation' | 'hydrology' | 'flood' | 'natural-event' | 'land-use' | 'mining' | 'transport' | 'planning'
   timestamp: number
   location: string
   measurement: any
@@ -302,19 +303,42 @@ export abstract class BaseWorker {
           console.error('Persistence error before enqueue:', persistErr)
         }
 
+        const resolvedFamily = (item.family || mapWorkerTypeToFamily(item.type)) as DataFamily
+        const resolvedProvider = (item.providerId || resolveProviderIdFromSource(item.source) || undefined) as ProviderId | undefined
+        const sensitivityResult = applySensitivityControls(
+          item.measurement || {},
+          {
+            family: resolvedFamily,
+            providerId: resolvedProvider ?? null,
+            dedupeKey: `${resolvedFamily}:${resolvedProvider}:${item.timestamp}`,
+            lat: item.coordinates?.lat,
+            lon: item.coordinates?.lon,
+          },
+        )
+
+        if (!sensitivityResult.allowed) {
+          if (sensitivityResult.delayed) cycleStats.backpressured++
+          continue
+        }
+
+        const policyCoords = sensitivityResult.coordinates
+        const finalCoordinates = item.coordinates
+          ? { lat: policyCoords.lat ?? item.coordinates.lat, lon: policyCoords.lon ?? item.coordinates.lon }
+          : item.coordinates
+
         const bsvData: BSVTransactionData = {
           type: item.type,
           timestamp: item.timestamp,
           location: item.location,
-          measurement: item.measurement,
+          measurement: sensitivityResult.payload,
           source_hash: unifiedHash,
-          family: item.family || mapWorkerTypeToFamily(item.type),
-          providerId: item.providerId || resolveProviderIdFromSource(item.source) || undefined,
+          family: resolvedFamily,
+          providerId: resolvedProvider,
           datasetId: item.datasetId,
           sourceLabel: resolveSourceLabel(item.providerId, item.datasetId, item.source),
           queueLane: item.queueLane,
           maxInFlight: item.maxInFlight,
-          coordinates: item.coordinates,
+          coordinates: finalCoordinates,
           stationId: item.stationId,
         }
 
@@ -1484,6 +1508,997 @@ export class UpperAtmosphereWorker extends BaseWorker {
   }
 }
 
+// ─── openSenseMap Worker ─────────────────────────────────────────────────────
+
+export class OpenSenseMapWorker extends BaseWorker {
+  constructor() {
+    super('OpenSenseMap')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.opensensemap_boxes?.cadence.intervalMs || 15 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.opensensemap_boxes
+    if (!config?.enabled) return []
+
+    const { collectOpenSenseMapData } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectOpenSenseMapData(config.chunkSize || 500)
+      for (const item of batch) {
+        data.push({
+          type: 'air-quality',
+          timestamp: item.timestamp,
+          location: item.boxName,
+          measurement: {
+            temperature: item.temperature,
+            humidity: item.humidity,
+            pressure: item.pressure,
+            pm25: item.pm25,
+            pm10: item.pm10,
+            uvIntensity: item.uvIntensity,
+            illuminance: item.illuminance,
+            aqi: 0, pm25_val: item.pm25, pm10_val: item.pm10, co: 0, no2: 0, o3: 0,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'air_quality',
+          providerId: 'opensensemap',
+          datasetId: 'opensensemap_boxes',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          stationId: item.boxId,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching openSenseMap data:', error)
+    }
+    return data
+  }
+}
+
+// ─── INTERMAGNET Worker ──────────────────────────────────────────────────────
+
+export class IntermagnetWorker extends BaseWorker {
+  constructor() {
+    super('INTERMAGNET')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.intermagnet_observatories?.cadence.intervalMs || 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.intermagnet_observatories
+    if (!config?.enabled) return []
+
+    const { collectIntermagnetData } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectIntermagnetData()
+      for (const item of batch) {
+        data.push({
+          type: 'geomagnetism',
+          timestamp: item.timestamp,
+          location: item.observatory,
+          measurement: { x: item.x, y: item.y, z: item.z, f: item.f },
+          source: item.source,
+          priority: 'normal',
+          family: 'geomagnetism',
+          providerId: 'intermagnet',
+          datasetId: 'intermagnet_observatories',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          stationId: item.observatory,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching INTERMAGNET data:', error)
+    }
+    return data
+  }
+}
+
+// ─── IRIS EarthScope Worker ──────────────────────────────────────────────────
+
+export class IrisWorker extends BaseWorker {
+  constructor() {
+    super('IRIS-EarthScope')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.iris_events?.cadence.intervalMs || 15 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.iris_events
+    if (!config?.enabled) return []
+
+    const { collectIrisEvents } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectIrisEvents(60, config.chunkSize || 500)
+      for (const item of batch) {
+        data.push({
+          type: 'seismic',
+          timestamp: item.timestamp,
+          location: item.location,
+          measurement: {
+            magnitude: item.magnitude,
+            depth: item.depth,
+            latitude: item.latitude,
+            longitude: item.longitude,
+          },
+          source: item.source,
+          priority: item.magnitude >= 5 ? 'high' : 'normal',
+          family: 'seismic_activity',
+          providerId: 'iris',
+          datasetId: 'iris_events',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          eventId: item.eventId,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching IRIS events:', error)
+    }
+    return data
+  }
+}
+
+// ─── NASA POWER Worker ───────────────────────────────────────────────────────
+
+export class NasaPowerWorker extends BaseWorker {
+  constructor() {
+    super('NASA-POWER')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.nasa_power_points?.cadence.intervalMs || 12 * 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.nasa_power_points
+    if (!config?.enabled) return []
+
+    const { collectNasaPowerData } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectNasaPowerData()
+      for (const item of batch) {
+        data.push({
+          type: 'advanced',
+          timestamp: item.timestamp,
+          location: `${item.latitude.toFixed(1)},${item.longitude.toFixed(1)}`,
+          measurement: {
+            temperature_c: item.temperature2m,
+            humidity_pct: item.relativeHumidity2m,
+            wind_kph: item.windSpeed10m != null ? item.windSpeed10m * 3.6 : null,
+            precipitation_mm: item.precipitation,
+            solar_irradiance_wm2: item.solarIrradiance,
+            pressure_mb: item.surfacePressure != null ? item.surfacePressure / 100 : null,
+            uv_index: 0, soil_moisture: 0, wildfire_risk: 0, environmental_quality_score: 0,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'advanced_metrics',
+          providerId: 'nasa_power',
+          datasetId: 'nasa_power_points',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching NASA POWER data:', error)
+    }
+    return data
+  }
+}
+
+// ─── Copernicus CAMS Worker ──────────────────────────────────────────────────
+
+export class CopernicusCamsWorker extends BaseWorker {
+  constructor() {
+    super('Copernicus-CAMS')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.copernicus_cams_grids?.cadence.intervalMs || 6 * 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.copernicus_cams_grids
+    if (!config?.enabled) return []
+
+    const { collectCamsData } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectCamsData()
+      for (const item of batch) {
+        data.push({
+          type: 'air-quality',
+          timestamp: item.timestamp,
+          location: `${item.latitude.toFixed(1)},${item.longitude.toFixed(1)}`,
+          measurement: {
+            pm25: item.pm25 ?? 0, pm10: item.pm10 ?? 0,
+            o3: item.ozone ?? 0, no2: item.no2 ?? 0,
+            so2: item.so2 ?? 0, co: item.co ?? 0, aqi: 0,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'air_quality',
+          providerId: 'copernicus_cams',
+          datasetId: 'copernicus_cams_grids',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching Copernicus CAMS data:', error)
+    }
+    return data
+  }
+}
+
+// ─── USGS Water Worker ───────────────────────────────────────────────────────
+
+export class UsgsWaterWorker extends BaseWorker {
+  constructor() {
+    super('USGS-Water')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.usgs_water_sites?.cadence.intervalMs || 15 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.usgs_water_sites
+    if (!config?.enabled) return []
+
+    const { collectUsgsWaterData } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectUsgsWaterData(config.chunkSize || 500)
+      for (const item of batch) {
+        data.push({
+          type: 'hydrology',
+          timestamp: item.timestamp,
+          location: item.siteName,
+          measurement: {
+            discharge_cfs: item.dischargeCfs,
+            gage_height_ft: item.gageHeightFt,
+            water_temperature_c: item.waterTemperatureC,
+            dissolved_oxygen_mg_l: item.dissolvedOxygenMgL,
+            specific_conductance: item.specificConductance,
+            ph: item.ph,
+            turbidity_ntu: item.turbidityNtu,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'hydrology',
+          providerId: 'usgs_water',
+          datasetId: 'usgs_water_sites',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          stationId: item.siteId,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching USGS Water data:', error)
+    }
+    return data
+  }
+}
+
+// ─── UK EA Flood Worker ──────────────────────────────────────────────────────
+
+export class UkEaFloodWorker extends BaseWorker {
+  constructor() {
+    super('UK-EA-Flood')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.uk_ea_flood_warnings?.cadence.intervalMs || 15 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const warningConfig = datasetConfigs.uk_ea_flood_warnings
+    const readingConfig = datasetConfigs.uk_ea_flood_readings
+    if (!warningConfig?.enabled && !readingConfig?.enabled) return []
+
+    const { collectUkEaFloodWarnings, collectUkEaFloodReadings } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+
+    try {
+      if (warningConfig?.enabled) {
+        const warnings = await collectUkEaFloodWarnings()
+        for (const w of warnings) {
+          data.push({
+            type: 'flood',
+            timestamp: w.timestamp,
+            location: w.floodArea || w.county,
+            measurement: {
+              severity_level: w.severityLevel,
+              flood_area: w.floodArea,
+              is_raised: w.isRaised,
+              description: w.description,
+            },
+            source: w.source,
+            priority: w.severityLevel <= 2 ? 'high' : 'normal',
+            family: 'flood_risk',
+            providerId: 'uk_ea_flood',
+            datasetId: 'uk_ea_flood_warnings',
+            queueLane: warningConfig.queueLane,
+            maxInFlight: warningConfig.maxInFlight,
+            coordinates: { lat: w.latitude, lon: w.longitude },
+          })
+        }
+      }
+
+      if (readingConfig?.enabled) {
+        const readings = await collectUkEaFloodReadings(readingConfig.chunkSize || 500)
+        for (const r of readings) {
+          data.push({
+            type: 'hydrology',
+            timestamp: r.timestamp,
+            location: r.stationName,
+            measurement: {
+              river_level_m: r.riverLevelM,
+              is_rising: r.isRising,
+              typical_range_high: r.typicalRangeHigh,
+              typical_range_low: r.typicalRangeLow,
+            },
+            source: r.source,
+            priority: 'normal',
+            family: 'hydrology',
+            providerId: 'uk_ea_flood',
+            datasetId: 'uk_ea_flood_readings',
+            queueLane: readingConfig.queueLane,
+            maxInFlight: readingConfig.maxInFlight,
+            stationId: r.stationRef,
+            coordinates: { lat: r.latitude, lon: r.longitude },
+          })
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching UK EA flood data:', error)
+    }
+    return data
+  }
+}
+
+// ─── GBIF Worker ─────────────────────────────────────────────────────────────
+
+export class GbifWorker extends BaseWorker {
+  constructor() {
+    super('GBIF')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.gbif_occurrences?.cadence.intervalMs || 30 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.gbif_occurrences
+    if (!config?.enabled) return []
+
+    const { collectGbifOccurrences } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectGbifOccurrences(config.chunkSize || 300)
+      for (const item of batch) {
+        data.push({
+          type: 'biodiversity',
+          timestamp: item.timestamp,
+          location: item.country || `${item.latitude.toFixed(2)},${item.longitude.toFixed(2)}`,
+          measurement: {
+            species: item.species,
+            scientific_name: item.scientificName,
+            kingdom: item.kingdom,
+            phylum: item.phylum,
+            observation_count: 1,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'biodiversity',
+          providerId: 'gbif',
+          datasetId: 'gbif_occurrences',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching GBIF data:', error)
+    }
+    return data
+  }
+}
+
+// ─── iNaturalist Worker ──────────────────────────────────────────────────────
+
+export class INaturalistWorker extends BaseWorker {
+  constructor() {
+    super('iNaturalist')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.inaturalist_observations?.cadence.intervalMs || 30 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.inaturalist_observations
+    if (!config?.enabled) return []
+
+    const { collectINaturalistObservations } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectINaturalistObservations(config.chunkSize || 200)
+      for (const item of batch) {
+        data.push({
+          type: 'biodiversity',
+          timestamp: item.timestamp,
+          location: item.placeGuess || `${item.latitude.toFixed(2)},${item.longitude.toFixed(2)}`,
+          measurement: {
+            species: item.species,
+            scientific_name: item.scientificName,
+            taxon_rank: item.taxonRank,
+            observation_count: 1,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'biodiversity',
+          providerId: 'inaturalist',
+          datasetId: 'inaturalist_observations',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching iNaturalist data:', error)
+    }
+    return data
+  }
+}
+
+// ─── OBIS Worker ─────────────────────────────────────────────────────────────
+
+export class ObisWorker extends BaseWorker {
+  constructor() {
+    super('OBIS')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.obis_occurrences?.cadence.intervalMs || 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.obis_occurrences
+    if (!config?.enabled) return []
+
+    const { collectObisOccurrences } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectObisOccurrences(config.chunkSize || 300)
+      for (const item of batch) {
+        data.push({
+          type: 'biodiversity',
+          timestamp: item.timestamp,
+          location: `${item.latitude.toFixed(2)},${item.longitude.toFixed(2)}`,
+          measurement: {
+            species: item.species,
+            scientific_name: item.scientificName,
+            phylum: item.phylum,
+            depth: item.depth,
+            observation_count: 1,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'biodiversity',
+          providerId: 'obis',
+          datasetId: 'obis_occurrences',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching OBIS data:', error)
+    }
+    return data
+  }
+}
+
+// ─── USFWS ECOS Worker ──────────────────────────────────────────────────────
+
+export class EcosWorker extends BaseWorker {
+  constructor() {
+    super('USFWS-ECOS')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.usfws_ecos_species?.cadence.intervalMs || 24 * 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.usfws_ecos_species
+    if (!config?.enabled) return []
+
+    const { collectEcosSpecies } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectEcosSpecies(config.chunkSize || 200)
+      for (const item of batch) {
+        data.push({
+          type: 'conservation',
+          timestamp: item.timestamp,
+          location: item.stateRange || 'US',
+          measurement: {
+            species: item.commonName,
+            scientific_name: item.scientificName,
+            listing_status: item.listingStatus,
+            family: item.family,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'conservation_status',
+          providerId: 'usfws_ecos',
+          datasetId: 'usfws_ecos_species',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching ECOS data:', error)
+    }
+    return data
+  }
+}
+
+// ─── NatureServe Worker ──────────────────────────────────────────────────────
+
+export class NatureServeWorker extends BaseWorker {
+  constructor() {
+    super('NatureServe')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.natureserve_species?.cadence.intervalMs || 24 * 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.natureserve_species
+    if (!config?.enabled) return []
+
+    const { collectNatureServeSpecies } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectNatureServeSpecies(config.chunkSize || 100)
+      for (const item of batch) {
+        data.push({
+          type: 'conservation',
+          timestamp: item.timestamp,
+          location: item.nation || 'North America',
+          measurement: {
+            species: item.commonName,
+            scientific_name: item.scientificName,
+            conservation_rank: item.globalRank,
+            population_trend: item.roundedGlobalRank,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'conservation_status',
+          providerId: 'natureserve',
+          datasetId: 'natureserve_species',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching NatureServe data:', error)
+    }
+    return data
+  }
+}
+
+// ─── NASA EONET Worker ───────────────────────────────────────────────────────
+
+export class NasaEonetWorker extends BaseWorker {
+  constructor() {
+    super('NASA-EONET')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.nasa_eonet_events?.cadence.intervalMs || 30 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.nasa_eonet_events
+    if (!config?.enabled) return []
+
+    const { collectNasaEonetEvents } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectNasaEonetEvents(config.chunkSize || 100)
+      for (const item of batch) {
+        data.push({
+          type: 'natural-event',
+          timestamp: item.timestamp,
+          location: item.title,
+          measurement: {
+            event_type: item.category,
+            category: item.category,
+            magnitude_value: item.magnitudeValue,
+            magnitude_unit: item.magnitudeUnit,
+          },
+          source: item.source,
+          priority: 'high',
+          family: 'natural_events',
+          providerId: 'nasa_eonet',
+          datasetId: 'nasa_eonet_events',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          eventId: item.eventId,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching NASA EONET data:', error)
+    }
+    return data
+  }
+}
+
+// ─── GFW Worker ──────────────────────────────────────────────────────────────
+
+export class GfwWorker extends BaseWorker {
+  constructor() {
+    super('Global-Forest-Watch')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.gfw_alerts?.cadence.intervalMs || 24 * 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.gfw_alerts
+    if (!config?.enabled) return []
+
+    const { collectGfwAlerts } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectGfwAlerts(config.chunkSize || 200)
+      for (const item of batch) {
+        data.push({
+          type: 'land-use',
+          timestamp: item.timestamp,
+          location: item.isoCountry || `${item.latitude.toFixed(2)},${item.longitude.toFixed(2)}`,
+          measurement: {
+            alert_confidence: item.confidence,
+            tree_cover_loss_ha: item.treeCoverLossHa,
+            disturbance_type: item.alertType,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'land_use_change',
+          providerId: 'global_forest_watch',
+          datasetId: 'gfw_alerts',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching GFW data:', error)
+    }
+    return data
+  }
+}
+
+// ─── USGS MRDS Worker ────────────────────────────────────────────────────────
+
+export class UsgsMrdsWorker extends BaseWorker {
+  constructor() {
+    super('USGS-MRDS')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.usgs_mrds_sites?.cadence.intervalMs || 7 * 24 * 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.usgs_mrds_sites
+    if (!config?.enabled) return []
+
+    const { collectUsgsMrdsSites } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectUsgsMrdsSites(config.chunkSize || 500)
+      for (const item of batch) {
+        data.push({
+          type: 'mining',
+          timestamp: item.timestamp,
+          location: item.siteName || `${item.state}, ${item.country}`,
+          measurement: {
+            commodity: item.commodity,
+            deposit_type: item.depositType,
+            development_status: item.developmentStatus,
+            site_name: item.siteName,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'mining_activity',
+          providerId: 'usgs_mrds',
+          datasetId: 'usgs_mrds_sites',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching USGS MRDS data:', error)
+    }
+    return data
+  }
+}
+
+// ─── International Planning Worker (umbrella for all planning providers) ───────
+
+const PLANNING_COLLECTOR_MAP: Record<string, (limit: number) => Promise<Array<{
+  timestamp: number
+  source: string
+  applicationRef?: string
+  proposal?: string
+  decisionDate?: string | null
+  latitude?: number | null
+  longitude?: number | null
+  organisationEntity?: string
+  entryDate?: string
+  [k: string]: unknown
+}>>> = {
+  uk_planning: async (limit) => {
+    const { collectUkPlanningApplications } = await import('./data-collector')
+    return collectUkPlanningApplications(limit)
+  },
+  scotland_planning: async (limit) => {
+    const { collectScotlandPlanningApplications } = await import('./data-collector')
+    return collectScotlandPlanningApplications(limit)
+  },
+  nsw_planning: async (limit) => {
+    const { collectNswPlanningApplications } = await import('./data-collector')
+    return collectNswPlanningApplications(limit)
+  },
+}
+
+export class InternationalPlanningWorker extends BaseWorker {
+  constructor() {
+    super('International-Planning')
+  }
+
+  protected getIntervalMs(): number {
+    const planningConfigs = Object.values(datasetConfigs).filter(
+      (c) => c.family === 'planning_development' && c.enabled,
+    )
+    const first = planningConfigs[0]
+    return first?.cadence.intervalMs ?? 24 * 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const planningConfigs = Object.values(datasetConfigs).filter(
+      (c) => c.family === 'planning_development' && c.enabled,
+    )
+    if (planningConfigs.length === 0) return []
+
+    const data: EnvironmentalData[] = []
+
+    for (const config of planningConfigs) {
+      const collector = PLANNING_COLLECTOR_MAP[config.providerId]
+      if (!collector) continue
+
+      try {
+        const batch = await collector(config.chunkSize || 200)
+        for (const item of batch) {
+          data.push({
+            type: 'planning',
+            timestamp: item.timestamp,
+            location: item.applicationRef ?? item.organisationEntity ?? config.providerId,
+            measurement: {
+              application_ref: item.applicationRef,
+              proposal: item.proposal,
+              decision_date: item.decisionDate,
+              status: (item as { entryDate?: string }).entryDate ? 'recorded' : null,
+            },
+            source: item.source,
+            priority: 'normal',
+            family: 'planning_development',
+            providerId: config.providerId as ProviderId,
+            datasetId: config.id,
+            queueLane: config.queueLane,
+            maxInFlight: config.maxInFlight,
+            coordinates: item.latitude != null && item.longitude != null
+              ? { lat: item.latitude, lon: item.longitude }
+              : undefined,
+          })
+        }
+      } catch (error) {
+        console.error(`Error fetching ${config.providerId} planning data:`, error)
+      }
+    }
+
+    return data
+  }
+}
+
+// ─── OpenSky Worker ──────────────────────────────────────────────────────────
+
+export class OpenSkyWorker extends BaseWorker {
+  constructor() {
+    super('OpenSky')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.opensky_states?.cadence.intervalMs || 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.opensky_states
+    if (!config?.enabled) return []
+
+    const { collectOpenSkyStates } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectOpenSkyStates(config.chunkSize || 1000)
+      for (const item of batch) {
+        data.push({
+          type: 'transport',
+          timestamp: item.timestamp,
+          location: item.originCountry || `${item.latitude.toFixed(1)},${item.longitude.toFixed(1)}`,
+          measurement: {
+            icao24: item.icao24,
+            callsign: item.callsign,
+            origin_country: item.originCountry,
+            velocity_ms: item.velocityMs,
+            altitude_m: item.altitudeM,
+            heading: item.heading,
+            on_ground: item.onGround,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'transport_tracking',
+          providerId: 'opensky',
+          datasetId: 'opensky_states',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching OpenSky data:', error)
+    }
+    return data
+  }
+}
+
+// ─── AISStream Worker ────────────────────────────────────────────────────────
+
+export class AisStreamWorker extends BaseWorker {
+  private streamStarted = false
+
+  constructor() {
+    super('AISStream')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.aisstream_vessels?.cadence.intervalMs || 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.aisstream_vessels
+    if (!config?.enabled) return []
+
+    const { startAisStream, getAisBufferSnapshot } = await import('./data-collector')
+    if (!this.streamStarted) {
+      startAisStream()
+      this.streamStarted = true
+    }
+
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = getAisBufferSnapshot(config.chunkSize || 500)
+      for (const item of batch) {
+        data.push({
+          type: 'transport',
+          timestamp: item.timestamp,
+          location: item.vesselName || item.mmsi,
+          measurement: {
+            mmsi: item.mmsi,
+            vessel_name: item.vesselName,
+            ship_type: item.shipType,
+            heading: item.heading,
+            course: item.course,
+            speed: item.speed,
+            destination: item.destination,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'transport_tracking',
+          providerId: 'aisstream',
+          datasetId: 'aisstream_vessels',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error processing AIS data:', error)
+    }
+    return data
+  }
+}
+
+// ─── Movebank Worker ─────────────────────────────────────────────────────────
+
+export class MovebankWorker extends BaseWorker {
+  constructor() {
+    super('Movebank')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.movebank_tracking?.cadence.intervalMs || 6 * 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.movebank_tracking
+    if (!config?.enabled) return []
+
+    const { collectMovebankTracking } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectMovebankTracking(config.chunkSize || 200)
+      for (const item of batch) {
+        data.push({
+          type: 'biodiversity',
+          timestamp: item.timestamp,
+          location: item.taxon || item.studyName,
+          measurement: {
+            species: item.taxon,
+            study_name: item.studyName,
+            study_id: item.studyId,
+            individual_id: item.individualId,
+            individual_local_id: item.individualLocalId,
+            altitude_m: item.altitudeM,
+            ground_speed: item.groundSpeed,
+            heading: item.heading,
+            visible: item.visible,
+            event_attributes: item.eventAttributes,
+            individual_attributes: item.individualAttributes,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'biodiversity',
+          providerId: 'movebank',
+          datasetId: 'movebank_tracking',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching Movebank data:', error)
+    }
+    return data
+  }
+}
+
 // Worker Manager
 export class WorkerManager {
   private workers: Map<string, BaseWorker> = new Map()
@@ -1507,6 +2522,25 @@ export class WorkerManager {
       const geomagWorker = new GeomagnetismWorker()
       const volcanoWorker = new VolcanoWorker()
       const upperAtmosphereWorker = new UpperAtmosphereWorker()
+      const opensensemapWorker = new OpenSenseMapWorker()
+      const intermagnetWorker = new IntermagnetWorker()
+      const irisWorker = new IrisWorker()
+      const nasaPowerWorker = new NasaPowerWorker()
+      const camsWorker = new CopernicusCamsWorker()
+      const usgsWaterWorker = new UsgsWaterWorker()
+      const ukEaFloodWorker = new UkEaFloodWorker()
+      const gbifWorker = new GbifWorker()
+      const inatWorker = new INaturalistWorker()
+      const obisWorker = new ObisWorker()
+      const ecosWorker = new EcosWorker()
+      const natureserveWorker = new NatureServeWorker()
+      const eonetWorker = new NasaEonetWorker()
+      const gfwWorker = new GfwWorker()
+      const mrdsWorker = new UsgsMrdsWorker()
+      const openskyWorker = new OpenSkyWorker()
+      const aisWorker = new AisStreamWorker()
+      const movebankWorker = new MovebankWorker()
+      const internationalPlanningWorker = new InternationalPlanningWorker()
 
       this.workers.set('waqi-environmental', waqiWorker)
       this.workers.set('noaa-weather', noaaWorker)
@@ -1520,6 +2554,25 @@ export class WorkerManager {
       this.workers.set('geomagnetism', geomagWorker)
       this.workers.set('volcanoes', volcanoWorker)
       this.workers.set('upper-atmosphere', upperAtmosphereWorker)
+      this.workers.set('opensensemap', opensensemapWorker)
+      this.workers.set('intermagnet', intermagnetWorker)
+      this.workers.set('iris-earthscope', irisWorker)
+      this.workers.set('nasa-power', nasaPowerWorker)
+      this.workers.set('copernicus-cams', camsWorker)
+      this.workers.set('usgs-water', usgsWaterWorker)
+      this.workers.set('uk-ea-flood', ukEaFloodWorker)
+      this.workers.set('gbif', gbifWorker)
+      this.workers.set('inaturalist', inatWorker)
+      this.workers.set('obis', obisWorker)
+      this.workers.set('usfws-ecos', ecosWorker)
+      this.workers.set('natureserve', natureserveWorker)
+      this.workers.set('nasa-eonet', eonetWorker)
+      this.workers.set('global-forest-watch', gfwWorker)
+      this.workers.set('usgs-mrds', mrdsWorker)
+      this.workers.set('opensky', openskyWorker)
+      this.workers.set('aisstream', aisWorker)
+      this.workers.set('movebank', movebankWorker)
+      this.workers.set('international-planning', internationalPlanningWorker)
 
       this.isInitialized = true
       try { console.log(`✅ Worker Manager initialized with ${this.workers.size} workers`) } catch {}

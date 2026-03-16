@@ -3318,6 +3318,78 @@ export function startAisStream(): void {
 }
 
 // ─── Movebank Animal Tracking ────────────────────────────────────────────────
+// Aligned with Movebank REST API: https://github.com/movebank/movebank-api-doc
+// Uses direct-read (CSV) with api-token or Basic auth. Fetches events + individuals.
+
+const MOVEBANK_BASE = 'https://www.movebank.org/movebank/service/direct-read'
+const MOVEBANK_MAX_STUDIES = 5
+const MOVEBANK_MAX_EVENTS_PER_STUDY = 500
+
+function parseCSVLine(line: string): string[] {
+  const result: string[] = []
+  let i = 0
+  while (i < line.length) {
+    if (line[i] === '"') {
+      let end = i + 1
+      while (end < line.length) {
+        if (line[end] === '"') {
+          if (line[end + 1] === '"') {
+            end += 2
+            continue
+          }
+          break
+        }
+        end++
+      }
+      result.push(line.slice(i + 1, end).replace(/""/g, '"'))
+      i = end + 1
+      if (line[i] === ',') i++
+    } else {
+      const comma = line.indexOf(',', i)
+      if (comma === -1) {
+        result.push(line.slice(i).trim())
+        break
+      }
+      result.push(line.slice(i, comma).trim())
+      i = comma + 1
+    }
+  }
+  return result
+}
+
+function parseCSV(text: string): Record<string, string>[] {
+  const lines = text.trim().split(/\r?\n/).filter(Boolean)
+  if (lines.length < 2) return []
+  const header = parseCSVLine(lines[0])
+  const out: Record<string, string>[] = []
+  for (let i = 1; i < lines.length; i++) {
+    const values = parseCSVLine(lines[i])
+    const row: Record<string, string> = {}
+    header.forEach((h, j) => {
+      row[h] = values[j] ?? ''
+    })
+    out.push(row)
+  }
+  return out
+}
+
+function buildMovebankAuth(): { headers?: Record<string, string>; tokenParam?: string } {
+  const user = process.env.MOVEBANK_USERNAME?.trim()
+  const pass = process.env.MOVEBANK_PASSWORD?.trim()
+  const apiKey = process.env.MOVEBANK_API_KEY?.trim()
+  if (user && pass) {
+    const encoded = Buffer.from(`${user}:${pass}`, 'utf-8').toString('base64')
+    return { headers: { 'Authorization': `Basic ${encoded}` } }
+  }
+  if (apiKey?.includes(':')) {
+    const encoded = Buffer.from(apiKey, 'utf-8').toString('base64')
+    return { headers: { 'Authorization': `Basic ${encoded}` } }
+  }
+  if (apiKey) {
+    return { tokenParam: apiKey }
+  }
+  return {}
+}
 
 export interface MovebankTrack {
   timestamp: number
@@ -3325,54 +3397,141 @@ export interface MovebankTrack {
   studyId: string
   studyName: string
   individualId: string
+  individualLocalId: string
   taxon: string
   latitude: number
   longitude: number
   altitudeM?: number | null
   groundSpeed?: number | null
   heading?: number | null
+  visible?: boolean
+  /** All event-level attributes (sensor-dependent) */
+  eventAttributes: Record<string, unknown>
+  /** All individual reference data (animal metadata) */
+  individualAttributes: Record<string, unknown>
 }
 
 export async function collectMovebankTracking(limit: number = 200): Promise<MovebankTrack[]> {
-  const apiKey = process.env.MOVEBANK_API_KEY
-  if (!apiKey) return []
+  const auth = buildMovebankAuth()
+  if (!auth.headers && !auth.tokenParam) return []
 
-  const url = `https://www.movebank.org/movebank/service/public/json?entity_type=event&max_events_per_individual=1&limit=${limit}`
-  const data = await fetchJsonWithRetry<any>(url, {
-    retries: 1,
-    providerId: 'movebank',
-    timeoutMs: 30000,
-    headers: { 'Authorization': `Bearer ${apiKey}` },
-  })
-
-  const events = Array.isArray(data) ? data : (Array.isArray(data?.individuals) ? data.individuals : [])
+  const tokenParam = auth.tokenParam ? `&api-token=${encodeURIComponent(auth.tokenParam)}` : ''
   const out: MovebankTrack[] = []
 
-  for (const ev of events) {
-    if (out.length >= limit) break
-    const lat = ev?.location_lat ?? ev?.latitude
-    const lon = ev?.location_long ?? ev?.longitude
-    if (lat == null || lon == null) continue
-
-    const ts = ev?.timestamp ? new Date(ev.timestamp).getTime() : Date.now()
-    if (isNaN(ts)) continue
-
-    const key = `movebank:${ev.individual_id || ev.id}:${ts}`
-    if (!(await dedupeStore.add(key))) continue
-
-    out.push({
-      timestamp: ts,
-      source: 'Movebank',
-      studyId: String(ev.study_id || ''),
-      studyName: ev.study_name || '',
-      individualId: String(ev.individual_id || ev.id || ''),
-      taxon: ev.individual_taxon_canonical_name || ev.taxon || '',
-      latitude: lat,
-      longitude: lon,
-      altitudeM: parseNumericValue(ev.height_above_ellipsoid) ?? null,
-      groundSpeed: parseNumericValue(ev.ground_speed) ?? null,
-      heading: parseNumericValue(ev.heading) ?? null,
+  try {
+    const studiesUrl = `${MOVEBANK_BASE}?entity_type=study&i_have_download_access=true&attributes=id,name${tokenParam}`
+    const studiesText = await fetchTextWithRetry(studiesUrl, {
+      retries: 1,
+      providerId: 'movebank',
+      timeoutMs: 30000,
+      headers: auth.headers ?? {},
     })
+    if (studiesText.trim().startsWith('<')) {
+      console.warn('Movebank: Received HTML instead of CSV (license terms or error). Accept terms at movebank.org or check credentials.')
+      return []
+    }
+    const studies = parseCSV(studiesText)
+    const studyIds = studies
+      .map(s => parseNumericValue(s.id))
+      .filter((id): id is number => id !== undefined && id > 0)
+      .slice(0, MOVEBANK_MAX_STUDIES)
+
+    for (const studyId of studyIds) {
+      if (out.length >= limit) break
+      const studyRow = studies.find(s => String(parseNumericValue(s.id)) === String(studyId))
+      const studyName = studyRow?.name ?? `study_${studyId}`
+
+      const individualsUrl = `${MOVEBANK_BASE}?entity_type=individual&study_id=${studyId}&attributes=all${tokenParam}`
+      let individuals: Record<string, string>[] = []
+      try {
+        const indText = await fetchTextWithRetry(individualsUrl, {
+          retries: 1,
+          providerId: 'movebank',
+          timeoutMs: 30000,
+          headers: auth.headers ?? {},
+        })
+        individuals = parseCSV(indText)
+      } catch {
+        // Individual fetch optional; continue with events only
+      }
+
+      const eventsUrl = `${MOVEBANK_BASE}?entity_type=event&study_id=${studyId}&attributes=all${tokenParam}`
+      let events: Record<string, string>[] = []
+      try {
+        const evText = await fetchTextWithRetry(eventsUrl, {
+          retries: 1,
+          providerId: 'movebank',
+          timeoutMs: 60000,
+          headers: auth.headers ?? {},
+        })
+        events = parseCSV(evText).slice(0, MOVEBANK_MAX_EVENTS_PER_STUDY)
+      } catch {
+        continue
+      }
+
+      const indById = new Map<string, Record<string, string>>()
+      for (const ind of individuals) {
+        const id = ind.id ?? ind.local_identifier
+        if (id) indById.set(String(id), ind)
+      }
+
+      for (const ev of events) {
+        if (out.length >= limit) break
+        const lat = parseNumericValue(ev.location_lat ?? ev.latitude)
+        const lon = parseNumericValue(ev.location_long ?? ev.longitude)
+        if (lat == null || lon == null) continue
+
+        const tsRaw = ev.timestamp ?? ev['event-timestamp']
+        const ts = tsRaw ? new Date(tsRaw).getTime() : Date.now()
+        if (isNaN(ts)) continue
+
+        const individualId = ev.individual_id ?? ev.individualId ?? ''
+        const key = `movebank:${studyId}:${individualId}:${ts}`
+        if (!(await dedupeStore.add(key))) continue
+
+        const visibleStr = (ev.visible ?? '').toLowerCase()
+        const visible = visibleStr === 'true' || visibleStr === '1'
+
+        const eventAttributes: Record<string, unknown> = {}
+        for (const [k, v] of Object.entries(ev)) {
+          if (k && v !== '' && v != null) {
+            const num = parseNumericValue(v)
+            eventAttributes[k] = num !== undefined ? num : v
+          }
+        }
+
+        const ind = indById.get(String(individualId))
+        const individualAttributes: Record<string, unknown> = {}
+        if (ind) {
+          for (const [k, v] of Object.entries(ind)) {
+            if (k && v !== '' && v != null) {
+              const num = parseNumericValue(v)
+              individualAttributes[k] = num !== undefined ? num : v
+            }
+          }
+        }
+
+        out.push({
+          timestamp: ts,
+          source: 'Movebank',
+          studyId: String(studyId),
+          studyName,
+          individualId: String(individualId),
+          individualLocalId: String(ev.individual_local_identifier ?? ind?.local_identifier ?? ''),
+          taxon: ev.individual_taxon_canonical_name ?? ind?.individual_taxon_canonical_name ?? '',
+          latitude: lat,
+          longitude: lon,
+          altitudeM: parseNumericValue(ev.height_above_ellipsoid) ?? null,
+          groundSpeed: parseNumericValue(ev.ground_speed) ?? null,
+          heading: parseNumericValue(ev.heading) ?? null,
+          visible,
+          eventAttributes,
+          individualAttributes,
+        })
+      }
+    }
+  } catch (error) {
+    console.error('Movebank fetch error:', error)
   }
   return out
 }

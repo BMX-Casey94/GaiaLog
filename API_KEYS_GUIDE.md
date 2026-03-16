@@ -49,8 +49,8 @@ With `GAIALOG_ROLLOUT_GATE=gate_d`, all implemented providers are enabled. Apply
 
 ### Movebank (Animal Tracking)
 - **Signup:** Create account at https://www.movebank.org/ and request API access
-- **Env var:** `MOVEBANK_API_KEY`
-- **Notes:** GaiaLog uses the **Movebank REST API** (`/movebank/service/public/json`) to fetch event data from studies. The [live data feeds](https://www.movebank.org/cms/movebank-content/live-data-feeds) are a separate feature (tag manufacturers pushing data into Movebank); we read via the API from studies that already have data. Token-based auth. Rate limit: 1 concurrent request per IP. Contact support@movebank.org for exemptions. See: https://github.com/movebank/movebank-api-doc
+- **Env vars:** `MOVEBANK_USERNAME` + `MOVEBANK_PASSWORD` (recommended), or `MOVEBANK_API_KEY` (api-token from request-token, or `user:pass` for Basic auth)
+- **Notes:** GaiaLog uses the **Movebank direct-read API** (CSV) per [movebank-api-doc](https://github.com/movebank/movebank-api-doc). Fetches studies with download access, then events with `attributes=all` and individual reference data. Fetches full event metrics (location, speed, heading, temperature, etc.) + animal metadata (species, sex, etc.). Rate limit: 1 concurrent request per IP. Contact support@movebank.org for exemptions.
 
 ### Planning Alerts AU (NSW / Australia-wide)
 - **Signup:** https://www.planningalerts.org.au/users/sign_up
@@ -92,7 +92,7 @@ With `GAIALOG_ROLLOUT_GATE=gate_d`, all implemented providers are enabled. Apply
 | Copernicus CAMS| `COPERNICUS_CAMS_API_KEY` | https://ads.atmosphere.copernicus.eu/           |
 | Global Forest Watch | `GFW_API_KEY`        | https://www.globalforestwatch.org/my-gfw        |
 | AISStream      | `AISSTREAM_API_KEY`       | https://aisstream.io/authenticate               |
-| Movebank       | `MOVEBANK_API_KEY`        | https://www.movebank.org/ (then request API)    |
+| Movebank       | `MOVEBANK_USERNAME`, `MOVEBANK_PASSWORD` or `MOVEBANK_API_KEY` | https://www.movebank.org/ (then request API)    |
 | Planning Alerts AU | `PLANNING_ALERTS_AU_API_KEY` | https://www.planningalerts.org.au/users/sign_up |
 | OpenSky        | `OPENSKY_USERNAME`, `OPENSKY_PASSWORD` | https://opensky-network.org/           |
 | WhatsOnChain   | `WHATSONCHAIN_API_KEY`    | https://www.whatsonchain.com/developers         |
