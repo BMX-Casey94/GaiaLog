@@ -57,6 +57,12 @@ export function getOverlayClientAuthConfig(): OverlayClientAuthConfig {
     return { mode: 'none', identityWif }
   }
 
+  const lookupUrl = String(process.env.BSV_OVERLAY_LOOKUP_URL || '').trim()
+  const isLocalhost = /^https?:\/\/(127\.0\.0\.1|localhost|::1)(:|\/|$)/.test(lookupUrl)
+  if (isLocalhost) {
+    return { mode: 'none', identityWif }
+  }
+
   if (requestedMode === 'brc104' || identityWif) {
     return { mode: 'brc104', identityWif }
   }

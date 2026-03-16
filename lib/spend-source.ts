@@ -264,6 +264,7 @@ function getOverlayAuthFetch(): AuthFetch | null {
 
   const authConfig = getOverlayClientAuthConfig()
   if (authConfig.mode !== 'brc104') {
+    console.log(`💸 Spend source: overlay auth mode=${authConfig.mode} (no AuthFetch)`)
     overlayAuthFetchSingleton = null
     return overlayAuthFetchSingleton
   }
@@ -272,6 +273,7 @@ function getOverlayAuthFetch(): AuthFetch | null {
     throw new Error('BSV_OVERLAY_CLIENT_IDENTITY_WIF is required when BSV_OVERLAY_AUTH_MODE=brc104')
   }
 
+  console.log('💸 Spend source: overlay auth mode=brc104 (AuthFetch enabled)')
   overlayAuthFetchSingleton = new AuthFetch(
     new ProtoWallet(SDKPrivateKey.fromWif(authConfig.identityWif)) as any,
   )
