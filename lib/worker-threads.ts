@@ -1958,15 +1958,28 @@ export class UkEaFloodWorker extends BaseWorker {
       if (readingConfig?.enabled) {
         const readings = await collectUkEaFloodReadings(readingConfig.chunkSize || 500)
         for (const r of readings) {
+          const hasCoordinates = Number.isFinite(r.latitude) && Number.isFinite(r.longitude)
           data.push({
             type: 'hydrology',
             timestamp: r.timestamp,
-            location: r.stationName,
+            location: r.stationName || r.riverName || r.stationRef,
             measurement: {
               river_level_m: r.riverLevelM,
               is_rising: r.isRising,
               typical_range_high: r.typicalRangeHigh,
               typical_range_low: r.typicalRangeLow,
+              station_reference: r.stationRef,
+              station_name: r.stationName,
+              river_name: r.riverName,
+              town: r.town,
+              catchment_name: r.catchmentName,
+              ea_area_name: r.eaAreaName,
+              station_status: r.stationStatus,
+              parameter: r.parameter,
+              parameter_name: r.parameterName,
+              qualifier: r.qualifier,
+              unit_name: r.unitName,
+              measure_id: r.measureId,
             },
             source: r.source,
             priority: 'normal',
@@ -1976,7 +1989,9 @@ export class UkEaFloodWorker extends BaseWorker {
             queueLane: readingConfig.queueLane,
             maxInFlight: readingConfig.maxInFlight,
             stationId: r.stationRef,
-            coordinates: { lat: r.latitude, lon: r.longitude },
+            coordinates: hasCoordinates
+              ? { lat: r.latitude as number, lon: r.longitude as number }
+              : undefined,
           })
         }
       }

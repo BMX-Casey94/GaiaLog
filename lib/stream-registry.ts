@@ -140,7 +140,15 @@ export const DATA_FAMILY_DESCRIPTORS = {
     color: 'blue',
     glowColor: 'cyan',
     accent: 'text-blue-300',
-    metricPreviewKeys: ['discharge_cfs', 'gage_height_ft', 'water_temperature_c', 'dissolved_oxygen_mg_l'],
+    metricPreviewKeys: [
+      'river_level_m',
+      'discharge_cfs',
+      'gage_height_ft',
+      'water_temperature_c',
+      'dissolved_oxygen_mg_l',
+      'river_name',
+      'station_name',
+    ],
   },
   flood_risk: {
     id: 'flood_risk',

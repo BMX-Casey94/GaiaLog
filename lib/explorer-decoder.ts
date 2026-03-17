@@ -60,7 +60,9 @@ const METRIC_PREVIEW_KEYS = new Set([
   'listing_status', 'threat_category', 'population_trend', 'conservation_rank',
   // hydrology
   'discharge_cfs', 'gage_height_ft', 'water_temperature_c', 'dissolved_oxygen_mg_l',
-  'specific_conductance', 'ph', 'turbidity_ntu',
+  'specific_conductance', 'ph', 'turbidity_ntu', 'river_level_m', 'typical_range_high', 'typical_range_low',
+  'station_reference', 'station_name', 'river_name', 'town', 'catchment_name',
+  'ea_area_name', 'station_status', 'parameter', 'parameter_name', 'qualifier', 'unit_name', 'measure_id',
   // flood risk
   'severity_level', 'flood_area', 'river_level_m', 'is_rising',
   // land-use change

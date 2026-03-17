@@ -2407,15 +2407,172 @@ export interface UkEaFloodReading {
   source: string
   stationRef: string
   stationName: string
-  latitude: number
-  longitude: number
+  latitude: number | null
+  longitude: number | null
   riverLevelM?: number | null
   isRising?: boolean | null
   typicalRangeHigh?: number | null
   typicalRangeLow?: number | null
+  parameter?: string
+  parameterName?: string
+  qualifier?: string
+  unitName?: string
+  measureId?: string
+  riverName?: string
+  town?: string
+  catchmentName?: string
+  eaAreaName?: string
+  stationStatus?: string
 }
 
 const _ukEaWm = { ts: 0 }
+const UK_EA_STATION_CACHE_KEY = 'uk_ea:station_index:v1'
+const UK_EA_STATION_CACHE_TTL_MS = 12 * 60 * 60 * 1000
+const UK_EA_STATION_PAGE_SIZE = 2000
+const UK_EA_STATION_MAX_PAGES = 10
+const _ukEaStationIndexState: { loadedAt: number; byRef: Map<string, UkEaStationMeta> } = {
+  loadedAt: 0,
+  byRef: new Map(),
+}
+
+interface UkEaStationMeta {
+  stationRef: string
+  stationName: string
+  latitude: number | null
+  longitude: number | null
+  riverName: string
+  town: string
+  catchmentName: string
+  eaAreaName: string
+  status: string
+}
+
+function normaliseAsciiText(value: unknown): string {
+  if (value == null) return ''
+  return String(value)
+    .normalize('NFKD')
+    .replace(/[^\x20-\x7E]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function parseUkEaStatus(value: unknown): string {
+  const raw = normaliseAsciiText(value)
+  if (!raw) return ''
+  const suffix = raw.split('/').filter(Boolean).pop() || raw
+  const stripped = suffix.replace(/^status/i, '')
+  if (!stripped) return raw
+  return stripped.charAt(0).toUpperCase() + stripped.slice(1)
+}
+
+function parseUkEaMeasureId(measure: unknown): string {
+  if (typeof measure === 'string') {
+    return normaliseAsciiText(measure.split('/').filter(Boolean).pop() || '')
+  }
+  if (measure && typeof measure === 'object') {
+    return normaliseAsciiText(String((measure as any)?.['@id'] || '').split('/').filter(Boolean).pop() || '')
+  }
+  return ''
+}
+
+function parseUkEaStationRefFromMeasureId(measureId: string): string {
+  const token = normaliseAsciiText(measureId)
+  if (!token) return ''
+  const sep = token.indexOf('-')
+  return sep > 0 ? token.slice(0, sep) : ''
+}
+
+function hydrateUkEaStationIndex(raw: unknown): Map<string, UkEaStationMeta> {
+  const index = new Map<string, UkEaStationMeta>()
+  if (!raw || typeof raw !== 'object') return index
+
+  for (const [key, value] of Object.entries(raw as Record<string, any>)) {
+    const stationRef = normaliseAsciiText(value?.stationRef || key)
+    if (!stationRef) continue
+    const latitude = parseNumericValue(value?.latitude) ?? null
+    const longitude = parseNumericValue(value?.longitude) ?? null
+    index.set(stationRef, {
+      stationRef,
+      stationName: normaliseAsciiText(value?.stationName) || stationRef,
+      latitude,
+      longitude,
+      riverName: normaliseAsciiText(value?.riverName),
+      town: normaliseAsciiText(value?.town),
+      catchmentName: normaliseAsciiText(value?.catchmentName),
+      eaAreaName: normaliseAsciiText(value?.eaAreaName),
+      status: normaliseAsciiText(value?.status),
+    })
+  }
+
+  return index
+}
+
+function serialiseUkEaStationIndex(index: Map<string, UkEaStationMeta>): Record<string, UkEaStationMeta> {
+  return Object.fromEntries(index.entries())
+}
+
+async function fetchUkEaStationIndex(): Promise<Map<string, UkEaStationMeta>> {
+  const index = new Map<string, UkEaStationMeta>()
+  let offset = 0
+
+  for (let page = 0; page < UK_EA_STATION_MAX_PAGES; page++) {
+    const url = `https://environment.data.gov.uk/flood-monitoring/id/stations?_limit=${UK_EA_STATION_PAGE_SIZE}&_offset=${offset}`
+    const payload = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'uk_ea_flood', timeoutMs: 30000 })
+    const items = Array.isArray(payload?.items) ? payload.items : []
+    if (items.length === 0) break
+
+    for (const item of items) {
+      const stationRef = normaliseAsciiText(item?.stationReference || item?.notation || item?.RLOIid)
+      if (!stationRef) continue
+      const latitude = parseNumericValue(item?.lat) ?? null
+      const longitude = parseNumericValue(item?.long) ?? null
+      index.set(stationRef, {
+        stationRef,
+        stationName: normaliseAsciiText(item?.label) || stationRef,
+        latitude,
+        longitude,
+        riverName: normaliseAsciiText(item?.riverName),
+        town: normaliseAsciiText(item?.town),
+        catchmentName: normaliseAsciiText(item?.catchmentName),
+        eaAreaName: normaliseAsciiText(item?.eaAreaName),
+        status: parseUkEaStatus(item?.status),
+      })
+    }
+
+    offset += items.length
+    if (items.length < UK_EA_STATION_PAGE_SIZE) break
+  }
+
+  return index
+}
+
+async function getUkEaStationIndex(): Promise<Map<string, UkEaStationMeta>> {
+  const now = Date.now()
+  if (_ukEaStationIndexState.byRef.size > 0 && (now - _ukEaStationIndexState.loadedAt) < UK_EA_STATION_CACHE_TTL_MS) {
+    return _ukEaStationIndexState.byRef
+  }
+
+  const cached = hydrateUkEaStationIndex(await cacheStore.get<Record<string, UkEaStationMeta>>(UK_EA_STATION_CACHE_KEY))
+  if (cached.size > 0) {
+    _ukEaStationIndexState.byRef = cached
+    _ukEaStationIndexState.loadedAt = now
+    return cached
+  }
+
+  try {
+    const fresh = await fetchUkEaStationIndex()
+    if (fresh.size > 0) {
+      _ukEaStationIndexState.byRef = fresh
+      _ukEaStationIndexState.loadedAt = now
+      await cacheStore.set(UK_EA_STATION_CACHE_KEY, serialiseUkEaStationIndex(fresh), UK_EA_STATION_CACHE_TTL_MS)
+      return fresh
+    }
+  } catch (error) {
+    console.warn('UK EA station index refresh failed; proceeding with available cache:', error)
+  }
+
+  return _ukEaStationIndexState.byRef
+}
 
 export async function collectUkEaFloodWarnings(): Promise<UkEaFloodWarning[]> {
   const url = 'https://environment.data.gov.uk/flood-monitoring/id/floods?_limit=200'
@@ -2450,7 +2607,8 @@ export async function collectUkEaFloodWarnings(): Promise<UkEaFloodWarning[]> {
 }
 
 export async function collectUkEaFloodReadings(limit: number = 500): Promise<UkEaFloodReading[]> {
-  const url = 'https://environment.data.gov.uk/flood-monitoring/data/readings?_sorted&_limit=2000&latest'
+  const stationIndex = await getUkEaStationIndex()
+  const url = 'https://environment.data.gov.uk/flood-monitoring/data/readings?latest&_view=full&_limit=10000'
   const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'uk_ea_flood', timeoutMs: 30000 })
   const items = Array.isArray(data?.items) ? data.items : []
 
@@ -2465,21 +2623,50 @@ export async function collectUkEaFloodReadings(limit: number = 500): Promise<UkE
     if (isNaN(ts) || ts <= lastSeen) continue
     if (ts > maxTs) maxTs = ts
 
-    const stationRef = item?.measure?.station?.stationReference || ''
+    const measure = item?.measure
+    const measureObj = measure && typeof measure === 'object' ? measure as any : null
+    const measureId = parseUkEaMeasureId(measureObj || measure)
+    const stationRef = normaliseAsciiText(measureObj?.stationReference) || parseUkEaStationRefFromMeasureId(measureId)
+    if (!stationRef) continue
     const key = `ukea:read:${stationRef}:${dateStr}`
     if (!(await dedupeStore.add(key))) continue
+
+    const stationMeta = stationIndex.get(stationRef)
+    const measureStation = measureObj?.station && typeof measureObj.station === 'object' ? measureObj.station : null
+    let latitude = stationMeta?.latitude ?? parseNumericValue(measureStation?.lat) ?? parseNumericValue(measureStation?.latitude) ?? null
+    let longitude = stationMeta?.longitude ?? parseNumericValue(measureStation?.long) ?? parseNumericValue(measureStation?.lon) ?? parseNumericValue(measureStation?.longitude) ?? null
+    if (latitude === 0 && longitude === 0) {
+      latitude = null
+      longitude = null
+    }
+
+    const stationName = normaliseAsciiText(
+      stationMeta?.stationName ||
+      measureStation?.label ||
+      stationRef
+    ) || stationRef
 
     out.push({
       timestamp: ts,
       source: 'UK Environment Agency',
       stationRef,
-      stationName: item?.measure?.station?.label || stationRef,
-      latitude: parseFloat(item?.measure?.station?.lat) || 0,
-      longitude: parseFloat(item?.measure?.station?.long) || 0,
+      stationName,
+      latitude,
+      longitude,
       riverLevelM: parseNumericValue(item?.value) ?? null,
       isRising: null,
-      typicalRangeHigh: parseNumericValue(item?.measure?.station?.typicalRangeHigh) ?? null,
-      typicalRangeLow: parseNumericValue(item?.measure?.station?.typicalRangeLow) ?? null,
+      typicalRangeHigh: parseNumericValue(measureStation?.typicalRangeHigh) ?? null,
+      typicalRangeLow: parseNumericValue(measureStation?.typicalRangeLow) ?? null,
+      parameter: normaliseAsciiText(measureObj?.parameter),
+      parameterName: normaliseAsciiText(measureObj?.parameterName),
+      qualifier: normaliseAsciiText(measureObj?.qualifier),
+      unitName: normaliseAsciiText(measureObj?.unitName),
+      measureId,
+      riverName: stationMeta?.riverName || '',
+      town: stationMeta?.town || '',
+      catchmentName: stationMeta?.catchmentName || '',
+      eaAreaName: stationMeta?.eaAreaName || '',
+      stationStatus: stationMeta?.status || '',
     })
   }
   if (maxTs > lastSeen) _ukEaWm.ts = maxTs
