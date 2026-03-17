@@ -4,7 +4,7 @@ import { useEffect, useState } from "react"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { ExternalLink, Clock, Hash, Wallet, Shield } from "lucide-react"
+import { ExternalLink, Clock, Hash, MapPin, Wallet, Shield } from "lucide-react"
 import {
   Dialog,
   DialogContent,
@@ -12,31 +12,21 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { getBSVNetwork, getBSVExplorerUrl, getBSVAddressUrl, isValidTxId } from "@/lib/utils"
+import { getBSVExplorerUrl, getBSVAddressUrl, isValidTxId } from "@/lib/utils"
 import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
-
-interface ReadingData {
-  provider?: string
-}
-
-interface Reading {
-  txid: string
-  type: string
-  timestamp: string
-  status?: string
-  data: ReadingData
-}
+import { getKeyMetrics } from "@/lib/family-metrics"
 
 interface TransactionDisplay {
   id: string
-  type: string
+  family: string
+  location: string | null
   timestamp: string
   status: string
-  data: string
+  metrics: Record<string, unknown>
 }
 
 export function BlockchainExplorer() {
-  const [transactions, setTransactions] = useState<TransactionDisplay[]>([])
+  const [txByFamily, setTxByFamily] = useState<Map<string, TransactionDisplay>>(new Map())
   const [network, setNetwork] = useState<string>('test')
   const [loading, setLoading] = useState(true)
   const [showWalletModal, setShowWalletModal] = useState(false)
@@ -52,7 +42,7 @@ export function BlockchainExplorer() {
     try {
       const response = await fetch('/api/blockchain/recent-readings')
       const result = await response.json()
-      
+
       if (result.success && result.readings) {
         setReadingsSource(result.source ?? null)
         const netStr =
@@ -60,20 +50,21 @@ export function BlockchainExplorer() {
           : result.network === 'testnet' ? 'test'
           : (result.network || 'test')
         setNetwork(netStr)
-        
-        // Transform the readings into display format
-        // API returns max 4 entries (one latest transaction per data type)
-        const displayTransactions: TransactionDisplay[] = result.readings
-          .filter((reading: Reading) => reading.txid && reading.txid !== 'failed' && isValidTxId(reading.txid))
-          .map((reading: Reading) => ({
-            id: reading.txid,
-            type: formatType(reading.type),
-            timestamp: formatTimestamp(reading.timestamp),
-            status: reading.status || 'confirmed',
-            data: formatReadingData(reading.type, reading.data),
-          }))
-        
-        setTransactions(displayTransactions)
+
+        const newMap = new Map<string, TransactionDisplay>()
+        result.readings
+          .filter((r: any) => r.txid && r.txid !== 'failed' && isValidTxId(r.txid))
+          .forEach((r: any) => {
+            newMap.set(r.type, {
+              id: r.txid,
+              family: r.type,
+              location: r.location ?? null,
+              timestamp: formatTimestamp(r.timestamp),
+              status: r.status || 'confirmed',
+              metrics: r.data?.metrics ?? {},
+            })
+          })
+        setTxByFamily(newMap)
       }
     } catch (error) {
       console.error('Error fetching blockchain transactions:', error)
@@ -84,54 +75,30 @@ export function BlockchainExplorer() {
 
   useEffect(() => {
     fetchTransactions()
-    // Refresh every 45 seconds
     const interval = setInterval(fetchTransactions, 45000)
     return () => clearInterval(interval)
   }, [])
-
-  const formatType = (type: string): string => {
-    return DATA_FAMILY_DESCRIPTORS[type as keyof typeof DATA_FAMILY_DESCRIPTORS]?.label || type
-  }
 
   const formatTimestamp = (timestamp: string): string => {
     const date = new Date(timestamp)
     const now = new Date()
     const diffMs = now.getTime() - date.getTime()
     const diffMins = Math.floor(diffMs / 60000)
-    
+
     if (diffMins < 1) return 'just now'
     if (diffMins < 60) return `${diffMins} minute${diffMins === 1 ? '' : 's'} ago`
-    
+
     const diffHours = Math.floor(diffMins / 60)
     if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`
-    
+
     const diffDays = Math.floor(diffHours / 24)
     return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`
   }
 
-  const formatReadingData = (type: string, data: ReadingData): string => {
-    const provider = data.provider || 'Unknown'
-    
-    switch (type) {
-      case 'air_quality':
-        return `Air quality data recorded from various sources.`
-      case 'water_levels':
-        return `Water level measurements from ${provider}`
-      case 'seismic_activity':
-        return `Seismic activity detected by ${provider}`
-      case 'advanced_metrics':
-        return `Environmental metrics from various sources, processed via ${provider}`
-      case 'volcanic_activity':
-        return `Volcano alert data from ${provider}`
-      case 'geomagnetism':
-        return `Geomagnetic field data from ${provider}`
-      case 'space_weather':
-        return `Solar wind and interplanetary data from ${provider}`
-      case 'upper_atmosphere':
-        return `Upper atmosphere observations from ${provider}`
-      default:
-        return `Environmental data recorded from ${provider}`
-    }
+  const buildMetricsSummary = (family: string, metrics: Record<string, unknown>): string | null => {
+    const items = getKeyMetrics(family, metrics, 3)
+    if (items.length === 0) return null
+    return items.map(m => `${m.label}: ${m.value}`).join(' • ')
   }
 
   const getWhatsonChainUrl = (txid: string): string =>
@@ -148,7 +115,7 @@ export function BlockchainExplorer() {
               Every environmental measurement is cryptographically secured and stored on the BSV blockchain. Verify any
               data point independently.
             </p>
-            {readingsSource === 'overlay' && transactions.length > 0 && (
+            {readingsSource === 'overlay' && txByFamily.size > 0 && (
               <div className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-green-900/30 border border-green-700/50">
                 <Shield className="h-4 w-4 text-green-400" />
                 <span className="text-sm font-medium text-green-400">Verified on-chain</span>
@@ -160,32 +127,44 @@ export function BlockchainExplorer() {
           <>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
               {Object.values(DATA_FAMILY_DESCRIPTORS).map((descriptor) => {
-                const label = descriptor.label
-                const tx = transactions.find((t) => t.type === label)
+                const tx = txByFamily.get(descriptor.id)
+                const metricsSummary = tx ? buildMetricsSummary(descriptor.id, tx.metrics) : null
+                const description = loading
+                  ? 'Loading...'
+                  : tx
+                    ? (metricsSummary ?? `${descriptor.label} data recorded`)
+                    : 'No recent transactions found yet.'
+
                 return (
-                  <GlowCard key={label} glowColor="purple" customSize>
+                  <GlowCard key={descriptor.id} glowColor="purple" customSize>
                     <div className="flex items-center justify-between">
-                      <div className="flex items-center space-x-4">
-                        <div className="w-10 h-10 bg-slate-950/60 rounded-full flex items-center justify-center">
+                      <div className="flex items-center space-x-4 min-w-0 flex-1">
+                        <div className="w-10 h-10 shrink-0 bg-slate-950/60 rounded-full flex items-center justify-center">
                           <Hash className="h-5 w-5 text-purple-300" />
                         </div>
-                        <div>
+                        <div className="min-w-0 flex-1">
                           <div className="flex items-center space-x-2 mb-1">
-                            <span className="font-medium text-white">{label}</span>
+                            <span className="font-medium text-white">{descriptor.label}</span>
                             {tx && (
-                              <Badge 
-                                variant="secondary" 
-                                className={tx.status === 'pending' 
-                                  ? "bg-yellow-900/50 text-yellow-400 rounded-sm" 
+                              <Badge
+                                variant="secondary"
+                                className={tx.status === 'pending'
+                                  ? "bg-yellow-900/50 text-yellow-400 rounded-sm"
                                   : "bg-green-900/50 text-green-400 rounded-sm"}
                               >
                                 {tx.status}
                               </Badge>
                             )}
                           </div>
-                          <div className="text-sm text-slate-400 mb-1">
-                            {loading ? 'Loading...' : (tx ? tx.data : 'No recent transactions found yet.')}
+                          <div className="text-sm text-slate-400 mb-1 truncate">
+                            {description}
                           </div>
+                          {tx?.location && (
+                            <div className="flex items-center gap-1 text-xs text-slate-500 mb-1">
+                              <MapPin className="h-3 w-3 shrink-0" />
+                              <span className="truncate">{tx.location}</span>
+                            </div>
+                          )}
                           {tx ? (
                             <div className="flex items-center space-x-2 text-xs text-slate-500">
                               <Clock className="h-3 w-3" />
@@ -199,10 +178,10 @@ export function BlockchainExplorer() {
                         </div>
                       </div>
                       {tx ? (
-                        <Button 
-                          variant="ghost" 
-                          size="sm" 
-                          className="text-purple-300 hover:text-purple-200"
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-purple-300 hover:text-purple-200 shrink-0 ml-2"
                           onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
                         >
                           <span className="sm:hidden inline-flex items-center">TX<ExternalLink className="ml-1 h-3 w-3" /></span>
@@ -215,10 +194,10 @@ export function BlockchainExplorer() {
                 )
               })}
             </div>
-            
+
             <div className="text-center">
-              <Button 
-                variant="outline" 
+              <Button
+                variant="outline"
                 className="border-slate-600 text-slate-300 hover:bg-slate-800 bg-transparent"
                 onClick={() => setShowWalletModal(true)}
               >
@@ -239,7 +218,7 @@ export function BlockchainExplorer() {
               Choose a wallet to view its complete transaction history on WhatsonChain
             </DialogDescription>
           </DialogHeader>
-          
+
           <div className="space-y-3 mt-4">
             {wallets.map((wallet, index) => (
               <button

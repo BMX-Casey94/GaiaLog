@@ -38,7 +38,6 @@ export interface OverlayExplorerReading {
 // is byte-identical after the switchover.
 
 const METRIC_PREVIEW_KEYS = new Set([
-  'provider_id',
   'air_quality_index', 'aqi', 'fine_particulate_matter_pm25', 'pm25',
   'coarse_particulate_matter_pm10', 'pm10', 'carbon_monoxide', 'co',
   'nitrogen_dioxide', 'no2', 'ozone', 'o3',
@@ -66,7 +65,7 @@ const METRIC_PREVIEW_KEYS = new Set([
   // hydrology
   'discharge_cfs', 'gage_height_ft', 'water_temperature_c', 'dissolved_oxygen_mg_l',
   'specific_conductance', 'ph', 'turbidity_ntu', 'river_level_m', 'typical_range_high', 'typical_range_low',
-  'station_reference', 'station_name', 'river_name', 'town', 'catchment_name',
+  'station_id', 'station_name', 'river_name', 'town', 'catchment_name',
   'ea_area_name', 'station_status', 'parameter', 'parameter_name', 'qualifier', 'unit_name', 'measure_id',
   // flood risk
   'severity_level', 'flood_area', 'river_level_m', 'is_rising',

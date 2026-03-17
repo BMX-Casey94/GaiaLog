@@ -1014,8 +1014,7 @@ export class BlockchainService {
       }
       if (providerIdValue) base.provider_id = providerIdValue
       if (datasetIdValue) base.dataset_id = datasetIdValue
-      // Omit provider for advanced_metrics payloads (per request)
-      if (data.stream !== 'advanced_metrics' && providerValue !== 'unknown') {
+      if (providerValue !== 'unknown') {
         base.provider = providerValue
       }
       // Add credibility metadata if generated

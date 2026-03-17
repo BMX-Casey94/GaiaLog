@@ -350,9 +350,6 @@ export abstract class BaseWorker {
                 location: item.location,
                 timestamp: new Date(item.timestamp).toISOString(),
                 source: resolveSourceLabel(bsvData.providerId, bsvData.datasetId, item.source),
-                provider_id: bsvData.providerId,
-                dataset_id: bsvData.datasetId,
-                family: bsvData.family,
                 ...item.measurement,
                 source_hash: unifiedHash
               }
@@ -700,7 +697,6 @@ export class NOAAWorker extends BaseWorker {
         const measurement: any = {
           river_level: item.river_level,
           sea_level: item.sea_level,
-          station_id: item.station_id,
         }
         // Include all optional NOAA metrics if available
         if (item.water_temperature_c != null) measurement.water_temperature_c = item.water_temperature_c
@@ -807,9 +803,7 @@ export class NOAANdbcWorker extends BaseWorker {
     try {
       const batch = await collectNdbcLatestObservations(config.chunkSize, true)
       for (const item of batch) {
-        const measurement: Record<string, unknown> = {
-          station_id: item.station_id,
-        }
+        const measurement: Record<string, unknown> = {}
         if (item.sea_level != null) measurement.sea_level = item.sea_level
         if (item.river_level != null) measurement.river_level = item.river_level
         if (item.wave_height_m != null) measurement.wave_height_m = item.wave_height_m
@@ -1968,7 +1962,6 @@ export class UkEaFloodWorker extends BaseWorker {
               is_rising: r.isRising,
               typical_range_high: r.typicalRangeHigh,
               typical_range_low: r.typicalRangeLow,
-              station_reference: r.stationRef,
               station_name: r.stationName,
               river_name: r.riverName,
               town: r.town,

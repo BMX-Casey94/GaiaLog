@@ -633,21 +633,12 @@ export class WorkerQueue {
   private buildPayloadFromItem(item: QueueItem): any {
     const t = item.data
     const iso = new Date(t.timestamp).toISOString()
-    const resolvedSource = resolveSourceLabel(
-      t.providerId,
-      t.datasetId,
-      t.sourceLabel || t.measurement?.source || null,
-    )
     return {
       location: t.location,
       timestamp: iso,
       ...(t.coordinates ? { latitude: t.coordinates.lat, longitude: t.coordinates.lon } : {}),
       ...(t.stationId ? { station_id: t.stationId } : {}),
       ...t.measurement,
-      ...(resolvedSource && resolvedSource !== 'unknown' ? { source: resolvedSource } : {}),
-      ...(t.providerId ? { provider_id: t.providerId } : {}),
-      ...(t.datasetId ? { dataset_id: t.datasetId } : {}),
-      ...(t.family ? { family: t.family } : {}),
     }
   }
 

@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
-import { Database, Droplets, Activity, Cloud, RefreshCw } from "lucide-react"
+import { Database, Droplets, Activity, Cloud, RefreshCw, ChevronDown, ChevronUp } from "lucide-react"
 import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
 
 const FAMILY_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -31,9 +31,12 @@ interface ProviderSource {
   status: string
 }
 
+const PAGE_SIZE = 8
+
 export function DataSources() {
   const [sources, setSources] = useState<ProviderSource[]>([])
   const [loading, setLoading] = useState(true)
+  const [showAll, setShowAll] = useState(false)
 
   useEffect(() => {
     const fetchProviders = async () => {
@@ -67,12 +70,15 @@ export function DataSources() {
     return () => clearInterval(interval)
   }, [])
 
-  const displaySources = sources.length > 0 ? sources : [
+  const allSources = sources.length > 0 ? sources : [
     { id: 'waqi', name: 'WAQI API', type: 'Air Quality', icon: Cloud, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
     { id: 'noaa', name: 'NOAA Tides & Currents', type: 'Water Levels', icon: Droplets, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
     { id: 'usgs', name: 'USGS Earthquake API', type: 'Seismic Activity', icon: Activity, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
     { id: 'env', name: 'Environmental Monitoring', type: 'UV, Soil, Wildfire Risk', icon: Database, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
   ]
+
+  const visibleSources = showAll ? allSources : allSources.slice(0, PAGE_SIZE)
+  const hasMore = allSources.length > PAGE_SIZE
 
   return (
     <section id="data-sources" className="py-20 px-4 sm:px-6 lg:px-8 relative scroll-mt-24">
@@ -88,7 +94,7 @@ export function DataSources() {
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-            {displaySources.map((source) => {
+            {visibleSources.map((source) => {
               const Icon = source.icon
               return (
               <GlowCard key={source.id} glowColor="purple" customSize className="h-full">
@@ -123,6 +129,21 @@ export function DataSources() {
               </GlowCard>
             )})}
           </div>
+
+          {hasMore && (
+            <div className="text-center mt-8">
+              <button
+                onClick={() => setShowAll(v => !v)}
+                className="inline-flex items-center gap-2 px-6 py-2.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800 hover:border-slate-500 transition-colors text-sm font-medium"
+              >
+                {showAll ? (
+                  <>Show less <ChevronUp className="h-4 w-4" /></>
+                ) : (
+                  <>View more ({allSources.length - PAGE_SIZE} more) <ChevronDown className="h-4 w-4" /></>
+                )}
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </section>

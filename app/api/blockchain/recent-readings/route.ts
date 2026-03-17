@@ -3,7 +3,7 @@ import { query } from '../../../../lib/db'
 import { blockchainService } from '@/lib/blockchain'
 import { DATA_FAMILY_DESCRIPTORS } from '@/lib/stream-registry'
 import { getExplorerReadSource } from '@/lib/explorer-read-source'
-import { getRecentReadingsByFamily } from '@/lib/overlay-explorer-repository'
+import { getLatestReadingsWithMetrics } from '@/lib/overlay-explorer-repository'
 
 function getBSVNetwork(): 'main' | 'test' {
   return process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
@@ -30,16 +30,20 @@ export async function GET(req: NextRequest) {
     const readSource = getExplorerReadSource()
     if (readSource === 'overlay') {
       try {
-        const overlayRows = await getRecentReadingsByFamily(wanted)
+        const overlayRows = await getLatestReadingsWithMetrics(wanted)
         if (overlayRows.length > 0) {
           const readings = overlayRows
             .filter((r) => r.txid && isValidTxId(r.txid))
             .map((r) => ({
               txid: r.txid,
               type: r.data_family,
+              location: r.location,
               timestamp: r.reading_ts,
               status: r.confirmed ? 'confirmed' : 'pending',
-              data: { provider: r.provider_id || 'unknown' },
+              data: {
+                provider: r.provider_id || 'unknown',
+                metrics: r.metrics_preview ?? {},
+              },
             }))
             .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
           return NextResponse.json({ success: true, network, readings, source: 'overlay' })
