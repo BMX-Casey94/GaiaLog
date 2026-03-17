@@ -2692,6 +2692,19 @@ export interface GbifOccurrence {
   country: string
   basisOfRecord: string
   datasetName: string
+  locality?: string
+  eventDate?: string
+  recordedBy?: string
+  institutionCode?: string
+  taxonRank?: string
+  acceptedScientificName?: string
+  region?: string
+  county?: string
+  city?: string
+  continent?: string
+  countryCode?: string
+  catalogNumber?: string
+  license?: string
 }
 
 const _gbifWm = { ts: 0 }
@@ -2719,6 +2732,7 @@ export async function collectGbifOccurrences(limit: number = 300): Promise<GbifO
     const key = `gbif:${r.key}`
     if (!(await dedupeStore.add(key))) continue
 
+    const gadm = r?.gadm
     out.push({
       timestamp: ts,
       source: 'GBIF',
@@ -2736,6 +2750,19 @@ export async function collectGbifOccurrences(limit: number = 300): Promise<GbifO
       country: r.country || '',
       basisOfRecord: r.basisOfRecord || '',
       datasetName: r.datasetName || '',
+      locality: r.locality || undefined,
+      eventDate: r.eventDate || undefined,
+      recordedBy: r.recordedBy || undefined,
+      institutionCode: r.institutionCode || undefined,
+      taxonRank: r.taxonRank || undefined,
+      acceptedScientificName: r.acceptedScientificName || undefined,
+      region: gadm?.level1?.name || undefined,
+      county: gadm?.level2?.name || undefined,
+      city: gadm?.level3?.name || undefined,
+      continent: r.continent || undefined,
+      countryCode: r.countryCode || undefined,
+      catalogNumber: r.catalogNumber || undefined,
+      license: r.license || undefined,
     })
   }
   if (maxTs > lastSeen) _gbifWm.ts = maxTs
@@ -2757,6 +2784,16 @@ export interface INaturalistObservation {
   placeGuess: string
   qualityGrade: string
   observedOn: string
+  description?: string
+  captive?: boolean
+  threatened?: boolean
+  endemic?: boolean
+  introduced?: boolean
+  observedOnString?: string
+  positionalAccuracy?: number
+  photoUrl?: string
+  identificationsCount?: number
+  numIdentificationAgreements?: number
 }
 
 const _inatWm = { ts: 0 }
@@ -2788,6 +2825,8 @@ export async function collectINaturalistObservations(limit: number = 200): Promi
     const loc = r.geojson?.coordinates || r.location?.split(',') || [0, 0]
     const lat = parseFloat(loc[1] ?? loc[0]) || 0
     const lon = parseFloat(loc[0] ?? loc[1]) || 0
+    const firstPhoto = Array.isArray(r.photos) && r.photos[0] ? r.photos[0] : r.observation_photos?.[0]?.photo
+    const photoUrl = firstPhoto?.url || firstPhoto?.medium_url || firstPhoto?.square_url
 
     out.push({
       timestamp: ts,
@@ -2802,6 +2841,16 @@ export async function collectINaturalistObservations(limit: number = 200): Promi
       placeGuess: r.place_guess || '',
       qualityGrade: r.quality_grade || '',
       observedOn: r.observed_on || '',
+      description: r.description || undefined,
+      captive: r.captive === true ? true : r.captive === false ? false : undefined,
+      threatened: taxon.threatened === true ? true : undefined,
+      endemic: taxon.endemic === true ? true : undefined,
+      introduced: taxon.introduced === true ? true : undefined,
+      observedOnString: r.observed_on_string || undefined,
+      positionalAccuracy: typeof r.positional_accuracy === 'number' ? r.positional_accuracy : undefined,
+      photoUrl: photoUrl || undefined,
+      identificationsCount: typeof r.identifications_count === 'number' ? r.identifications_count : undefined,
+      numIdentificationAgreements: typeof r.num_identification_agreements === 'number' ? r.num_identification_agreements : undefined,
     })
   }
   if (maxTs > lastSeen) _inatWm.ts = maxTs
@@ -2825,6 +2874,9 @@ export interface ObisOccurrence {
   depth?: number | null
   datasetName: string
   basisOfRecord: string
+  eventDate?: string
+  locality?: string
+  recordedBy?: string
 }
 
 const _obisWm = { ts: 0 }
@@ -2833,7 +2885,7 @@ export async function collectObisOccurrences(limit: number = 300): Promise<ObisO
   const now = new Date()
   const start = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
   const startDate = start.toISOString().slice(0, 10)
-  const url = `https://api.obis.org/v3/occurrence?startdate=${startDate}&size=${Math.min(limit, 300)}&fields=id,species,scientificName,phylum,class,order,family,decimalLatitude,decimalLongitude,depth,eventDate,datasetName,basisOfRecord`
+  const url = `https://api.obis.org/v3/occurrence?startdate=${startDate}&size=${Math.min(limit, 300)}&fields=id,species,scientificName,phylum,class,order,family,decimalLatitude,decimalLongitude,depth,eventDate,datasetName,basisOfRecord,locality,recordedBy`
 
   const data = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'obis', timeoutMs: 30000 })
   const results = Array.isArray(data?.results) ? data.results : []
@@ -2866,6 +2918,9 @@ export async function collectObisOccurrences(limit: number = 300): Promise<ObisO
       depth: parseNumericValue(r.depth) ?? null,
       datasetName: r.datasetName || '',
       basisOfRecord: r.basisOfRecord || '',
+      eventDate: r.eventDate || undefined,
+      locality: r.locality || undefined,
+      recordedBy: r.recordedBy || undefined,
     })
   }
   if (maxTs > lastSeen) _obisWm.ts = maxTs

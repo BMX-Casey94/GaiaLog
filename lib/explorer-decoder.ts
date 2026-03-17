@@ -56,6 +56,11 @@ const METRIC_PREVIEW_KEYS = new Set([
   // biodiversity
   'species', 'scientific_name', 'taxon_rank', 'observation_count',
   'kingdom', 'phylum', 'class', 'order', 'family', 'genus',
+  'locality', 'event_date', 'recorded_by', 'institution_code', 'accepted_scientific_name',
+  'region', 'county', 'city', 'continent', 'country_code', 'catalog_number', 'basis_of_record', 'dataset_name',
+  'iconic_taxon', 'quality_grade', 'description', 'captive', 'threatened', 'endemic', 'introduced',
+  'observed_on_string', 'positional_accuracy_m', 'photo_url', 'identifications_count', 'num_identification_agreements',
+  'depth',
   // conservation
   'listing_status', 'threat_category', 'population_trend', 'conservation_rank',
   // hydrology

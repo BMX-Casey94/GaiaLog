@@ -122,7 +122,11 @@ export const DATA_FAMILY_DESCRIPTORS = {
     color: 'green',
     glowColor: 'emerald',
     accent: 'text-green-400',
-    metricPreviewKeys: ['species', 'scientific_name', 'taxon_rank', 'observation_count', 'latitude', 'longitude'],
+    metricPreviewKeys: [
+      'species', 'scientific_name', 'taxon_rank', 'observation_count',
+      'locality', 'event_date', 'recorded_by', 'iconic_taxon', 'quality_grade',
+      'kingdom', 'phylum', 'region', 'country_code',
+    ],
   },
   conservation_status: {
     id: 'conservation_status',
