@@ -455,7 +455,15 @@ export abstract class BaseWorker {
   }
 
   private generateSourceHash(data: EnvironmentalData): string {
-    return this.computeUnifiedHash(data)
+    return calculateSourceHash({
+      type: data.type,
+      providerId: data.providerId || resolveProviderIdFromSource(data.source) || 'unknown',
+      datasetId: data.datasetId || 'default',
+      source: data.source,
+      timestamp: new Date(data.timestamp).toISOString(),
+      location: data.location,
+      measurement: data.measurement,
+    })
   }
 }
 
