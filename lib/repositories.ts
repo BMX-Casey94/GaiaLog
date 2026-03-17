@@ -1,8 +1,9 @@
 import { query } from '@/lib/db'
+import { createHash } from 'crypto'
+import { stringifyCanonical } from './utils'
 
 export function calculateSourceHash(obj: any): string {
-  const str = JSON.stringify(obj)
-  return Buffer.from(str, 'utf8').toString('base64').slice(0, 64)
+  return createHash('sha256').update(stringifyCanonical(obj)).digest('hex')
 }
 
 export async function insertAirQuality(row: {
@@ -313,6 +314,11 @@ export async function getOwmStationsPage(params: {
                OFFSET $${values.length}`
   const rows = await query<any>(sql, values)
   return rows.rows as any
+}
+
+export async function getStationCountByProvider(provider: string): Promise<number> {
+  const result = await query<{ count: string }>('SELECT COUNT(*) AS count FROM stations WHERE provider = $1', [provider])
+  return parseInt(result.rows[0]?.count || '0', 10)
 }
 
 export async function getNearestOwmCountry(lat: number, lon: number): Promise<string | null> {

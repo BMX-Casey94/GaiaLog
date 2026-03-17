@@ -748,7 +748,7 @@ export class DataCollector {
   // --- persistence helpers ---
   private async persistAirQuality(aq: AirQualityData): Promise<string> {
     const obj = { type: 'air_quality', aq }
-    const source_hash = Buffer.from(JSON.stringify(obj)).toString('base64').slice(0, 64)
+    const source_hash = calculateSourceHash(obj)
     try {
       await insertAirQuality({
         provider: aq.source,
@@ -780,7 +780,7 @@ export class DataCollector {
 
   private async persistWater(w: WaterLevelData): Promise<string> {
     const obj = { type: 'water_levels', w }
-    const source_hash = Buffer.from(JSON.stringify(obj)).toString('base64').slice(0, 64)
+    const source_hash = calculateSourceHash(obj)
     try {
       await insertWaterLevel({
         provider: w.source,
@@ -810,7 +810,7 @@ export class DataCollector {
 
   private async persistSeismic(s: SeismicData): Promise<string> {
     const obj = { type: 'seismic', s }
-    const source_hash = Buffer.from(JSON.stringify(obj)).toString('base64').slice(0, 64)
+    const source_hash = calculateSourceHash(obj)
     try {
       await insertSeismic({
         provider: s.source,
@@ -831,7 +831,7 @@ export class DataCollector {
 
   private async persistAdvanced(a: AdvancedMetricsData): Promise<string> {
     const obj = { type: 'advanced', a }
-    const source_hash = Buffer.from(JSON.stringify(obj)).toString('base64').slice(0, 64)
+    const source_hash = calculateSourceHash(obj)
     try {
       await insertAdvanced({
         provider: a.source,
@@ -942,8 +942,7 @@ export class DataCollector {
       let payloadToWrite: any = data
       // WAQI archival gate: until explicit approval, avoid storing raw WAQI data on-chain
       if (data && data.source === 'WAQI' && process.env.WAQI_ARCHIVAL_APPROVED !== 'true') {
-        const sourceString = JSON.stringify({ stream, data })
-        const sourceHash = Buffer.from(sourceString).toString('base64').substring(0, 32)
+        const sourceHash = calculateSourceHash({ stream, data })
         // Include key numeric metrics but omit raw nested payload; remove attribution/notice
         payloadToWrite = {
           source: 'WAQI',
@@ -1183,21 +1182,23 @@ export async function collectWaterLevelDataBatch(limit: number = 25, sweepBudget
   let sweepPages = 0
   let cursorWrapped = false
 
-  while (!cursorWrapped && (Date.now() - sweepStart) < effectiveBudget) {
+  const initialCursor = await readCursor('noaa', null, 'station_index')
+  let stationsRemainingInCycle = total
+
+  while (!cursorWrapped && stationsRemainingInCycle > 0 && (Date.now() - sweepStart) < effectiveBudget) {
     const cursor = await readCursor('noaa', null, 'station_index')
-    const selectedStations = buildRotatingSlice(list, cursor, Math.min(limit, total))
+    const batchSize = Math.min(limit, stationsRemainingInCycle)
+    const selectedStations = buildRotatingSlice(list, cursor, batchSize)
     if (selectedStations.length === 0) break
     const nextCursor = (cursor + selectedStations.length) % total
-    cursorWrapped = nextCursor <= cursor && sweepPages > 0
     await writeCursor('noaa', null, 'station_index', nextCursor)
 
     if (sweepPages === 0) {
       console.log(
-        `NOAA: Processing stations (${total} total, products=${Array.from(products).join(',')}, concurrency=${concurrency}, sweep=${sweepBudgetMs > 0 ? 'on' : 'off'})...`
+        `NOAA: Processing stations (${total} total, cursor=${initialCursor}, products=${Array.from(products).join(',')}, concurrency=${concurrency}, sweep=${sweepBudgetMs > 0 ? 'on' : 'off'})...`
       )
     }
 
-    const batchStart = Date.now()
     for (let offset = 0; offset < selectedStations.length; offset += concurrency) {
       const slice = selectedStations.slice(offset, offset + concurrency)
       const results = await Promise.all(slice.map(station => collectNoaaWaterLevelForStation(station, products)))
@@ -1206,14 +1207,16 @@ export async function collectWaterLevelDataBatch(limit: number = 25, sweepBudget
       }
     }
     totalProcessed += selectedStations.length
+    stationsRemainingInCycle -= selectedStations.length
     sweepPages++
 
+    if (stationsRemainingInCycle <= 0) cursorWrapped = true
     if (sweepBudgetMs <= 0) break
-    if (cursorWrapped) break
   }
 
+  const endCursor = await readCursor('noaa', null, 'station_index')
   const totalElapsed = ((Date.now() - sweepStart) / 1000).toFixed(1)
-  console.log(`NOAA: Batch complete - ${out.length} readings from ${totalProcessed} stations (${sweepPages} pages) in ${totalElapsed}s${cursorWrapped ? ' [full cycle]' : ''}`)
+  console.log(`NOAA: Batch complete - ${out.length} readings from ${totalProcessed}/${total} stations (${sweepPages} pages) cursor=${initialCursor}→${endCursor} ${totalElapsed}s${cursorWrapped ? ' [full cycle]' : ''}`)
   return out
 }
 
@@ -1607,10 +1610,8 @@ export async function ensureWaqiStationIndex(maxTilesToScan: number = WAQI_TILES
       const etagKey = `waqi:bounds:${t.lat1},${t.lon1},${t.lat2},${t.lon2}`
       const data = await fetchJsonWithRetry<any>(url, { retries: 1, etagKey, providerId: 'waqi' })
       if ((data as any)?.__notModified) {
-        // No changes for this tile; advance and move on
         scanned++
         i++
-        await budgetStore.consume('waqi')
         continue
       }
       const stations = Array.isArray(data?.data) ? data.data : []
@@ -1619,7 +1620,6 @@ export async function ensureWaqiStationIndex(maxTilesToScan: number = WAQI_TILES
         if (typeof uid === 'number' && !seen.has(uid)) {
           index.push({ uid, lat: s.lat, lon: s.lon, aqi: s.aqi, name: s.station?.name })
           seen.add(uid)
-          // Persist to stations table with provider='waqi' and derived country
           try {
             const { getNearestOwmCountry, upsertStation } = await import('./repositories')
             const cc = await getNearestOwmCountry(Number(s.lat), Number(s.lon))
@@ -1636,7 +1636,6 @@ export async function ensureWaqiStationIndex(maxTilesToScan: number = WAQI_TILES
           } catch {}
         }
       }
-      await budgetStore.consume('waqi')
     } catch {
       // ignore tile fetch errors
     }
