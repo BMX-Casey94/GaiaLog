@@ -112,6 +112,12 @@ const bool = (v: string | undefined, d: boolean) => {
 
 const toEnvPrefix = (value: string) => value.replace(/[^a-zA-Z0-9]+/g, '_').toUpperCase()
 
+function isProviderRolloutActive(keyRequired: boolean, minimumGate: RolloutGate, requestedGate: RolloutGate): boolean {
+  // Keyless/public providers should not be held back by phased rollout gates.
+  if (!keyRequired) return true
+  return isRolloutGateEnabled(minimumGate, requestedGate)
+}
+
 const PROVIDER_ENV_OVERRIDES: Partial<Record<ProviderId, {
   rpsEnv: string
   perDayEnv?: string
@@ -502,7 +508,7 @@ export const providerConfigs: Record<ProviderId, ProviderConfig> = Object.fromEn
     const configuredEnabled = isProviderEnabled(providerId)
     const requestedRolloutGate = getRequestedRolloutGate()
     const rollout = PROVIDER_ROLLOUT_RULES[providerId]
-    const rolloutEnabled = isRolloutGateEnabled(rollout.minimumGate, requestedRolloutGate)
+    const rolloutEnabled = isProviderRolloutActive(descriptor.keyRequired, rollout.minimumGate, requestedRolloutGate)
     return [providerId, {
       id: providerId,
       purpose: descriptor.displayName,
@@ -543,7 +549,7 @@ export const datasetConfigs: Record<DatasetId, ProviderDatasetConfig> = Object.f
     const configuredEnabled = bool(process.env[`${prefix}_ENABLED`], provider.configuredEnabled)
     const requestedRolloutGate = provider.requestedRolloutGate
     const rollout = provider.rollout
-    const rolloutEnabled = isRolloutGateEnabled(rollout.minimumGate, requestedRolloutGate)
+    const rolloutEnabled = isProviderRolloutActive(descriptor.keyRequired, rollout.minimumGate, requestedRolloutGate)
     const enabled = configuredEnabled && rolloutEnabled && provider.enabled
     const intervalMs = Math.max(60 * 1000, n(process.env[`${prefix}_INTERVAL_MS`], provider.cadence.intervalMs || descriptor.defaultIntervalMs))
     const chunkSize = Math.max(1, n(process.env[`${prefix}_CHUNK_SIZE`], provider.chunkSize || descriptor.defaultChunkSize))
