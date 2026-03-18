@@ -923,6 +923,9 @@ export class BlockchainService {
             // Remove database-related references to reduce payload size
             delete (copy as any).source_hash
             delete (copy as any).db_source_hash
+            // Strip provider_id/dataset_id from payload; they are promoted to root level
+            delete (copy as any).provider_id
+            delete (copy as any).dataset_id
           }
           return copy
         } catch {
