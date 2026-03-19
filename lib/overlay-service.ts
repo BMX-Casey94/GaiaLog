@@ -129,7 +129,7 @@ const lookupSchema = z.object({
   provider: z.string().min(1),
   query: z.object({
     topic: z.string().min(1),
-    limit: z.number().int().positive().max(5000).optional(),
+    limit: z.number().int().positive().max(10000).optional(),
     offset: z.number().int().nonnegative().optional(),
     order: z.enum(['asc', 'desc']).optional(),
     minSatoshis: z.number().int().nonnegative().optional(),
