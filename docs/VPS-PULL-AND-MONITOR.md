@@ -62,6 +62,33 @@ pm2 restart gaialog-workers
 # npm run workers
 ```
 
+### 1b. Update `.env` when the repo adds new variables
+
+`git pull` **does not** change your VPS `.env` (it is local / usually gitignored). The repo’s **`env.template`** is the checklist for new keys after each deploy.
+
+```bash
+cd /opt/gaialog   # or ~/gaialog — use your real clone path
+git pull origin master
+
+# Variable NAMES present in env.template but missing from .env (review env.template and add lines you need)
+comm -23 \
+  <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' env.template | sed 's/=.*//' | sort -u) \
+  <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env 2>/dev/null | sed 's/=.*//' | sort -u)
+
+# Optional: side-by-side diff of template vs live file (secrets will appear — run only on a trusted host)
+# diff -u env.template .env | less
+
+# Backup, then edit
+cp -a .env ".env.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+nano .env   # or: vi .env
+
+# Apply changes to running Node processes (dotenv reads .env at startup; PM2 must reload env)
+pm2 restart gaialog-web gaialog-workers gaialog-overlay --update-env
+pm2 save
+```
+
+**Note:** `--update-env` refreshes variables PM2 injected when the app was first started; apps that load **only** from `.env` via `dotenv` still need a **restart** after you change `.env` (the block above does both).
+
 ### 1a. Trigger UTXO cache refresh (web) and split tooling
 
 `GET`/`POST` `/api/blockchain/refresh-utxos` only clears/refetches UTXO state inside **that Next.js process**. **Worker** processes hold separate in-memory overlay caches — after chain moves or overlay DB updates, restart workers: `pm2 restart gaialog-workers`.
