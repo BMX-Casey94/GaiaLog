@@ -26,8 +26,12 @@
  *   kill_timeout gives the SIGINT handler 8 seconds to drain gracefully before SIGKILL.
  */
 
-// Load .env so overlay/worker vars are passed to PM2 processes
-require('dotenv').config({ path: require('path').join(__dirname, '.env') })
+// Load .env so overlay/worker vars are passed to PM2 processes.
+// override: true — file wins over stale shell/PM2 env (e.g. old BSV_QUEUE_CONCURRENCY).
+require('dotenv').config({
+  path: require('path').join(__dirname, '.env'),
+  override: true,
+})
 
 module.exports = {
   apps: [
@@ -107,6 +111,8 @@ module.exports = {
         BSV_OVERLAY_TIMEOUT_MS: process.env.BSV_OVERLAY_TIMEOUT_MS || '10000',
         BSV_OVERLAY_MAX_RETRIES: process.env.BSV_OVERLAY_MAX_RETRIES || '1',
         BSV_QUEUE_CONCURRENCY: process.env.BSV_QUEUE_CONCURRENCY || '2',
+        BSV_ARC_ACCEPT_ORPHAN_MEMPOOL: process.env.BSV_ARC_ACCEPT_ORPHAN_MEMPOOL ?? 'false',
+        BSV_WALLET_PICK_BY_CONFIRMED_FIRST: process.env.BSV_WALLET_PICK_BY_CONFIRMED_FIRST ?? 'true',
         BSV_HEAP_GUARD_ENABLED: process.env.BSV_HEAP_GUARD_ENABLED ?? 'false',
         BSV_HEAP_GUARD_HIGH_WATERMARK: process.env.BSV_HEAP_GUARD_HIGH_WATERMARK || '0.98',
         BSV_HEAP_GUARD_PAUSE_MS: process.env.BSV_HEAP_GUARD_PAUSE_MS || '10000',
