@@ -80,6 +80,18 @@ If `.env` does not exist yet, `npm run sync:env` copies `env.template` → `.env
 
 **Manual fallback:** compare variable names only with `comm` + `grep` (see older revisions of this doc) if you cannot run Node.
 
+### 1c. GorillaPool `SEEN_IN_ORPHAN_MEMPOOL` vs TAAL 460 / WoC “Missing inputs”
+
+If logs show `trying next broadcaster … BSV_ARC_ACCEPT_ORPHAN_MEMPOOL`, you have **`BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=false`** in the environment (often from an old `.env` line or PM2 env). That **rejects** a valid GorillaPool 200 response and guarantees failure when fallbacks cannot see parent txs.
+
+```bash
+grep -n BSV_ARC_ACCEPT_ORPHAN_MEMPOOL /opt/gaialog/.env
+# Remove the line, or comment it out, or set: BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=true
+pm2 restart gaialog-web gaialog-workers gaialog-overlay --update-env
+```
+
+Also check PM2 did not freeze an old value: `pm2 show gaialog-workers | grep -i orphan` (if your ecosystem injects it, fix the ecosystem file).
+
 ### 1a. Trigger UTXO cache refresh (web) and split tooling
 
 `GET`/`POST` `/api/blockchain/refresh-utxos` only clears/refetches UTXO state inside **that Next.js process**. **Worker** processes hold separate in-memory overlay caches — after chain moves or overlay DB updates, restart workers: `pm2 restart gaialog-workers`.

@@ -14,6 +14,9 @@ const root = path.resolve(__dirname, '..')
 const envPath = path.join(root, '.env')
 const templatePath = path.join(root, 'env.template')
 
+/** Keys we never auto-append — dangerous defaults or tri-state semantics (see env.template comments). */
+const EXCLUDE_KEYS_FROM_SYNC = new Set<string>(['BSV_ARC_ACCEPT_ORPHAN_MEMPOOL'])
+
 const dryRun =
   process.argv.includes('--dry-run') ||
   process.argv.includes('-n') ||
@@ -111,7 +114,7 @@ function main(): void {
 
   const missing: { key: string; line: string }[] = []
   for (const key of keyOrder) {
-    if (active.has(key)) continue
+    if (active.has(key) || EXCLUDE_KEYS_FROM_SYNC.has(key)) continue
     const line = fromTemplate.get(key)
     if (line) missing.push({ key, line })
   }
