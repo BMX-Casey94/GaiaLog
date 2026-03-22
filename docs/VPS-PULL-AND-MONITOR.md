@@ -33,8 +33,9 @@
 ## 1. Pull Recent Changes on VPS
 
 ```bash
-# Navigate to project directory (adjust path if different)
-cd /path/to/GaiaLog
+# Navigate to your clone (use the real path — e.g. `pwd` on the VPS, often ~/gaialog)
+# Do NOT use the literal string "/path/to/GaiaLog"; that is only a placeholder in docs.
+cd ~/gaialog
 
 # Pull latest from master
 git pull origin master
