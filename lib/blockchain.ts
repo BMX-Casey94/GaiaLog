@@ -110,6 +110,8 @@ const REQUIRE_VALIDATION = process.env.GAIALOG_REQUIRE_VALIDATION === 'true'
 // Optional UTXO fetch controls and lightweight pooling (defaults keep current behaviour)
 const ENABLE_UTXO_POOL = process.env.BSV_ENABLE_UTXO_POOL === 'true'
 const ENABLE_UTXO_DB_LOCKS = process.env.BSV_ENABLE_UTXO_DB_LOCKS === 'true'
+/** When true, keep in-memory UTXO reservations on "Missing input(s)" style errors (legacy; can cause spendable=0 under relay mismatch). */
+const PRESERVE_UTXO_ON_MISSING_INPUT = process.env.BSV_UTXO_PRESERVE_ON_MISSING_INPUT === 'true'
 const UTXO_POOL_TTL_MS = Number(process.env.BSV_UTXO_POOL_TTL_MS || 10000)
 const UTXO_FETCH_BACKOFF_BASE_MS = Number(process.env.BSV_UTXO_FETCH_BACKOFF_BASE_MS || 250)
 const UTXO_FETCH_MAX_RETRIES = Number(process.env.BSV_UTXO_FETCH_MAX_RETRIES || 4)
@@ -1432,7 +1434,11 @@ export class BlockchainService {
         return txid
       } catch (innerErr) {
         const innerMsg = innerErr instanceof Error ? innerErr.message : String(innerErr)
-        const preserveUsedReservation = /txn-mempool-conflict|DOUBLE_SPEND|MEMPOOL_CHAIN_LIMIT|Missing input|Missing inputs/i.test(innerMsg)
+        // Only preserve pool reservations for true mempool/chain conflicts. "Missing input(s)" from WoC/relays
+        // often means parent not visible to that endpoint — not a local double-spend; releasing avoids locking all overlay UTXOs for TTL.
+        const preserveMempoolConflict = /txn-mempool-conflict|DOUBLE_SPEND|double[-_ ]?spend|MEMPOOL_CHAIN_LIMIT/i.test(innerMsg)
+        const preserveMissingInputLegacy = PRESERVE_UTXO_ON_MISSING_INPUT && /Missing input|Missing inputs|missing inputs/i.test(innerMsg)
+        const preserveUsedReservation = preserveMempoolConflict || preserveMissingInputLegacy
         // On failure, release reserved UTXOs back to pool
         if (ENABLE_UTXO_POOL && reservedKeys.length > 0 && !preserveUsedReservation) {
           this.releaseUtxos(reservedKeys)
@@ -2074,11 +2080,15 @@ export class BlockchainService {
         } else if (gpRes.status >= 500) {
           this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, `HTTP ${gpRes.status}`)
         }
-        // GorillaPool sometimes rejects extended-format metadata with 461.
-        // Retry once without prevouts before failing over to TAAL/WoC.
+        // GorillaPool sometimes rejects extended-format metadata with 461, or returns 460 when parents
+        // are not visible to ARC. Retry once with rawTx-only before failing over to TAAL/WoC.
         const gp461 = gpRes.status === 461 || /malformed|false\/empty top stack/i.test(gpText)
-        this.logBroadcastStep(traceId, 'gorillapool_arc', `http_${gpRes.status}`, Date.now() - gpStartedAt, gp461 ? 'compat-retry' : undefined)
-        if (useExtended && gp461) {
+        const gp460 =
+          gpRes.status === 460 ||
+          /parent transaction not found|fee requires|Not extended format|Missing input scripts|Failed validity with parents/i.test(gpText)
+        const gpCompatRetry = useExtended && (gp461 || gp460)
+        this.logBroadcastStep(traceId, 'gorillapool_arc', `http_${gpRes.status}`, Date.now() - gpStartedAt, gpCompatRetry ? 'compat-retry' : undefined)
+        if (gpCompatRetry) {
           try {
             const gpCompatStartedAt = Date.now()
             this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
@@ -2093,7 +2103,7 @@ export class BlockchainService {
               if (txid) {
                 this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'accepted', Date.now() - gpCompatStartedAt, `txid=${this.shortenToken(txid, 12)}`)
                 if (bsvConfig.logging.level !== 'error') {
-                  console.warn('⚠️  ARC (GorillaPool): accepted after rawTx compatibility retry (without extended inputs)')
+                  console.warn('⚠️  ARC (GorillaPool): accepted after rawTx compatibility retry (460/461 / extended mismatch)')
                 }
                 this.clearBroadcastChannelBackoff('gorillapool_arc')
                 return { txid, acceptedVia: 'gorillapool_arc' }
@@ -2165,7 +2175,53 @@ export class BlockchainService {
         } else if (arcRes.status >= 500) {
           this.noteBroadcastChannelBackoff('taal_arc', 30000, `HTTP ${arcRes.status}`)
         }
-        errors.push(`TAAL ARC failed (${arcRes.status}): ${arcText.substring(0, 300)}`)
+        const taal461 = arcRes.status === 461 || /malformed|false\/empty top stack/i.test(arcText)
+        const taal460 =
+          arcRes.status === 460 ||
+          /parent transaction not found|fee requires|Not extended format|Missing input scripts|Failed validity with parents/i.test(arcText)
+        const taalCompatRetry = useExtended && (taal461 || taal460)
+        if (taalCompatRetry) {
+          try {
+            const taalCompatStartedAt = Date.now()
+            this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
+            const taalCompatRes = await this.fetchWithTimeout(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
+              method: 'POST',
+              headers: taalHeaders,
+              body: JSON.stringify(arcBodyRaw),
+            })
+            const taalCompatText = await taalCompatRes.text().catch(() => '')
+            if (taalCompatRes.ok) {
+              const txid = this.parseArcResponse(taalCompatText, 'TAAL')
+              if (txid) {
+                this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'accepted', Date.now() - taalCompatStartedAt, `txid=${this.shortenToken(txid, 12)}`)
+                if (bsvConfig.logging.level !== 'error') {
+                  console.warn('⚠️  ARC (TAAL): accepted after rawTx compatibility retry (460/461)')
+                }
+                this.clearBroadcastChannelBackoff('taal_arc')
+                return { txid, acceptedVia: 'taal_arc' }
+              }
+              this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'rejected', Date.now() - taalCompatStartedAt, 'ok-without-accepted-txid')
+              errors.push(`TAAL ARC compatibility retry: unexpected response: ${taalCompatText.substring(0, 200)}`)
+            } else {
+              this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', `http_${taalCompatRes.status}`, Date.now() - taalCompatStartedAt)
+              if (bsvConfig.logging.level !== 'error') {
+                console.warn(`⚠️  ARC (TAAL compat) ${taalCompatRes.status}: ${taalCompatText.substring(0, 150)}`)
+              }
+              if (taalCompatRes.status === 429) {
+                this.noteBroadcastChannelBackoff('taal_arc', 60000, 'HTTP 429')
+              } else if (taalCompatRes.status >= 500) {
+                this.noteBroadcastChannelBackoff('taal_arc', 30000, `HTTP ${taalCompatRes.status}`)
+              }
+              errors.push(`TAAL ARC compatibility retry failed (${taalCompatRes.status}): ${taalCompatText.substring(0, 300)}`)
+            }
+          } catch (compatErr) {
+            this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'error', undefined, compatErr instanceof Error ? compatErr.message : String(compatErr))
+            this.noteBroadcastChannelBackoff('taal_arc', 30000, compatErr instanceof Error ? compatErr.message : String(compatErr))
+            errors.push(`TAAL ARC compatibility retry error: ${compatErr instanceof Error ? compatErr.message : String(compatErr)}`)
+          }
+        } else {
+          errors.push(`TAAL ARC failed (${arcRes.status}): ${arcText.substring(0, 300)}`)
+        }
       }
       }
     } catch (e) {
