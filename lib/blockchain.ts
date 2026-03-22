@@ -1948,9 +1948,10 @@ export class BlockchainService {
   }
 
   // ARC txStatus values that indicate the TX was genuinely accepted for our purposes.
-  // SEEN_IN_ORPHAN_MEMPOOL is intentionally excluded: ARC holds the tx but WhatsOnChain
-  // often returns 404 until parents confirm — we fall through to TAAL ARC / WoC instead.
-  // Opt back in with BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=true (not recommended for production).
+  // SEEN_IN_ORPHAN_MEMPOOL: relay accepted the tx but parent(s) are not visible to that ARC
+  // instance yet. Falling through to TAAL/WoC often yields 460 / "Missing inputs" for the same
+  // reason — so treating orphan as success (default) avoids total broadcast failure. Operators
+  // who require strict main-mempool acceptance can set BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=false.
   private static ARC_OK_STATUSES = new Set([
     'SEEN_ON_NETWORK',
     'MINED',
@@ -1989,16 +1990,24 @@ export class BlockchainService {
         return null
       }
 
-      // Orphan mempool: do not treat as broadcast success unless operator explicitly opts in
+      // Orphan mempool: accept by default (GP often returns this when parents lag; TAAL/WoC then 460/missing-inputs).
+      // Set BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=false to try fallbacks instead (legacy strict behaviour).
       if (txid && status === 'SEEN_IN_ORPHAN_MEMPOOL') {
-        if (process.env.BSV_ARC_ACCEPT_ORPHAN_MEMPOOL === 'true') {
-          return txid
+        const acceptOrphan = process.env.BSV_ARC_ACCEPT_ORPHAN_MEMPOOL !== 'false'
+        if (!acceptOrphan) {
+          console.warn(
+            `⚠️  ARC (${providerLabel}): txStatus=SEEN_IN_ORPHAN_MEMPOOL — trying next broadcaster ` +
+              `(unset BSV_ARC_ACCEPT_ORPHAN_MEMPOOL or set true to accept) txid=${txid.substring(0, 12)}...`,
+          )
+          return null
         }
-        console.warn(
-          `⚠️  ARC (${providerLabel}): txStatus=SEEN_IN_ORPHAN_MEMPOOL — trying next broadcaster ` +
-            `(set BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=true to accept) txid=${txid.substring(0, 12)}...`,
-        )
-        return null
+        if (bsvConfig.logging.level !== 'error') {
+          console.warn(
+            `⚠️  ARC (${providerLabel}): txStatus=SEEN_IN_ORPHAN_MEMPOOL — accepting txid=${txid.substring(0, 12)}... ` +
+              `(parents not visible to all relays; set BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=false to reject)`,
+          )
+        }
+        return txid
       }
 
       // Accept if status is known-good or if no status field was returned (legacy ARC)
