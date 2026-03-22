@@ -338,7 +338,9 @@ export class WorkerQueue {
         return
       }
 
-      const concurrency = Math.max(1, Number(process.env.BSV_QUEUE_CONCURRENCY || 25))
+      // Default 2 (matches env.template). Unset used to fall back to 25 — that deepens mempool chains and
+      // triggers ARC 460 / WoC missing-inputs under overlay + parallel spends.
+      const concurrency = Math.max(1, Number(process.env.BSV_QUEUE_CONCURRENCY || 2))
       const maxItemsPerBatch = Math.min(
         bsvConfig.queue.batchSize,
         bsvConfig.queue.maxTxPerSecond,
