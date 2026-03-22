@@ -207,3 +207,21 @@ Then restart workers: `pm2 restart gaialog-workers`
 **Cause:** Space weather (or another high-volume provider) has hit its `maxInFlight` limit. The queue is full and cannot accept more until some items are broadcast.
 
 **Fix:** Resolve UTXO/overlay issues so broadcasts can complete. Once the queue drains, backpressure will ease.
+
+---
+
+### 8. Treasury UTXOs: overlay shows rows but writes stall (`No UTXOs` or queue paused)
+
+**Cause:** Two different confirmation policies:
+
+- **`BSV_MIN_SPEND_CONFIRMATIONS`** — spend path: `> 0` means only overlay rows with `confirmed=true` are listed for `writeToChain`. If your DB never sets `confirmed`, counts with `confirmedOnly=true` are zero even when `confirmedOnly=false` shows many rows.
+- **`BSV_UTXO_MIN_CONFIRMATIONS`** — queue gate + UTXO maintainer inventory: unset defaults to **1** (conservative). Set **`BSV_UTXO_MIN_CONFIRMATIONS=0`** explicitly if you want the maintainer and pause gate to count **unconfirmed** overlay rows (align with `BSV_MIN_SPEND_CONFIRMATIONS=0`).
+
+**Ops:** After deploy, set `GAIALOG_UTXO_HEALTH_SECRET` (≥8 characters) in `.env` and call:
+
+```bash
+curl -sS "https://your-host/api/blockchain/utxo-health" \
+  -H "x-gaialog-utxo-health-secret: YOUR_SECRET"
+```
+
+Response includes per-wallet `totalSpendable` vs `confirmedSpendable` and active policy values. See `env.template` for `BSV_OVERLAY_EMPTY_DRIFT_RETRY`, `BSV_UTXO_MAINTAINER_INVENTORY_LOG_INTERVAL_MS`, and `BSV_UTXO_DRIFT_LOG_INTERVAL_MS`.

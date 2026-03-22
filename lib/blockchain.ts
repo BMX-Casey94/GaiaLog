@@ -17,6 +17,11 @@ import type { CredibilityMetadata } from './types/credibility'
 import { addReading, canAttemptExplorerWrite, type StoredReading } from './explorer-read-source'
 import { removeUnconfirmedReading } from './overlay-explorer-repository'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress, type SpendableOutput } from './spend-source'
+import { getMinSpendConfirmations } from './utxo-spend-policy'
+import {
+  logOverlayEmptyListDrift,
+  logOverlayUnconfirmedOnlyBlocked,
+} from './utxo-overlay-monitor'
 import { QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
 
@@ -91,7 +96,7 @@ const DUST_LIMIT = 1
 //   2. mempool-chain backoff — pauses a wallet for 10 min on "too-long-mempool-chain"
 //   3. UTXO splitter — creates fan-out pools from confirmed UTXOs
 // Override with BSV_MIN_SPEND_CONFIRMATIONS=1 (or higher) if desired.
-const MIN_SPEND_CONF = Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS ?? 0)
+const MIN_SPEND_CONF = getMinSpendConfirmations()
 const REFRESH_THRESHOLD = Number(process.env.BSV_UTXO_REFRESH_THRESHOLD || 10)
 const SPEND_SOURCE_LIST_LIMIT = Math.max(100, Number(process.env.BSV_SPEND_SOURCE_LIST_LIMIT || 5000))
 const BROADCAST_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.BSV_BROADCAST_TIMEOUT_MS || 15000))
@@ -1589,18 +1594,50 @@ export class BlockchainService {
     const inflight = this.overlayInFlight.get(address)
     if (inflight) return inflight
 
+    const driftRetryEnabled = process.env.BSV_OVERLAY_EMPTY_DRIFT_RETRY !== 'false'
+
     const fetching = (async () => {
       const topic = getTreasuryTopicForWallet(walletIndex)
       const spendSource = getSpendSourceForWallet(walletIndex)
-      const outputs = await spendSource.listSpendable({
-        topic,
-        limit: SPEND_SOURCE_LIST_LIMIT,
-        order: 'asc',
-        minSatoshis: 0,
-        excludeReserved: false,
-        confirmedOnly: MIN_SPEND_CONF > 0,
-      })
-      return outputs.map(output => this.mapSpendSourceOutputToUtxo(output, address))
+      const confirmedOnly = MIN_SPEND_CONF > 0
+      const listOnce = async () => {
+        const outputs = await spendSource.listSpendable({
+          topic,
+          limit: SPEND_SOURCE_LIST_LIMIT,
+          order: 'asc',
+          minSatoshis: 0,
+          excludeReserved: false,
+          confirmedOnly,
+        })
+        return outputs.map(output => this.mapSpendSourceOutputToUtxo(output, address))
+      }
+
+      let mapped = await listOnce()
+
+      if (mapped.length === 0 && driftRetryEnabled) {
+        try {
+          const totalAny = await spendSource.countSpendable({
+            topic,
+            minSatoshis: 0,
+            excludeReserved: false,
+            confirmedOnly: false,
+            allowDegradedStale: true,
+          })
+
+          if (totalAny > 0 && confirmedOnly) {
+            logOverlayUnconfirmedOnlyBlocked(walletIndex, totalAny, MIN_SPEND_CONF)
+          }
+
+          if (totalAny > 0 && !confirmedOnly) {
+            logOverlayEmptyListDrift(walletIndex, totalAny)
+            mapped = await listOnce()
+          }
+        } catch {
+          // count is best-effort diagnostics / retry trigger
+        }
+      }
+
+      return mapped
     })()
 
     this.overlayInFlight.set(address, fetching)

@@ -5,6 +5,8 @@ import * as bsv from 'bsv'
 import { bsvConfig } from './bsv-config'
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress } from './spend-source'
+import { getMaintainerMinConfirmations } from './utxo-spend-policy'
+import { fetchTreasuryOverlayInventorySnapshot, logTreasuryOverlayInventorySummary } from './utxo-overlay-monitor'
 
 const NET = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY || ''
@@ -28,7 +30,7 @@ const LOW_WATER = Number(process.env.BSV_UTXO_LOW_WATERMARK || Math.max(150, Mat
 const SPLIT_BATCH_MAX = Number(process.env.BSV_UTXO_SPLIT_BATCH_MAX || 1200)
 const SPLIT_BATCH = Number(process.env.BSV_UTXO_SPLIT_BATCH || Math.min(SPLIT_BATCH_MAX, Math.max(100, Math.ceil(TARGET * 0.4))))
 const SPLIT_OUTPUT_SATS = Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 2000)
-const MIN_CONF = Number(process.env.BSV_UTXO_MIN_CONFIRMATIONS || 1)
+const MIN_CONF = getMaintainerMinConfirmations()
 const INTERVAL_MS = Number(process.env.BSV_UTXO_MAINTAINER_INTERVAL_MS || 30000) // 30s for high-throughput
 // GorillaPool/TAAL ARC minimum: 100 sat/kB. Default 0.105 sat/byte (105 sat/kB) for 5% margin.
 const FEE_RATE = Number((process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE) || 0.105)
@@ -223,7 +225,8 @@ async function getSpendableInventoryCount(address: string, legacyConfirmedCount:
       topic: getTreasuryTopicForWallet(walletIndex),
       minSatoshis: 0,
       excludeReserved: false,
-      confirmedOnly: true,
+      // Align with BSV_UTXO_MIN_CONFIRMATIONS / maintainer: 0 = count unconfirmed overlay rows too.
+      confirmedOnly: MIN_CONF > 0,
       allowDegradedStale: true,
     })
   } catch {
@@ -405,8 +408,28 @@ export async function logUtxoHealthDiagnostics(): Promise<void> {
   const keys = (bsvConfig?.wallets?.privateKeys || []).filter(k => !!k)
   if (keys.length === 0) return
 
+  const spendMode = String(process.env.BSV_SPEND_SOURCE_MODE || '').toLowerCase()
+
   console.log(`\n📊 UTXO Pool Health Report (target: ${TARGET}/wallet, low-water: ${LOW_WATER}, split-batch: ${SPLIT_BATCH})`)
   console.log(`   Auto-calculated from ${EXPECTED_TX_PER_DAY.toLocaleString()} TX/day across ${WALLET_COUNT} wallet(s)`)
+  console.log(`   Maintainer min confirmations (BSV_UTXO_MIN_CONFIRMATIONS): ${MIN_CONF}`)
+
+  if (spendMode === 'overlay') {
+    try {
+      const snap = await fetchTreasuryOverlayInventorySnapshot()
+      for (const row of snap) {
+        if (row.error) {
+          console.log(`   Overlay ${row.walletLabel} (${row.topic}): ❌ ${row.error}`)
+        } else {
+          console.log(
+            `   Overlay ${row.walletLabel}: ${row.totalSpendable} row(s) total, ${row.confirmedSpendable} confirmed in DB`,
+          )
+        }
+      }
+    } catch (e) {
+      console.log(`   Overlay inventory snapshot: ❌ ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
 
   for (let i = 0; i < keys.length; i++) {
     try {
@@ -427,13 +450,13 @@ export async function logUtxoHealthDiagnostics(): Promise<void> {
       const hasAny = confirmed.length + unconfirmed.length > 0
       const status = confirmed.length >= LOW_WATER ? '✅' :
         hasAny ? '⚠️' : '❌'
-      console.log(`   Wallet ${i + 1} (${address}):`)
-      console.log(`     ${status} ${confirmed.length} confirmed UTXO(s) (${(confirmedSats / 1e8).toFixed(6)} BSV) | ${unconfirmed.length} unconfirmed (${((totalSats - confirmedSats) / 1e8).toFixed(6)} BSV)`)
+      console.log(`   Wallet ${i + 1} (${address}) — legacy/WoC view:`)
+      console.log(`     ${status} ${confirmed.length} UTXO(s) meeting minConf=${MIN_CONF} (${(confirmedSats / 1e8).toFixed(6)} BSV) | ${unconfirmed.length} other (${((totalSats - confirmedSats) / 1e8).toFixed(6)} BSV)`)
 
       if (confirmed.length === 0 && unconfirmed.length > 0) {
-        console.log(`     ℹ️  All ${unconfirmed.length} UTXO(s) unconfirmed — will be usable once mined (spending proceeds normally)`)
+        console.log(`     ℹ️  Legacy path shows unconfirmed-only — overlay spend-source may still list admitted rows (see above).`)
       } else if (confirmed.length > 0 && confirmed.length < LOW_WATER) {
-        console.log(`     ⚠️  Below low-water mark (${LOW_WATER}) — UTXO maintainer will auto-split`)
+        console.log(`     ⚠️  Below low-water mark (${LOW_WATER}) — UTXO maintainer will auto-split when a large enough input exists`)
       }
     } catch (e) {
       console.log(`   Wallet ${i + 1}: ❌ Error — ${e instanceof Error ? e.message : String(e)}`)
@@ -474,6 +497,15 @@ export function clearWalletBackoff(address: string): void {
 
 // ─── Main maintainer loop ───────────────────────────────────────────────────
 const UTXO_MAINTAINER_KEY = '__GAIALOG_UTXO_MAINTAINER_STARTED__' as const
+const UTXO_INV_LOG_KEY = '__GAIALOG_UTXO_INV_LOG_AT__' as const
+
+function getLastInventoryLogAt(): number {
+  return Number((globalThis as any)[UTXO_INV_LOG_KEY] || 0)
+}
+
+function setLastInventoryLogAt(ts: number): void {
+  ;(globalThis as any)[UTXO_INV_LOG_KEY] = ts
+}
 
 export function startUtxoMaintainer(): void {
   const mutatorControl = getMutatorControlState()
@@ -513,6 +545,13 @@ export function startUtxoMaintainer(): void {
       }
     } finally {
       running = false
+    }
+
+    const invInterval = Math.max(60_000, Number(process.env.BSV_UTXO_MAINTAINER_INVENTORY_LOG_INTERVAL_MS || 300_000))
+    const now = Date.now()
+    if (now - getLastInventoryLogAt() >= invInterval) {
+      setLastInventoryLogAt(now)
+      logTreasuryOverlayInventorySummary().catch(() => {})
     }
   }
 

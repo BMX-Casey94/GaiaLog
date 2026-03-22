@@ -7,6 +7,7 @@ import { ensureQueueTable, enqueueQueueItem, loadPendingQueueItems, markQueueIte
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getOverlayFallbackConfig } from './overlay-config'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet } from './spend-source'
+import { getQueueGateMinConfirmations } from './utxo-spend-policy'
 import { normaliseDataFamily, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
 
@@ -526,7 +527,7 @@ export class WorkerQueue {
       const addresses = walletManager.getAllWalletAddresses()
       if (!addresses || addresses.length === 0) return true
       const pauseMin = Number(process.env.BSV_UTXO_PAUSE_MIN || process.env.BSV_UTXO_MIN_WATERMARK || 10)
-      const minConf = Number(process.env.BSV_UTXO_MIN_CONFIRMATIONS || 1)
+      const minConf = getQueueGateMinConfirmations()
       const gateSource = getOverlayFallbackConfig().queueGateSource
       const legacyProvider = gateSource === 'legacy'
         ? (await import('./utxo-provider')).getUnspentForAddress
@@ -567,7 +568,7 @@ export class WorkerQueue {
         const atOrAboveMin = results.filter(r => r.confirmed >= pauseMin).length
         const shouldLog = (this.utxoPauseState !== 'paused') || (now - this.lastUtxoPauseLogAt > 60000)
         if (shouldLog) {
-          console.log(`⏸️  Pausing writes: ${atOrAboveMin}/${results.length} wallets at/above minimum (source=${gateSource}, minConfirmed=${minConfirmed}, minRequired=${pauseMin}). Checking every 30s.`)
+          console.log(`⏸️  Pausing writes: ${atOrAboveMin}/${results.length} wallets at/above minimum (source=${gateSource}, gateCountMin=${minConfirmed}, pauseMin=${pauseMin}, BSV_UTXO_MIN_CONFIRMATIONS=${minConf}). Checking every 30s.`)
           this.lastUtxoPauseLogAt = now
         }
         this.utxoPauseState = 'paused'
@@ -587,7 +588,7 @@ export class WorkerQueue {
         }
       } else {
         if (this.utxoPauseState !== 'ok') {
-          console.log(`▶️  Resuming writes: confirmed UTXOs recovered across all wallets (source=${gateSource}).`)
+          console.log(`▶️  Resuming writes: UTXO gate counts recovered across wallets (source=${gateSource}).`)
         }
         this.utxoPauseState = 'ok'
         const minConfirmed = results.length ? Math.min(...results.map(r => r.confirmed)) : 0

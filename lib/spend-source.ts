@@ -8,6 +8,7 @@ import { spendSourceObservability } from './spend-source-observability'
 import { getReservedUtxoKeys } from './utxo-locks'
 import { getUnspentForAddress } from './utxo-provider'
 import { walletManager } from './wallet-manager'
+import { getQueueGateMinConfirmations } from './utxo-spend-policy'
 
 export type SpendSourceMode = 'legacy' | 'shadow' | 'overlay'
 export type SpendableOrder = 'asc' | 'desc'
@@ -120,7 +121,6 @@ const DEFAULT_TOPIC_PREFIX = 'TREASURY'
 const DEFAULT_TOPIC_VERSION = 'v1'
 const DEFAULT_OVERLAY_PROVIDER_ID = 'donations-lookup'
 const DEFAULT_LIST_LIMIT = 200
-const DEFAULT_MIN_CONF = Math.max(1, Number(process.env.BSV_UTXO_MIN_CONFIRMATIONS || 1))
 const LEGACY_SUBMIT_WARN_KEY = '__GAIALOG_LEGACY_SPEND_SOURCE_SUBMIT_WARNED__'
 const OVERLAY_COUNT_FALLBACK_WARN_KEY = '__GAIALOG_OVERLAY_COUNT_FALLBACK_WARNED__'
 const OVERLAY_FALLBACK_WARN_KEY = '__GAIALOG_OVERLAY_SPEND_SOURCE_FALLBACK_WARNED__'
@@ -205,10 +205,11 @@ function compareSpendables(left: LegacyWalletSpendable, right: LegacyWalletSpend
   return direction * (left.vout - right.vout)
 }
 
-function isLegacyUtxoConfirmed(utxo: any, minConf: number = DEFAULT_MIN_CONF): boolean {
+function isLegacyUtxoConfirmed(utxo: any, minConf?: number): boolean {
+  const m = minConf ?? getQueueGateMinConfirmations()
   const confirmations = Number(utxo?.confirmations || 0)
   const height = typeof utxo?.height === 'number' ? utxo.height : null
-  return confirmations >= minConf || (height != null && height > 0)
+  return confirmations >= m || (height != null && height > 0)
 }
 
 function getOutputScriptHex(address: string): string {

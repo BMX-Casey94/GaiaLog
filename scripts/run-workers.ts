@@ -1,6 +1,7 @@
 import 'dotenv/config'
 import dotenv from 'dotenv'
 import { applyPrimaryMutatorRole, getMutatorControlState } from '../lib/mutator-control'
+import { getMinSpendConfirmations, getQueueGateMinConfirmations } from '../lib/utxo-spend-policy'
 // Load .env.local only in development; production/VPS uses .env only to avoid brc104 override
 if (process.env.NODE_ENV !== 'production') {
   dotenv.config({ path: '.env.local' })
@@ -78,7 +79,7 @@ async function main() {
       console.log(
         `📡 Broadcast config: fee=${Number(process.env.BSV_TX_FEE_RATE || 0.105)} sat/B ` +
         `timeout=${Math.max(3000, Number(process.env.BSV_BROADCAST_TIMEOUT_MS || 15000))}ms ` +
-        `minConf=${Number(process.env.BSV_MIN_SPEND_CONFIRMATIONS ?? 0)} ` +
+        `minSpendConf=${getMinSpendConfirmations()} queueGateMinConf=${getQueueGateMinConfirmations()} ` +
         `utxoPool=${process.env.BSV_ENABLE_UTXO_POOL === 'true' ? 'on' : 'off'} ` +
         `dbLocks=${process.env.BSV_ENABLE_UTXO_DB_LOCKS === 'true' ? 'on' : 'off'} ` +
         `trace=${traceMode}`
