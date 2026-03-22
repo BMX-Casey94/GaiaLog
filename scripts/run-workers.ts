@@ -1,12 +1,15 @@
-import 'dotenv/config'
 import dotenv from 'dotenv'
+import path from 'path'
 import { applyPrimaryMutatorRole, getMutatorControlState } from '../lib/mutator-control'
 import { getMinSpendConfirmations, getQueueGateMinConfirmations } from '../lib/utxo-spend-policy'
+
+const repoRoot = path.resolve(__dirname, '..')
+// `.env` on disk must win over stale vars PM2 keeps in dump (dotenv default does not override).
+dotenv.config({ path: path.join(repoRoot, '.env'), override: true })
 // Load .env.local only in development; production/VPS uses .env only to avoid brc104 override
 if (process.env.NODE_ENV !== 'production') {
-  dotenv.config({ path: '.env.local' })
+  dotenv.config({ path: path.join(repoRoot, '.env.local'), override: true })
 }
-dotenv.config()
 
 applyPrimaryMutatorRole()
 

@@ -1,8 +1,9 @@
-import 'dotenv/config'
 import dotenv from 'dotenv'
+import path from 'path'
 
-dotenv.config({ path: '.env.local' })
-dotenv.config()
+const repoRoot = path.resolve(__dirname, '..')
+dotenv.config({ path: path.join(repoRoot, '.env.local') })
+dotenv.config({ path: path.join(repoRoot, '.env'), override: true })
 
 import { getOverlayServerConfig } from '@/lib/overlay-config'
 import { createOverlayApp } from '@/lib/overlay-server'

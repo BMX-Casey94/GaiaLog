@@ -92,6 +92,16 @@ pm2 restart gaialog-web gaialog-workers gaialog-overlay --update-env
 
 Also check PM2 did not freeze an old value: `pm2 show gaialog-workers | grep -i orphan` (if your ecosystem injects it, fix the ecosystem file).
 
+**Stale PM2 env:** If `.env` is correct but logs still show the old orphan message, PM2’s saved process env can still carry `BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=false`. By default, `dotenv` does not override existing `process.env` keys — GaiaLog now loads `.env` with `override: true` in `run-workers.ts`, `run-overlay-server.ts`, and `next.config.mjs` after you `git pull`. Until then, either:
+
+```bash
+export BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=true
+pm2 restart gaialog-workers gaialog-web gaialog-overlay --update-env
+pm2 save
+```
+
+or remove that variable from your PM2 ecosystem / `pm2 delete` + fresh `pm2 start` so it is not injected before Node starts.
+
 ### 1a. Trigger UTXO cache refresh (web) and split tooling
 
 `GET`/`POST` `/api/blockchain/refresh-utxos` only clears/refetches UTXO state inside **that Next.js process**. **Worker** processes hold separate in-memory overlay caches — after chain moves or overlay DB updates, restart workers: `pm2 restart gaialog-workers`.

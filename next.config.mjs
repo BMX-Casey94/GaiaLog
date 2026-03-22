@@ -1,8 +1,11 @@
 import { createRequire } from 'module'
+import dotenv from 'dotenv'
 import path from 'path'
 import { fileURLToPath } from 'url'
 const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+// PM2 may inject old env; `.env` on disk is source of truth for Next server/build.
+dotenv.config({ path: path.join(__dirname, '.env'), override: true })
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
