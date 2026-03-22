@@ -1900,6 +1900,10 @@ export class BlockchainService {
             cache.inFlight = null // Cancel any in-flight refresh
           }
         }
+
+        // Overlay-backed lookups cache responses in-process; clear so next spend path refetches
+        this.overlayResponseCache.delete(addr)
+        this.overlayInFlight.delete(addr)
         
         // Force refresh
         await this.refreshUtxoCache(addr, wif)

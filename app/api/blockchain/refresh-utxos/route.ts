@@ -21,7 +21,8 @@ export async function POST() {
     
     return NextResponse.json({
       success: true,
-      message: 'UTXO caches refreshed successfully',
+      message:
+        'UTXO caches refreshed for this Next.js process only. Worker processes keep their own in-memory overlay caches — restart them (e.g. pm2 restart gaialog-workers) after chain or overlay DB changes so spend paths see fresh UTXOs.',
       timestamp: new Date().toISOString()
     })
   } catch (error) {

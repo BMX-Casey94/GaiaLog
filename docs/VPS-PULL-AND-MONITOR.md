@@ -39,25 +39,43 @@ cd /path/to/GaiaLog
 # Pull latest from master
 git pull origin master
 
-# Install dependencies if package.json changed
-npm install
+# Install dependencies if package-lock.json / package.json changed (prefer reproducible installs)
+npm ci
+# or: npm install
 # or: pnpm install
 
-# Rebuild Next.js if needed
+# Rebuild Next.js if the app changed
 npm run build
 
-# Restart workers (choose one based on your setup)
-# If using PM2:
-pm2 restart gialog-workers
-# or: pm2 restart all
+# Restart processes (names must match `pm2 list` on your host)
+pm2 restart gaialog-web
+pm2 restart gaialog-workers
+# If you run overlay lookup/submit on the same machine:
+# pm2 restart gaialog-overlay
 
-# If using systemd:
-sudo systemctl restart gialog-workers
+# If using systemd instead of PM2:
+# sudo systemctl restart gaialog-web gaialog-workers
 
 # If running workers directly (foreground):
 # Stop the current process (Ctrl+C) and restart:
-npm run workers
+# npm run workers
 ```
+
+### 1a. Trigger UTXO cache refresh (web) and split tooling
+
+`GET`/`POST` `/api/blockchain/refresh-utxos` only clears/refetches UTXO state inside **that Next.js process**. **Worker** processes hold separate in-memory overlay caches — after chain moves or overlay DB updates, restart workers: `pm2 restart gaialog-workers`.
+
+```bash
+# Optional: refresh UTXO caches in the web app (localhost or your public URL + auth if required)
+curl -sS -X POST "http://127.0.0.1:3000/api/blockchain/refresh-utxos"
+
+# Dry-run a split (no broadcast); then remove --dry-run when satisfied
+npm run split:utxos -- --wallet 0 --outputs 200 --amount 2000 --dry-run
+# Live broadcast (ensure BSV_GORILLAPOOL_API_KEY / BSV_ARC_API_KEY / WoC key as appropriate)
+# npm run split:utxos -- --wallet 0 --outputs 200 --amount 2000
+```
+
+**Production note:** Size treasury splits against expected throughput and per-wallet balance (many deployments target on the order of **~0.75 BSV** operational balance per hot wallet; adjust `--outputs` / `--amount` accordingly).
 
 ---
 
@@ -75,16 +93,16 @@ grep GAIALOG_ROLLOUT_GATE .env
 
 ```bash
 # Live tail of worker logs
-pm2 logs gialog-workers --lines 200
+pm2 logs gaialog-workers --lines 200
 
 # Filter for errors
-pm2 logs gialog-workers --err --lines 100
+pm2 logs gaialog-workers --err --lines 100
 
 # Filter for specific workers (Geomagnetism, Upper Atmosphere, etc.)
-pm2 logs gialog-workers 2>&1 | grep -E "Geomagnetism|UpperAtmosphere|GBIF|USGS-Water|NASA-EONET|OpenSky|International-Planning"
+pm2 logs gaialog-workers 2>&1 | grep -E "Geomagnetism|UpperAtmosphere|GBIF|USGS-Water|NASA-EONET|OpenSky|International-Planning"
 
 # Filter for broadcast/queue activity
-pm2 logs gialog-workers 2>&1 | grep -E "Direct broadcast|Queued|Error collecting|Error fetching"
+pm2 logs gaialog-workers 2>&1 | grep -E "Direct broadcast|Queued|Error collecting|Error fetching"
 ```
 
 ### Direct process (if workers run via npm run workers)
@@ -114,7 +132,7 @@ npm run workers 2>&1 | tee -a worker-debug.log
 ### One-liner to watch for errors in missing families
 
 ```bash
-pm2 logs gialog-workers --lines 0 2>&1 | grep -iE "Error|❌|Geomagnetism|UpperAtmosphere|GBIF|USGS-Water|UkEaFlood|NASA-EONET|OpenSky|International-Planning|UsgsMrds|GfwWorker"
+pm2 logs gaialog-workers --lines 0 2>&1 | grep -iE "Error|❌|Geomagnetism|UpperAtmosphere|GBIF|USGS-Water|UkEaFlood|NASA-EONET|OpenSky|International-Planning|UsgsMrds|GfwWorker"
 ```
 
 ### Check worker status via API (if Next.js is running)

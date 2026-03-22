@@ -7,13 +7,7 @@ import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress } from './spend-source'
 import { getMaintainerMinConfirmations } from './utxo-spend-policy'
 import { fetchTreasuryOverlayInventorySnapshot, logTreasuryOverlayInventorySummary } from './utxo-overlay-monitor'
-
-const NET = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
-const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY || ''
-// Broadcasting endpoints: GorillaPool ARC (primary) → TAAL ARC (fallback) → WoC (final)
-const GORILLAPOOL_ARC_ENDPOINT = (process.env.BSV_GORILLAPOOL_ARC_ENDPOINT || 'https://arc.gorillapool.io').replace(/\/$/, '')
-const TAAL_ARC_ENDPOINT = (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com').replace(/\/$/, '')
-const ARC_KEY = process.env.BSV_ARC_API_KEY || ''
+import { broadcastSplitTransactionRaw } from './broadcast-raw-tx'
 
 // ─── Auto-sizing from expected throughput ───────────────────────────────────
 // 2,000,000 TX/day across 3 wallets ≈ 666,667 TX/wallet/day.
@@ -103,111 +97,12 @@ function releaseSplitInputHold(address: string, utxoKey: string): void {
   maintState.heldSplitInputs.delete(holdKey(address, utxoKey))
 }
 
-// ─── ARC response validation (mirrors blockchain.ts logic) ──────────────────
-const ARC_OK_STATUSES = new Set([
-  'SEEN_ON_NETWORK', 'MINED', 'ACCEPTED', 'STORED', 'RECEIVED',
-  'ANNOUNCED_TO_NETWORK', 'SEEN_IN_ORPHAN_MEMPOOL',
-])
-const ARC_REJECT_STATUSES = new Set([
-  'DOUBLE_SPEND_ATTEMPTED', 'REJECTED', 'INVALID', 'EVICTED',
-])
-
-function parseArcResponse(responseText: string, providerLabel: string): string | null {
-  try {
-    const parsed = JSON.parse(responseText || '{}')
-    const txid = typeof parsed.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(parsed.txid)
-      ? parsed.txid : null
-    const status = typeof parsed.txStatus === 'string' ? parsed.txStatus : ''
-
-    if (txid && ARC_REJECT_STATUSES.has(status)) {
-      const extra = parsed.extraInfo ? ` (${String(parsed.extraInfo).substring(0, 80)})` : ''
-      console.warn(`⚠️  UTXO-Split ARC (${providerLabel}): TX rejected — txStatus=${status}${extra}`)
-      return null
-    }
-    if (txid && (ARC_OK_STATUSES.has(status) || !status)) return txid
-    if (txid) {
-      console.warn(`⚠️  UTXO-Split ARC (${providerLabel}): Unknown txStatus="${status}" — accepting cautiously`)
-      return txid
-    }
-  } catch {}
-  const plain = (responseText || '').replace(/"/g, '').trim()
-  if (/^[0-9a-fA-F]{64}$/.test(plain)) return plain
-  return null
-}
-
 // ─── UTXO fetch ─────────────────────────────────────────────────────────────
 async function getUnspent(address: string): Promise<any[]> {
   const { getUnspentForAddress } = await import('./utxo-provider')
   return getUnspentForAddress(address, {
     confirmedOnly: process.env.BSV_UTXO_BOOTSTRAP_FROM_UNCONFIRMED !== 'true',
   })
-}
-
-// ─── Broadcast with proper ARC + WoC fallback ──────────────────────────────
-async function broadcastWithFallbacks(rawHex: string): Promise<string> {
-  const errors: string[] = []
-
-  // 1. GorillaPool ARC
-  try {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-    const gpApiKey = process.env.BSV_GORILLAPOOL_API_KEY
-    if (gpApiKey) headers['Authorization'] = `Bearer ${gpApiKey}`
-    const res = await fetch(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
-      method: 'POST', headers,
-      body: JSON.stringify({ rawTx: rawHex })
-    })
-    const text = await res.text().catch(() => '')
-    if (res.ok) {
-      const txid = parseArcResponse(text, 'GorillaPool')
-      if (txid) return txid
-      errors.push(`GorillaPool ARC: rejected — ${text.substring(0, 200)}`)
-    } else {
-      errors.push(`GorillaPool ARC ${res.status}: ${text.substring(0, 200)}`)
-    }
-  } catch (e) { errors.push(`GorillaPool ARC error: ${e instanceof Error ? e.message : String(e)}`) }
-
-  // 2. TAAL ARC
-  try {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-    if (ARC_KEY) headers['Authorization'] = `Bearer ${ARC_KEY}`
-    const res = await fetch(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
-      method: 'POST', headers,
-      body: JSON.stringify({ rawTx: rawHex })
-    })
-    const text = await res.text().catch(() => '')
-    if (res.ok) {
-      const txid = parseArcResponse(text, 'TAAL')
-      if (txid) return txid
-      errors.push(`TAAL ARC: rejected — ${text.substring(0, 200)}`)
-    } else {
-      errors.push(`TAAL ARC ${res.status}: ${text.substring(0, 200)}`)
-    }
-  } catch (e) { errors.push(`TAAL ARC error: ${e instanceof Error ? e.message : String(e)}`) }
-
-  // 3. WhatsOnChain broadcast (bypasses ARC entirely)
-  try {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-    if (WHATSONCHAIN_API_KEY) headers['woc-api-key'] = WHATSONCHAIN_API_KEY
-    const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${NET}/tx/raw`, {
-      method: 'POST', headers,
-      body: JSON.stringify({ txhex: rawHex })
-    })
-    const text = await res.text().catch(() => '')
-    if (res.ok) {
-      const txid = text.replace(/"/g, '').trim()
-      if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
-      errors.push(`WoC returned unexpected body: ${text.substring(0, 200)}`)
-    } else {
-      errors.push(`WoC broadcast ${res.status}: ${text.substring(0, 200)}`)
-    }
-  } catch (e) { errors.push(`WoC broadcast error: ${e instanceof Error ? e.message : String(e)}`) }
-
-  // Detect mempool-chain-limit (transient, will self-heal after next block)
-  const allErrors = errors.join('\n')
-  if (allErrors.includes('too-long-mempool-chain')) {
-    throw new Error('MEMPOOL_CHAIN_LIMIT')
-  }
-  throw new Error(`All split broadcast methods failed:\n${allErrors}`)
 }
 
 function p2pkhScriptHexFromWif(wif: string): string {
@@ -376,7 +271,7 @@ async function doSplit(
   const raw = tx.serialize()
 
   try {
-    const txid = await broadcastWithFallbacks(raw)
+    const txid = await broadcastSplitTransactionRaw(raw)
     maintState.pendingSplitUntilByAddress.set(address, Date.now() + SPLIT_COOLDOWN_MS)
     try {
       await submitSplitToSpendSource(address, txid, raw, scriptHex, inputSource)
