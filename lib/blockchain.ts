@@ -806,7 +806,25 @@ export class BlockchainService {
       isBackedOff = mod.isWalletBackedOff
     } catch {}
 
+    const isConfirmedUtxo = (u: any): boolean => {
+      const conf = Number(u?.confirmations || 0)
+      const h = typeof u?.height === 'number' ? u.height : null
+      return conf > 0 || (h != null && h > 0)
+    }
+
+    const pickByConfirmedFirst = process.env.BSV_WALLET_PICK_BY_CONFIRMED_FIRST !== 'false'
     const now = Date.now()
+
+    type WalletCandidate = {
+      pick: number
+      wif: string
+      address: string
+      spendable: any[]
+      confirmedCount: number
+      rrDistance: number
+    }
+    const candidates: WalletCandidate[] = []
+
     for (let i = 0; i < list.length; i++) {
       const pick = (this.rrIndex + i) % list.length
       const wif = list[pick]
@@ -823,17 +841,40 @@ export class BlockchainService {
 
         if (spendable.length > 0) {
           this.walletEmptyUntil.delete(pick)
-          this.rrIndex = (pick + 1) % list.length
-          return { wif, index: pick, address: addr, utxos: spendable }
+          const confirmedCount = spendable.filter(isConfirmedUtxo).length
+          if (pickByConfirmedFirst) {
+            candidates.push({
+              pick,
+              wif,
+              address: addr,
+              spendable,
+              confirmedCount,
+              rrDistance: i,
+            })
+          } else {
+            this.rrIndex = (pick + 1) % list.length
+            return { wif, index: pick, address: addr, utxos: spendable }
+          }
+        } else {
+          this.walletEmptyUntil.set(pick, now + BlockchainService.WALLET_EMPTY_CACHE_MS)
         }
-
-        this.walletEmptyUntil.set(pick, now + BlockchainService.WALLET_EMPTY_CACHE_MS)
       } catch {
         this.walletEmptyUntil.set(pick, now + BlockchainService.WALLET_EMPTY_CACHE_MS)
       }
     }
 
-    return null
+    if (!pickByConfirmedFirst || candidates.length === 0) {
+      return null
+    }
+
+    candidates.sort((a, b) => {
+      if (b.confirmedCount !== a.confirmedCount) return b.confirmedCount - a.confirmedCount
+      return a.rrDistance - b.rrDistance
+    })
+
+    const best = candidates[0]!
+    this.rrIndex = (best.pick + 1) % list.length
+    return { wif: best.wif, index: best.pick, address: best.address, utxos: best.spendable }
   }
 
   public getAddress(): string | null {
@@ -1859,9 +1900,10 @@ export class BlockchainService {
     console.log('✅ UTXO cache refresh complete')
   }
 
-  // ARC txStatus values that indicate the TX was genuinely accepted.
-  // SEEN_IN_ORPHAN_MEMPOOL means ARC accepted but parent chain is long/unconfirmed;
-  // the TX will propagate automatically once parents confirm in a block.
+  // ARC txStatus values that indicate the TX was genuinely accepted for our purposes.
+  // SEEN_IN_ORPHAN_MEMPOOL is intentionally excluded: ARC holds the tx but WhatsOnChain
+  // often returns 404 until parents confirm — we fall through to TAAL ARC / WoC instead.
+  // Opt back in with BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=true (not recommended for production).
   private static ARC_OK_STATUSES = new Set([
     'SEEN_ON_NETWORK',
     'MINED',
@@ -1871,7 +1913,6 @@ export class BlockchainService {
     'REQUESTED_BY_NETWORK',
     'SENT_TO_NETWORK',
     'ANNOUNCED_TO_NETWORK',
-    'SEEN_IN_ORPHAN_MEMPOOL',
   ])
 
   // ARC txStatus values that mean the TX was rejected (should NOT be treated as success)
@@ -1898,6 +1939,18 @@ export class BlockchainService {
       if (txid && BlockchainService.ARC_REJECT_STATUSES.has(status)) {
         const competing = Array.isArray(parsed.competingTxs) ? ` (competing: ${parsed.competingTxs[0]?.substring(0, 12)}...)` : ''
         console.warn(`⚠️  ARC (${providerLabel}): TX rejected — txStatus=${status}${competing} txid=${txid.substring(0, 12)}...`)
+        return null
+      }
+
+      // Orphan mempool: do not treat as broadcast success unless operator explicitly opts in
+      if (txid && status === 'SEEN_IN_ORPHAN_MEMPOOL') {
+        if (process.env.BSV_ARC_ACCEPT_ORPHAN_MEMPOOL === 'true') {
+          return txid
+        }
+        console.warn(
+          `⚠️  ARC (${providerLabel}): txStatus=SEEN_IN_ORPHAN_MEMPOOL — trying next broadcaster ` +
+            `(set BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=true to accept) txid=${txid.substring(0, 12)}...`,
+        )
         return null
       }
 
