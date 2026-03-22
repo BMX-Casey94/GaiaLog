@@ -19,7 +19,9 @@
     "explorer:sync": "tsx scripts/run-junglebus-worker.ts",
     "explorer:backfill": "tsx scripts/backfill-explorer.ts",
     "explorer:geocode-backfill": "tsx scripts/backfill-geocode.ts",
-    "explorer:addresses": "tsx scripts/show-wallet-addresses.ts"
+    "explorer:addresses": "tsx scripts/show-wallet-addresses.ts",
+    "sync:env": "tsx scripts/sync-env-from-template.ts",
+    "sync:env:dry-run": "tsx scripts/sync-env-from-template.ts --dry-run"
   },
   "dependencies": {
     "@bsv/auth-express-middleware": "^2.0.4",
