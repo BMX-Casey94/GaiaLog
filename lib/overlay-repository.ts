@@ -15,6 +15,11 @@ export interface OverlayAdmittedUtxoRow {
   removed: boolean
   removed_at: string | null
   spending_txid: string | null
+  wallet_index: number
+  utxo_role: 'pool' | 'reserve'
+  locked: boolean
+  locked_by: string | null
+  locked_at: string | null
 }
 
 export interface OverlayLookupQuery {
@@ -69,7 +74,8 @@ export async function getExistingOutputsForTopicTxid(
   if (vouts.length === 0) return new Map()
 
   const res = await client.query<OverlayAdmittedUtxoRow>(
-    `SELECT topic, txid, vout, satoshis, output_script, raw_tx, beef, admitted_at, confirmed, removed, removed_at, spending_txid
+    `SELECT topic, txid, vout, satoshis, output_script, raw_tx, beef, admitted_at, confirmed, removed, removed_at, spending_txid,
+            wallet_index, utxo_role, locked, locked_by, locked_at
        FROM overlay_admitted_utxos
       WHERE topic = $1
         AND txid = $2
@@ -82,21 +88,31 @@ export async function getExistingOutputsForTopicTxid(
 
 export async function insertAdmittedOutput(
   client: PoolClient,
-  row: Pick<OverlayAdmittedUtxoRow, 'topic' | 'txid' | 'vout' | 'satoshis' | 'output_script' | 'raw_tx' | 'beef' | 'confirmed'>,
+  row: Pick<OverlayAdmittedUtxoRow, 'topic' | 'txid' | 'vout' | 'satoshis' | 'output_script' | 'raw_tx' | 'beef' | 'confirmed' | 'wallet_index'> & {
+    utxo_role?: OverlayAdmittedUtxoRow['utxo_role']
+  },
 ): Promise<OverlayAdmittedUtxoRow> {
   const res = await client.query<OverlayAdmittedUtxoRow>(
     `INSERT INTO overlay_admitted_utxos (
-       topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed
+       topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed, wallet_index, utxo_role
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)
      ON CONFLICT (topic, txid, vout) DO UPDATE SET
+       satoshis = EXCLUDED.satoshis,
+       output_script = EXCLUDED.output_script,
        raw_tx = EXCLUDED.raw_tx,
        beef = COALESCE(EXCLUDED.beef, overlay_admitted_utxos.beef),
        confirmed = CASE WHEN EXCLUDED.confirmed THEN true ELSE overlay_admitted_utxos.confirmed END,
+       wallet_index = EXCLUDED.wallet_index,
+       utxo_role = EXCLUDED.utxo_role,
+       locked = false,
+       locked_by = NULL,
+       locked_at = NULL,
        removed = false,
        removed_at = NULL,
        spending_txid = NULL
-     RETURNING topic, txid, vout, satoshis, output_script, raw_tx, beef, admitted_at, confirmed, removed, removed_at, spending_txid`,
+     RETURNING topic, txid, vout, satoshis, output_script, raw_tx, beef, admitted_at, confirmed, removed, removed_at, spending_txid,
+               wallet_index, utxo_role, locked, locked_by, locked_at`,
     [
       row.topic,
       row.txid,
@@ -106,6 +122,8 @@ export async function insertAdmittedOutput(
       row.raw_tx,
       row.beef == null ? null : JSON.stringify(row.beef),
       row.confirmed,
+      row.wallet_index,
+      row.utxo_role || 'pool',
     ],
   )
 
@@ -144,12 +162,16 @@ export async function markCoinRemoved(
     `UPDATE overlay_admitted_utxos
         SET removed = true,
             removed_at = now(),
-            spending_txid = $4
+            spending_txid = $4,
+            locked = false,
+            locked_by = NULL,
+            locked_at = NULL
       WHERE topic = $1
         AND txid = $2
         AND vout = $3
         AND removed = false
-      RETURNING topic, txid, vout, satoshis, output_script, raw_tx, beef, admitted_at, confirmed, removed, removed_at, spending_txid`,
+      RETURNING topic, txid, vout, satoshis, output_script, raw_tx, beef, admitted_at, confirmed, removed, removed_at, spending_txid,
+                wallet_index, utxo_role, locked, locked_by, locked_at`,
     [topic, txid, vout, spendingTxid],
   )
 
@@ -205,24 +227,11 @@ export async function refreshTopicCounts(client: PoolClient, topic: string, delt
   )
 }
 
-export async function getCachedTopicCount(topic: string, confirmedOnly: boolean): Promise<number | null> {
-  const res = await query<{ available_count: string; confirmed_available_count: string }>(
-    `SELECT available_count::text, confirmed_available_count::text
-       FROM overlay_topic_counts
-      WHERE topic = $1`,
-    [topic],
-  )
-
-  const row = res.rows[0]
-  if (!row) return null
-  return Number(confirmedOnly ? row.confirmed_available_count : row.available_count)
-}
-
 function buildLookupWhere(queryInput: OverlayLookupQuery): { whereSql: string; params: any[] } {
   const params: any[] = [queryInput.topic]
   let index = params.length
 
-  const clauses = ['u.topic = $1', 'u.removed = false']
+  const clauses = ['u.topic = $1', 'u.removed = false', `u.utxo_role = 'pool'`]
 
   index += 1
   params.push(queryInput.confirmedOnly)
@@ -233,12 +242,7 @@ function buildLookupWhere(queryInput: OverlayLookupQuery): { whereSql: string; p
   clauses.push(`u.satoshis >= $${index}`)
 
   if (queryInput.excludeReserved) {
-    clauses.push(`NOT EXISTS (
-      SELECT 1
-        FROM utxo_locks l
-       WHERE l.utxo_key = (u.txid || ':' || u.vout::text)
-         AND l.expires_at >= now()
-    )`)
+    clauses.push('u.locked = false')
   }
 
   return {
@@ -265,7 +269,8 @@ export async function listLookupOutputs(queryInput: OverlayLookupQuery): Promise
     SELECT topic, txid, vout, satoshis, output_script,
            '' AS raw_tx, NULL::jsonb AS beef,
            admitted_at, confirmed,
-           false AS removed, NULL::timestamptz AS removed_at, NULL AS spending_txid
+           false AS removed, NULL::timestamptz AS removed_at, NULL AS spending_txid,
+           wallet_index, utxo_role, locked, locked_by, locked_at
       FROM overlay_admitted_utxos u
      WHERE ${whereSql}
      ORDER BY u.satoshis ${order}, u.txid ${order}, u.vout ${order}

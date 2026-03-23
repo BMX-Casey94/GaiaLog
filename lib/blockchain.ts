@@ -17,6 +17,7 @@ import type { CredibilityMetadata } from './types/credibility'
 import { addReading, canAttemptExplorerWrite, type StoredReading } from './explorer-read-source'
 import { removeUnconfirmedReading } from './overlay-explorer-repository'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress, type SpendableOutput } from './spend-source'
+import { acquirePoolUtxo, consumeAndAdmitChange, releaseUtxo, type InventoryUtxo } from './utxo-inventory'
 import { getMinSpendConfirmations } from './utxo-spend-policy'
 import {
   logOverlayEmptyListDrift,
@@ -109,9 +110,7 @@ const REQUIRE_VALIDATION = process.env.GAIALOG_REQUIRE_VALIDATION === 'true'
 
 // Optional UTXO fetch controls and lightweight pooling (defaults keep current behaviour)
 const ENABLE_UTXO_POOL = process.env.BSV_ENABLE_UTXO_POOL === 'true'
-const ENABLE_UTXO_DB_LOCKS = process.env.BSV_ENABLE_UTXO_DB_LOCKS === 'true'
-/** When true, keep in-memory UTXO reservations on "Missing input(s)" style errors (legacy; can cause spendable=0 under relay mismatch). */
-const PRESERVE_UTXO_ON_MISSING_INPUT = process.env.BSV_UTXO_PRESERVE_ON_MISSING_INPUT === 'true'
+const UTXO_POOL_MIN_SATS = Math.max(0, Number(process.env.BSV_UTXO_POOL_MIN_SATS || 0))
 const UTXO_POOL_TTL_MS = Number(process.env.BSV_UTXO_POOL_TTL_MS || 10000)
 const UTXO_FETCH_BACKOFF_BASE_MS = Number(process.env.BSV_UTXO_FETCH_BACKOFF_BASE_MS || 250)
 const UTXO_FETCH_MAX_RETRIES = Number(process.env.BSV_UTXO_FETCH_MAX_RETRIES || 4)
@@ -801,7 +800,10 @@ export class BlockchainService {
   private walletEmptyUntil: Map<number, number> = new Map()
   private static readonly WALLET_EMPTY_CACHE_MS = 60_000
 
-  private async getFirstWalletWithSpendableUtxos(traceId?: string): Promise<{ wif: string; index: number; address: string; utxos: any[] } | null> {
+  private async getFirstWalletWithSpendableUtxos(
+    minSatoshis: number,
+    traceId?: string,
+  ): Promise<{ wif: string; index: number; address: string; utxo: InventoryUtxo } | null> {
     const list = this.wifsForSend && this.wifsForSend.length > 0
       ? this.wifsForSend
       : (BSV_PRIVATE_KEY ? [BSV_PRIVATE_KEY] : (BSV_FALLBACK_WIF ? [BSV_FALLBACK_WIF] : []))
@@ -813,75 +815,72 @@ export class BlockchainService {
       isBackedOff = mod.isWalletBackedOff
     } catch {}
 
-    const isConfirmedUtxo = (u: any): boolean => {
-      const conf = Number(u?.confirmations || 0)
-      const h = typeof u?.height === 'number' ? u.height : null
-      return conf > 0 || (h != null && h > 0)
-    }
-
     const pickByConfirmedFirst = process.env.BSV_WALLET_PICK_BY_CONFIRMED_FIRST !== 'false'
-    const now = Date.now()
+    const confirmedPasses = pickByConfirmedFirst && MIN_SPEND_CONF <= 0 ? [true, false] : [MIN_SPEND_CONF > 0]
 
-    type WalletCandidate = {
-      pick: number
-      wif: string
-      address: string
-      spendable: any[]
-      confirmedCount: number
-      rrDistance: number
-    }
-    const candidates: WalletCandidate[] = []
+    for (const confirmedOnly of confirmedPasses) {
+      const now = Date.now()
+      for (let i = 0; i < list.length; i++) {
+        const pick = (this.rrIndex + i) % list.length
+        const wif = list[pick]
+        try {
+          const sdkKey = SDKPrivateKey.fromWif(wif)
+          const addr = sdkKey.toPublicKey().toAddress().toString()
 
-    for (let i = 0; i < list.length; i++) {
-      const pick = (this.rrIndex + i) % list.length
-      const wif = list[pick]
-      try {
-        const sdkKey = SDKPrivateKey.fromWif(wif)
-        const addr = sdkKey.toPublicKey().toAddress().toString()
+          if (isBackedOff && isBackedOff(addr)) continue
 
-        if (isBackedOff && isBackedOff(addr)) continue
+          const emptyUntil = this.walletEmptyUntil.get(pick) || 0
+          if (emptyUntil > now) continue
 
-        const emptyUntil = this.walletEmptyUntil.get(pick) || 0
-        if (emptyUntil > now) continue
+          const startedAt = Date.now()
+          const acquired = await acquirePoolUtxo({
+            walletIndex: pick,
+            minSatoshis,
+            confirmedOnly,
+          })
 
-        const spendable = await this.getSpendableUtxos(addr, wif, pick, traceId)
-
-        if (spendable.length > 0) {
-          this.walletEmptyUntil.delete(pick)
-          const confirmedCount = spendable.filter(isConfirmedUtxo).length
-          if (pickByConfirmedFirst) {
-            candidates.push({
-              pick,
-              wif,
-              address: addr,
-              spendable,
-              confirmedCount,
-              rrDistance: i,
-            })
-          } else {
+          if (acquired) {
+            this.walletEmptyUntil.delete(pick)
             this.rrIndex = (pick + 1) % list.length
-            return { wif, index: pick, address: addr, utxos: spendable }
+            this.logUtxoLookupTrace({
+              traceId,
+              walletIndex: pick,
+              address: addr,
+              source: 'inventory',
+              spendableCount: 1,
+              durationMs: Date.now() - startedAt,
+              note: `minSats=${minSatoshis};confirmedOnly=${confirmedOnly}`,
+            })
+            return { wif, index: pick, address: addr, utxo: acquired }
           }
-        } else {
-          this.walletEmptyUntil.set(pick, now + BlockchainService.WALLET_EMPTY_CACHE_MS)
+
+          if (!confirmedOnly || confirmedPasses.length === 1) {
+            this.walletEmptyUntil.set(pick, now + BlockchainService.WALLET_EMPTY_CACHE_MS)
+          }
+        } catch (error) {
+          const addr = (() => {
+            try {
+              return SDKPrivateKey.fromWif(wif).toPublicKey().toAddress().toString()
+            } catch {
+              return ''
+            }
+          })()
+          if (addr) {
+            this.logUtxoLookupTrace({
+              traceId,
+              walletIndex: pick,
+              address: addr,
+              source: 'inventory-error',
+              spendableCount: 0,
+              durationMs: 0,
+              note: error instanceof Error ? error.message : String(error),
+            })
+          }
         }
-      } catch {
-        this.walletEmptyUntil.set(pick, now + BlockchainService.WALLET_EMPTY_CACHE_MS)
       }
     }
 
-    if (!pickByConfirmedFirst || candidates.length === 0) {
-      return null
-    }
-
-    candidates.sort((a, b) => {
-      if (b.confirmedCount !== a.confirmedCount) return b.confirmedCount - a.confirmedCount
-      return a.rrDistance - b.rrDistance
-    })
-
-    const best = candidates[0]!
-    this.rrIndex = (best.pick + 1) % list.length
-    return { wif: best.wif, index: best.pick, address: best.address, utxos: best.spendable }
+    return null
   }
 
   public getAddress(): string | null {
@@ -947,18 +946,6 @@ export class BlockchainService {
         return 'blockchain-not-configured'
       }
       this.enforceHeapGuard()
-      // Pick a wallet that currently has spendable UTXOs (fair round-robin)
-      const walletLookupStartedAt = Date.now()
-      const picked = await this.getFirstWalletWithSpendableUtxos(traceId)
-      walletLookupMs = Date.now() - walletLookupStartedAt
-      if (!picked) throw new Error('No UTXOs available across wallets')
-      const { wif, index: walletIndexForLog, address: pickedAddress } = picked
-      selectedWalletIndex = walletIndexForLog
-      selectedWalletAddress = pickedAddress
-      selectedSpendableCount = Array.isArray(picked.utxos) ? picked.utxos.length : undefined
-      fromAddress = pickedAddress
-
-      // Proceed based on UTXO availability rather than blunt balance threshold
 
       // Create OP_RETURN data with top-level metadata
       const sanitizedPayload = (() => {
@@ -1074,34 +1061,6 @@ export class BlockchainService {
       }
       const opReturnData = JSON.stringify(base)
 
-      // Use the previously fetched spendable UTXOs for the selected wallet
-      const utxos = picked.utxos
-      if (utxos.length === 0) {
-        throw new Error('No UTXOs available for transaction')
-      }
-
-      // Build UTXO objects with reconstructed scriptPubKey for our address (P2PKH)
-      const address = fromAddress
-      const scriptPubKey = (bsv.Script as any).fromAddress
-        ? (bsv.Script as any).fromAddress(address).toHex()
-        : this.p2pkhLockingScriptHexFromWif(wif)
-      // Prefer confirmed UTXOs first (prevents long unconfirmed ancestor chains).
-      // Fallback to mixed spendable UTXOs only if no confirmed inputs are available.
-      const preferConfirmed = process.env.BSV_PREFER_CONFIRMED_UTXOS !== 'false'
-      const isConfirmedUtxo = (u: any): boolean => {
-        const conf = Number(u?.confirmations || 0)
-        const h = typeof u?.height === 'number' ? u.height : null
-        return conf > 0 || (h != null && h > 0)
-      }
-      let isSplitInputHeld: ((address: string, utxoKey: string) => boolean) | null = null
-      try {
-        const mod = await import('./utxo-maintainer')
-        isSplitInputHeld = mod.isWalletSplitInputHeld
-      } catch {}
-
-      const confirmedOnly = utxos.filter(isConfirmedUtxo)
-      const selectionPool = (preferConfirmed && confirmedOnly.length > 0) ? confirmedOnly : utxos
-
       // Build payload bytes (optionally gzip) and optional extra pushes
       const includeHashPush = process.env.BSV_OPRETURN_INCLUDE_HASH_PUSH === 'true'
       const useGzip = process.env.BSV_OPRETURN_GZIP === 'true'
@@ -1146,91 +1105,46 @@ export class BlockchainService {
         const explicitFee = Math.ceil(estimatedSize * FEE_RATE_SAT_PER_BYTE * feeMultiplier)
         return { estimatedSize, explicitFee }
       }
+      const { explicitFee: singleInputExplicitFee } = estimateExplicitFee(1, 1)
+      const minInputSatoshis = Math.max(
+        UTXO_POOL_MIN_SATS,
+        opReturnOutputSats + singleInputExplicitFee + DUST_LIMIT,
+      )
 
-      const releaseSelectedKeys = async (keys: string[]): Promise<void> => {
-        if (keys.length === 0) return
-        if (ENABLE_UTXO_POOL) this.releaseUtxos(keys)
-        if (ENABLE_UTXO_DB_LOCKS) {
-          try {
-            const { releaseUtxoKeys } = await import('./utxo-locks')
-            await releaseUtxoKeys(keys)
-          } catch {}
-        }
-      }
+      const walletLookupStartedAt = Date.now()
+      const picked = await this.getFirstWalletWithSpendableUtxos(minInputSatoshis, traceId)
+      walletLookupMs = Date.now() - walletLookupStartedAt
+      if (!picked) throw new Error(`No inventory UTXOs available across wallets for minSats=${minInputSatoshis}`)
 
-      const tryReserveCandidate = async (u: any): Promise<string | null> => {
-        const key = `${u.tx_hash}:${u.tx_pos}`
-        if (isSplitInputHeld && isSplitInputHeld(address, key)) return null
-        if (ENABLE_UTXO_DB_LOCKS) {
-          try {
-            const { reserveUtxoKeys } = await import('./utxo-locks')
-            const reserved = await reserveUtxoKeys([key])
-            if (reserved.includes(key)) return key
-          } catch {}
-          return null
-        }
-        const addrCache = this.ensureAddressCache(address)
-        const alreadyUsed = addrCache.usedKeys.get(key)
-        if (alreadyUsed && alreadyUsed > Date.now()) return null
-        addrCache.usedKeys.set(key, Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS))
-        return key
-      }
+      const { wif, index: walletIndexForLog, address, utxo: acquiredUtxo } = picked
+      selectedWalletIndex = walletIndexForLog
+      selectedWalletAddress = address
+      selectedSpendableCount = 1
+      fromAddress = address
 
-      const selectEnoughInputs = async (sourceUtxos: any[]): Promise<{ selectedUtxos: any[]; selectedKeys: string[] } | null> => {
-        const selectedUtxos: any[] = []
-        const selectedKeys: string[] = []
-        let totalInput = 0
-        for (const u of sourceUtxos) {
-          const key = await tryReserveCandidate(u)
-          if (!key) continue
-          selectedUtxos.push(u)
-          selectedKeys.push(key)
-          totalInput += Number(u?.value || 0)
-          const { explicitFee } = estimateExplicitFee(selectedUtxos.length, 1)
-          if (totalInput - opReturnOutputSats >= explicitFee) {
-            return { selectedUtxos, selectedKeys }
-          }
-        }
-        await releaseSelectedKeys(selectedKeys)
-        return null
-      }
-
-      // If below low-watermark, prefer the smallest to leave the largest for the splitter
-      const lowWater = Number(process.env.BSV_UTXO_LOW_WATERMARK || 50)
-      const candidates = selectionPool.length <= lowWater
-        ? [...selectionPool].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
-        : [...selectionPool].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
-
-      let selectedInputs = await selectEnoughInputs(candidates)
-      if (!selectedInputs) {
-        await this.refreshUtxoCache(address, wif, true)
-        const freshUtxos = await this.getSpendableUtxos(address, wif, walletIndexForLog, traceId)
-        const freshConfirmedOnly = freshUtxos.filter(isConfirmedUtxo)
-        const freshPool = (preferConfirmed && freshConfirmedOnly.length > 0) ? freshConfirmedOnly : freshUtxos
-        const freshCandidates = freshPool.length <= lowWater
-          ? [...freshPool].sort((a: any, b: any) => (a.value || 0) - (b.value || 0))
-          : [...freshPool].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
-        selectedInputs = await selectEnoughInputs(freshCandidates)
-      }
-      if (!selectedInputs) {
-        throw new Error('No reservable UTXO set covers the required fee')
-      }
-      const selectedInputKeys = selectedInputs.selectedKeys
-      const bitcoreUtxos = selectedInputs.selectedUtxos.map((u: any) => ({
-        txId: u.tx_hash,
-        outputIndex: u.tx_pos,
+      const scriptPubKey = acquiredUtxo.output_script || (
+        (bsv.Script as any).fromAddress
+          ? (bsv.Script as any).fromAddress(address).toHex()
+          : this.p2pkhLockingScriptHexFromWif(wif)
+      )
+      const bitcoreUtxos = [{
+        txId: acquiredUtxo.txid,
+        outputIndex: acquiredUtxo.vout,
         address,
         script: scriptPubKey,
-        satoshis: u.value,
-      }))
+        satoshis: Number(acquiredUtxo.satoshis),
+      }]
 
       // Create transaction using explicit fee. bsv's feePerKb uses _estimateSize()
       // which runs BEFORE signing — input scriptSigs grow from ~40 to ~148 bytes,
       // so the library underestimates size and we end up with ~22 sat/kB instead of 105.
       // We estimate size ourselves: signed P2PKH input=148 bytes, op_return known.
-      const buildSerialized = (feeMultiplier: number): string => {
+      const buildSignedTransaction = (feeMultiplier: number): {
+        serialized: string
+        changeOutput: { vout: number; satoshis: number; outputScript: string } | null
+      } => {
         const numInputs = bitcoreUtxos.length
-        const { estimatedSize, explicitFee } = estimateExplicitFee(numInputs, feeMultiplier)
+        const { explicitFee } = estimateExplicitFee(numInputs, feeMultiplier)
         const inputSats = bitcoreUtxos.reduce((s: number, u: any) => s + (u.satoshis || 0), 0)
         const availableForFee = inputSats - opReturnOutputSats
         if (availableForFee < explicitFee) {
@@ -1252,21 +1166,31 @@ export class BlockchainService {
         }
         const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
         tx.sign(signingKey)
-        let serialized: string
-        try {
-          serialized = tx.serialize()
-        } catch (serializeErr) {
-          const serializeMsg = serializeErr instanceof Error ? serializeErr.message : String(serializeErr)
-          throw serializeErr
-        }
+        const serialized = tx.serialize()
         const outputSats = tx.outputs.reduce((s: number, o: any) => s + (o.satoshis || o._satoshis || 0), 0)
         const actualFee = inputSats - outputSats
         const txSizeBytes = serialized.length / 2
-        const impliedSatPerKb = txSizeBytes > 0 ? Math.round((actualFee / txSizeBytes) * 1000) : 0
         if (actualFee < 2) {
           console.warn(`⚠️  TX fee sanity check: fee=${actualFee} sats, explicitFee=${explicitFee}, txSize=${txSizeBytes} bytes, input=${inputSats}`)
         }
-        return serialized
+        const changeOutput = tx.outputs
+          .map((output: any, vout: number) => {
+            let outputScript = ''
+            try {
+              outputScript = typeof output?.script?.toHex === 'function'
+                ? output.script.toHex()
+                : String(output?.script || '')
+            } catch {}
+            return {
+              vout,
+              satoshis: Number(output?.satoshis || output?._satoshis || 0),
+              outputScript,
+            }
+          })
+          .find((output: { satoshis: number; outputScript: string }) =>
+            output.satoshis > 0 && output.outputScript.toLowerCase() !== scriptHex.toLowerCase()
+          ) || null
+        return { serialized, changeOutput }
       }
 
       // Build prevouts for ARC Extended Format (order must match inputs)
@@ -1284,16 +1208,13 @@ export class BlockchainService {
       }) : []
 
       // Broadcast transaction via GorillaPool ARC (primary) → TAAL ARC (fallback)
-      // Note: UTXO was already marked used at selection time (race-condition guard).
-      // The call below simply refreshes the TTL.
-        let reservedKeys: string[] = []
+      let normalHex = ''
+      let changeOutput: { vout: number; satoshis: number; outputScript: string } | null = null
       try {
-        if (ENABLE_UTXO_POOL) {
-            reservedKeys = selectedInputKeys.slice()
-          this.markUtxosUsed(reservedKeys) // refresh TTL
-        }
         const buildStartedAt = Date.now()
-        const normalHex = buildSerialized(1)
+        const builtTx = buildSignedTransaction(1)
+        normalHex = builtTx.serialized
+        changeOutput = builtTx.changeOutput
         txBuildMs = Date.now() - buildStartedAt
         const broadcastStartedAt = Date.now()
         let broadcastResult: { txid: string; acceptedVia: string } | null = null
@@ -1306,149 +1227,155 @@ export class BlockchainService {
         const { txid, acceptedVia: acceptedViaResult } = broadcastResult
         acceptedVia = acceptedViaResult
         acceptedTxid = txid
-
-        // Log transaction
-        const transactionLog: TransactionLog = {
-          txid,
-          stream: data.stream,
-          timestamp: data.timestamp,
-          payload: this.compactPayloadForLog(data.payload),
-          status: 'pending'
-        }
-
-        this.appendTransactionLog(transactionLog)
-        this.operationalStats.broadcastsOk += 1
-        throughputObservability.recordBroadcastAccepted({
-          family: data.family || data.stream,
-          providerId: providerIdValue,
-          datasetId: datasetIdValue,
-          queueLane: queueLaneValue,
-          channel: acceptedVia,
-          txid,
-        })
-
-        // Feed accepted transactions into the spend-source admission path.
-        // In legacy mode this is a no-op; overlay mode can admit the outputs
-        // immediately without waiting for external indexers to converge.
-        try {
-          const spendSource = getSpendSourceForWallet(walletIndexForLog)
-          const treasuryTopic = getTreasuryTopicForWallet(walletIndexForLog)
-          void spendSource.submitAcceptedTx({
-            clientRequestId: txid,
-            topics: [treasuryTopic],
-            rawTxEnvelope: {
-              txid,
-              rawTx: normalHex,
-              acceptedVia,
-              prevouts: prevoutsForArc,
-              broadcastedAt: new Date().toISOString(),
-            },
-          }).catch((submitErr) => {
-            const msg = submitErr instanceof Error ? submitErr.message : String(submitErr)
-            console.warn(`⚠️ Spend-source submit failed for ${txid.substring(0, 12)}...: ${msg}`)
-          })
-        } catch {
-          // Non-fatal – on-chain acceptance already succeeded.
-        }
-
-        // ── Feed reading to /explorer store (zero API calls) ──
-        try {
-          if (canAttemptExplorerWrite()) {
-            const pl: any = payloadWithAscii ?? data.payload ?? {}
-            const explorerReading: StoredReading = {
-              txid,
-              dataType: data.stream,
-              location: pl.location || pl.location_ascii || pl.station_name || pl.city || null,
-              lat: pl.coordinates?.lat ?? pl.coordinates?.latitude ?? pl.latitude ?? null,
-              lon: pl.coordinates?.lon ?? pl.coordinates?.longitude ?? pl.longitude ?? null,
-              timestamp: data.timestamp,
-              metrics: pl,
-              provider: (data as any)?.payload?.source || null,
-              blockHeight: 0, // Will be set when confirmed
-              blockTime: null,
-            }
-            void addReading(explorerReading, { providerId: providerIdValue, datasetId: datasetIdValue })
-              .then((inserted) => {
-                if (!inserted) return
-                throughputObservability.recordExplorerIndexed({
-                  family: data.family || data.stream,
-                  providerId: providerIdValue,
-                  datasetId: datasetIdValue,
-                  queueLane: queueLaneValue,
-                  channel: acceptedVia,
-                  txid,
-                })
-              })
-              .catch(() => {
-                // Non-fatal – explorer store is secondary
-              })
-          }
-        } catch {
-          // Non-fatal – explorer store is secondary
-        }
-
-        // Persist to tx_log (pending on broadcast, will be confirmed later)
-        try {
-          if (process.env.GAIALOG_NO_DB !== 'true') {
-            const txLogStartedAt = Date.now()
-            await upsertTxLog({
-              txid,
-              type: data.stream,
-              provider: (data as any)?.payload?.source || 'unknown',
-              collected_at: new Date(data.timestamp),
-              status: 'pending',
-              onchain_at: new Date(),
-              fee_sats: null,
-              wallet_index: walletIndexForLog,
-              retries: 0,
-              error: null,
-            })
-            txLogMs = Date.now() - txLogStartedAt
-          }
-        } catch (e) {
-          // Non-fatal
-        }
-
-        // Queue a best-effort confirmation check without adding a new timer per TX
-        this.enqueueConfirmationCheck(txid, data.stream)
-
-        this.broadcastCountSinceLastSample++
-        // Release global reservation after successful broadcast
-        if (ENABLE_UTXO_DB_LOCKS) {
-          try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys(selectedInputKeys) } catch {}
-        }
-        this.logWriteToChainSummary({
-          traceId,
-          stream: data.stream,
-          totalMs: Date.now() - writeStartedAt,
-          walletLookupMs,
-          walletIndex: selectedWalletIndex,
-          address: selectedWalletAddress || fromAddress,
-          spendableCount: selectedSpendableCount,
-          txBuildMs,
-          broadcastMs,
-          txLogMs,
-          acceptedVia,
-          txid: acceptedTxid,
-        })
-        return txid
       } catch (innerErr) {
-        const innerMsg = innerErr instanceof Error ? innerErr.message : String(innerErr)
-        // Only preserve pool reservations for true mempool/chain conflicts. "Missing input(s)" from WoC/relays
-        // often means parent not visible to that endpoint — not a local double-spend; releasing avoids locking all overlay UTXOs for TTL.
-        const preserveMempoolConflict = /txn-mempool-conflict|DOUBLE_SPEND|double[-_ ]?spend|MEMPOOL_CHAIN_LIMIT/i.test(innerMsg)
-        const preserveMissingInputLegacy = PRESERVE_UTXO_ON_MISSING_INPUT && /Missing input|Missing inputs|missing inputs/i.test(innerMsg)
-        const preserveUsedReservation = preserveMempoolConflict || preserveMissingInputLegacy
-        // On failure, release reserved UTXOs back to pool
-        if (ENABLE_UTXO_POOL && reservedKeys.length > 0 && !preserveUsedReservation) {
-          this.releaseUtxos(reservedKeys)
-        }
-        // Release global reservation as well
-        if (ENABLE_UTXO_DB_LOCKS) {
-          try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys(selectedInputKeys) } catch {}
-        }
+        await releaseUtxo(acquiredUtxo.topic, acquiredUtxo.txid, acquiredUtxo.vout)
         throw innerErr
       }
+
+      const txid = acceptedTxid!
+
+      try {
+        await consumeAndAdmitChange({
+          topic: acquiredUtxo.topic,
+          walletIndex: walletIndexForLog,
+          spentTxid: acquiredUtxo.txid,
+          spentVout: acquiredUtxo.vout,
+          spendingTxid: txid,
+          rawTx: normalHex,
+          change: changeOutput ? {
+            vout: changeOutput.vout,
+            satoshis: changeOutput.satoshis,
+            outputScript: changeOutput.outputScript,
+            confirmed: false,
+            utxoRole: 'pool',
+          } : null,
+        })
+      } catch (inventoryErr) {
+        const inventoryMsg = inventoryErr instanceof Error ? inventoryErr.message : String(inventoryErr)
+        console.error(`❌ Inventory consume/admit failed for ${txid.substring(0, 12)}...: ${inventoryMsg}`)
+      }
+
+      // Log transaction
+      const transactionLog: TransactionLog = {
+        txid,
+        stream: data.stream,
+        timestamp: data.timestamp,
+        payload: this.compactPayloadForLog(data.payload),
+        status: 'pending'
+      }
+
+      this.appendTransactionLog(transactionLog)
+      this.operationalStats.broadcastsOk += 1
+      throughputObservability.recordBroadcastAccepted({
+        family: data.family || data.stream,
+        providerId: providerIdValue,
+        datasetId: datasetIdValue,
+        queueLane: queueLaneValue,
+        channel: acceptedVia,
+        txid,
+      })
+
+      // Feed accepted transactions into the spend-source admission path.
+      // In legacy mode this is a no-op; overlay mode can admit the outputs
+      // immediately without waiting for external indexers to converge.
+      try {
+        const spendSource = getSpendSourceForWallet(walletIndexForLog)
+        const treasuryTopic = getTreasuryTopicForWallet(walletIndexForLog)
+        void spendSource.submitAcceptedTx({
+          clientRequestId: txid,
+          topics: [treasuryTopic],
+          rawTxEnvelope: {
+            txid,
+            rawTx: normalHex,
+            acceptedVia,
+            prevouts: prevoutsForArc,
+            broadcastedAt: new Date().toISOString(),
+          },
+        }).catch((submitErr) => {
+          const msg = submitErr instanceof Error ? submitErr.message : String(submitErr)
+          console.warn(`⚠️ Spend-source submit failed for ${txid.substring(0, 12)}...: ${msg}`)
+        })
+      } catch {
+        // Non-fatal – on-chain acceptance already succeeded.
+      }
+
+      // ── Feed reading to /explorer store (zero API calls) ──
+      try {
+        if (canAttemptExplorerWrite()) {
+          const pl: any = payloadWithAscii ?? data.payload ?? {}
+          const explorerReading: StoredReading = {
+            txid,
+            dataType: data.stream,
+            location: pl.location || pl.location_ascii || pl.station_name || pl.city || null,
+            lat: pl.coordinates?.lat ?? pl.coordinates?.latitude ?? pl.latitude ?? null,
+            lon: pl.coordinates?.lon ?? pl.coordinates?.longitude ?? pl.longitude ?? null,
+            timestamp: data.timestamp,
+            metrics: pl,
+            provider: (data as any)?.payload?.source || null,
+            blockHeight: 0, // Will be set when confirmed
+            blockTime: null,
+          }
+          void addReading(explorerReading, { providerId: providerIdValue, datasetId: datasetIdValue })
+            .then((inserted) => {
+              if (!inserted) return
+              throughputObservability.recordExplorerIndexed({
+                family: data.family || data.stream,
+                providerId: providerIdValue,
+                datasetId: datasetIdValue,
+                queueLane: queueLaneValue,
+                channel: acceptedVia,
+                txid,
+              })
+            })
+            .catch(() => {
+              // Non-fatal – explorer store is secondary
+            })
+        }
+      } catch {
+        // Non-fatal – explorer store is secondary
+      }
+
+      // Persist to tx_log (pending on broadcast, will be confirmed later)
+      try {
+        if (process.env.GAIALOG_NO_DB !== 'true') {
+          const txLogStartedAt = Date.now()
+          await upsertTxLog({
+            txid,
+            type: data.stream,
+            provider: (data as any)?.payload?.source || 'unknown',
+            collected_at: new Date(data.timestamp),
+            status: 'pending',
+            onchain_at: new Date(),
+            fee_sats: null,
+            wallet_index: walletIndexForLog,
+            retries: 0,
+            error: null,
+          })
+          txLogMs = Date.now() - txLogStartedAt
+        }
+      } catch (e) {
+        // Non-fatal
+      }
+
+      // Queue a best-effort confirmation check without adding a new timer per TX
+      this.enqueueConfirmationCheck(txid, data.stream)
+
+      this.broadcastCountSinceLastSample++
+      this.logWriteToChainSummary({
+        traceId,
+        stream: data.stream,
+        totalMs: Date.now() - writeStartedAt,
+        walletLookupMs,
+        walletIndex: selectedWalletIndex,
+        address: selectedWalletAddress || fromAddress,
+        spendableCount: selectedSpendableCount,
+        txBuildMs,
+        broadcastMs,
+        txLogMs,
+        acceptedVia,
+        txid: acceptedTxid,
+      })
+      return txid
 
     } catch (error) {
       // Suppress noisy logs for expected, transient availability issues
@@ -1468,7 +1395,7 @@ export class BlockchainService {
         txid: acceptedTxid,
         error: msg,
       })
-      const transient = /already reserved|No UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(msg)
+      const transient = /already reserved|No UTXOs available across wallets|No inventory UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(msg)
       const failedProviderValue = (data as any)?.payload?.source || 'unknown'
       const failedProviderId = (data as any)?.providerId || (data as any)?.payload?.provider_id || resolveProviderIdFromSource(failedProviderValue) || undefined
       const failedDatasetId = (data as any)?.datasetId || (data as any)?.payload?.dataset_id || undefined

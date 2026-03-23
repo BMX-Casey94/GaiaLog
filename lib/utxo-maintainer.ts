@@ -5,6 +5,7 @@ import * as bsv from 'bsv'
 import { bsvConfig } from './bsv-config'
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress } from './spend-source'
+import { acquireReserveUtxo, admitSplitOutputs, releaseUtxo, type InventoryUtxo } from './utxo-inventory'
 import { getMaintainerMinConfirmations } from './utxo-spend-policy'
 import { fetchTreasuryOverlayInventorySnapshot, logTreasuryOverlayInventorySummary } from './utxo-overlay-monitor'
 import { broadcastSplitTransactionRaw } from './broadcast-raw-tx'
@@ -31,7 +32,6 @@ const FEE_RATE = Number((process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env
 const SPLIT_FEE_RATE = Number(process.env.BSV_UTXO_SPLIT_FEE_RATE_SAT_PER_BYTE || FEE_RATE)
 // BSV has no protocol-enforced dust limit (unlike BTC). 1 sat is the minimum viable output.
 const DUST_LIMIT = 1
-const ENABLE_UTXO_DB_LOCKS = process.env.BSV_ENABLE_UTXO_DB_LOCKS === 'true'
 // Dynamic split cooldown:
 // ensure split production can keep pace with expected per-wallet TX throughput.
 const PER_WALLET_EXPECTED_TPS = EXPECTED_TX_PER_DAY / WALLET_COUNT / 86400
@@ -41,10 +41,9 @@ const AUTO_SPLIT_COOLDOWN_MS = Math.max(
   Math.floor((SPLIT_BATCH / Math.max(0.1, PER_WALLET_EXPECTED_TPS * 1.25)) * 1000)
 )
 const SPLIT_COOLDOWN_MS = Number(process.env.BSV_UTXO_SPLIT_COOLDOWN_MS || Math.min(5 * 60 * 1000, AUTO_SPLIT_COOLDOWN_MS))
-const SPLIT_INPUT_HOLD_MS = Number(
-  process.env.BSV_UTXO_SPLIT_INPUT_HOLD_MS ||
-  process.env.BSV_UTXO_LOCK_TTL_MS ||
-  10 * 60 * 1000
+const SPLIT_RESERVE_MIN_SATS = Math.max(
+  SPLIT_OUTPUT_SATS * 2,
+  Number(process.env.BSV_UTXO_RESERVE_MIN_SATS || 0),
 )
 
 // Validate SPLIT_OUTPUT_SATS is above dust limit
@@ -59,43 +58,12 @@ if (!_g.__GAIALOG_UTXO_MAINT_STATE__) {
   _g.__GAIALOG_UTXO_MAINT_STATE__ = {
     pendingSplitUntilByAddress: new Map<string, number>(),
     mempoolBackoffUntil: new Map<string, number>(), // wallet → timestamp until which to skip
-    heldSplitInputs: new Map<string, number>(), // `${address}:${txid:vout}` -> expiry
   }
 }
 const maintState: {
   pendingSplitUntilByAddress: Map<string, number>
   mempoolBackoffUntil: Map<string, number>
-  heldSplitInputs: Map<string, number>
 } = _g.__GAIALOG_UTXO_MAINT_STATE__
-if (!maintState.heldSplitInputs) {
-  maintState.heldSplitInputs = new Map<string, number>()
-}
-
-function holdKey(address: string, utxoKey: string): string {
-  return `${address}:${utxoKey}`
-}
-
-function isSplitInputHeld(address: string, utxoKey: string): boolean {
-  const key = holdKey(address, utxoKey)
-  const until = maintState.heldSplitInputs.get(key) || 0
-  if (until <= Date.now()) {
-    maintState.heldSplitInputs.delete(key)
-    return false
-  }
-  return true
-}
-
-export function isWalletSplitInputHeld(address: string, utxoKey: string): boolean {
-  return isSplitInputHeld(address, utxoKey)
-}
-
-function reserveSplitInputHold(address: string, utxoKey: string): void {
-  maintState.heldSplitInputs.set(holdKey(address, utxoKey), Date.now() + Math.max(30000, SPLIT_INPUT_HOLD_MS))
-}
-
-function releaseSplitInputHold(address: string, utxoKey: string): void {
-  maintState.heldSplitInputs.delete(holdKey(address, utxoKey))
-}
 
 // ─── UTXO fetch ─────────────────────────────────────────────────────────────
 async function getUnspent(address: string): Promise<any[]> {
@@ -130,15 +98,12 @@ async function getSpendableInventoryCount(address: string, legacyConfirmedCount:
 }
 
 async function submitSplitToSpendSource(
-  address: string,
+  walletIndex: number,
   txid: string,
   rawTx: string,
   scriptHex: string,
-  inputSource: any,
+  inputSatoshis: number,
 ): Promise<void> {
-  const walletIndex = getWalletIndexForAddress(address)
-  if (walletIndex == null) return
-
   await getSpendSourceForWallet(walletIndex).submitAcceptedTx({
     clientRequestId: txid,
     topics: [getTreasuryTopicForWallet(walletIndex)],
@@ -150,33 +115,36 @@ async function submitSplitToSpendSource(
       broadcastedAt: new Date().toISOString(),
       prevouts: [{
         lockingScript: scriptHex,
-        satoshis: Number(inputSource?.value || 0),
+        satoshis: Number(inputSatoshis || 0),
       }],
     },
   })
+}
+
+function estimateSplitRequirement(outputCount: number): number {
+  const safeOutputs = Math.max(2, outputCount)
+  const totalOut = safeOutputs * SPLIT_OUTPUT_SATS
+  const estBytes = 300 + safeOutputs * 40
+  const fee = Math.ceil(estBytes * SPLIT_FEE_RATE)
+  return totalOut + fee + DUST_LIMIT
+}
+
+function maxSplitOutputsForInput(inputSatoshis: number): number {
+  return Math.floor((inputSatoshis - 300 * SPLIT_FEE_RATE - DUST_LIMIT) / (SPLIT_OUTPUT_SATS + 40 * SPLIT_FEE_RATE))
 }
 
 // ─── Core split logic ───────────────────────────────────────────────────────
 async function topUpWallet(wif: string): Promise<{ txid: string; address: string; outputs: number } | null> {
   const sdk = SDKPrivateKey.fromWif(wif)
   const address = sdk.toPublicKey().toAddress().toString()
+  const walletIndex = (bsvConfig?.wallets?.privateKeys || []).filter(k => !!k).findIndex(candidate => candidate === wif)
+  if (walletIndex < 0) return null
 
   // Respect mempool backoff
   const backoffUntil = maintState.mempoolBackoffUntil.get(address) || 0
   if (backoffUntil > Date.now()) return null
 
-  const utxos = await getUnspent(address)
-  const confirmed = utxos.filter((u: any) => {
-    const conf = (u.confirmations || 0) >= MIN_CONF
-    const byHeight = typeof u.height === 'number' ? u.height > 0 : true
-    return conf || byHeight
-  })
-  const unconfirmed = utxos.filter((u: any) => {
-    const byHeight = typeof u.height === 'number' ? u.height === 0 : false
-    const conf = (u.confirmations || 0) === 0
-    return byHeight || conf
-  })
-  const count = await getSpendableInventoryCount(address, confirmed.length)
+  const count = await getSpendableInventoryCount(address, 0)
 
   // If a split was recently broadcast for this address, wait for cooldown or confirmation
   const pendingUntil = maintState.pendingSplitUntilByAddress.get(address) || 0
@@ -195,73 +163,52 @@ async function topUpWallet(wif: string): Promise<{ txid: string; address: string
     return null
   }
 
-  // Choose the largest viable candidate and reserve it before split, so the
-  // broadcaster and splitter don't select the same UTXO under concurrency.
-  const candidates = confirmed.slice().sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
-  if (candidates.length === 0 && process.env.BSV_UTXO_BOOTSTRAP_FROM_UNCONFIRMED === 'true') {
-    candidates.push(...unconfirmed.slice().sort((a: any, b: any) => (b.value || 0) - (a.value || 0)))
-  }
-  for (const inputSource of candidates) {
-    const inputKey = `${inputSource.tx_hash}:${inputSource.tx_pos}`
-    if (isSplitInputHeld(address, inputKey)) continue
+  const minUsefulInput = estimateSplitRequirement(2)
+  let inputSource = await acquireReserveUtxo({
+    walletIndex,
+    minSatoshis: minUsefulInput,
+    confirmedOnly: MIN_CONF > 0,
+  })
 
-    let dbReserved = false
-    if (ENABLE_UTXO_DB_LOCKS) {
-      try {
-        const { reserveUtxoKeys } = await import('./utxo-locks')
-        const reserved = await reserveUtxoKeys([inputKey], undefined, Math.max(60000, SPLIT_INPUT_HOLD_MS))
-        if (!reserved.includes(inputKey)) continue
-        dbReserved = true
-      } catch {
-        // If lock infra is unavailable, continue with local hold.
-      }
-    }
-
-    reserveSplitInputHold(address, inputKey)
-
-    const totalOut = need * SPLIT_OUTPUT_SATS
-    const estBytes = 300 + need * 40
-    const fee = Math.ceil(estBytes * SPLIT_FEE_RATE)
-    const required = totalOut + fee + DUST_LIMIT
-
-    if (inputSource.value < required) {
-      // If the UTXO isn't large enough, try fewer outputs
-      const maxOutputs = Math.floor((inputSource.value - 300 * SPLIT_FEE_RATE - DUST_LIMIT) / (SPLIT_OUTPUT_SATS + 40 * SPLIT_FEE_RATE))
-      if (maxOutputs < 2) {
-        if (dbReserved) {
-          try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys([inputKey]) } catch {}
-        }
-        releaseSplitInputHold(address, inputKey)
-        continue
-      }
-      const adjustedNeed = Math.min(need, maxOutputs)
-      return doSplit(wif, address, inputSource, adjustedNeed, inputKey, dbReserved)
-    }
-
-    return doSplit(wif, address, inputSource, need, inputKey, dbReserved)
+  if (!inputSource && process.env.BSV_UTXO_BOOTSTRAP_FROM_UNCONFIRMED === 'true') {
+    inputSource = await acquireReserveUtxo({
+      walletIndex,
+      minSatoshis: minUsefulInput,
+      confirmedOnly: false,
+    })
   }
 
-  return null
+  if (!inputSource) return null
+
+  const maxOutputs = maxSplitOutputsForInput(Number(inputSource.satoshis))
+  if (maxOutputs < 2) {
+    await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout)
+    return null
+  }
+
+  const outputCount = Math.min(need, maxOutputs)
+  return doSplit(wif, walletIndex, address, inputSource, outputCount)
 }
 
 async function doSplit(
   wif: string,
+  walletIndex: number,
   address: string,
-  inputSource: any,
+  inputSource: InventoryUtxo,
   outputCount: number,
-  inputKey: string,
-  dbReserved: boolean
 ): Promise<{ txid: string; address: string; outputs: number } | null> {
-  const scriptHex = (bsv.Script as any).fromAddress
-    ? (bsv.Script as any).fromAddress(address).toHex()
-    : p2pkhScriptHexFromWif(wif)
+  const scriptHex = inputSource.output_script || (
+    (bsv.Script as any).fromAddress
+      ? (bsv.Script as any).fromAddress(address).toHex()
+      : p2pkhScriptHexFromWif(wif)
+  )
 
   const input = {
-    txId: inputSource.tx_hash,
-    outputIndex: inputSource.tx_pos,
+    txId: inputSource.txid,
+    outputIndex: inputSource.vout,
     address,
     script: scriptHex,
-    satoshis: inputSource.value,
+    satoshis: Number(inputSource.satoshis),
   }
   const tx = new (bsv as any).Transaction().from([input])
   for (let i = 0; i < outputCount; i++) tx.to(address, SPLIT_OUTPUT_SATS)
@@ -274,20 +221,47 @@ async function doSplit(
     const txid = await broadcastSplitTransactionRaw(raw)
     maintState.pendingSplitUntilByAddress.set(address, Date.now() + SPLIT_COOLDOWN_MS)
     try {
-      await submitSplitToSpendSource(address, txid, raw, scriptHex, inputSource)
+      const outputs = tx.outputs.map((output: any, vout: number) => {
+        let outputScript = ''
+        try {
+          outputScript = typeof output?.script?.toHex === 'function'
+            ? output.script.toHex()
+            : String(output?.script || '')
+        } catch {}
+        const satoshis = Number(output?.satoshis || output?._satoshis || 0)
+        const isChange = vout >= outputCount
+        return {
+          vout,
+          satoshis,
+          outputScript,
+          utxoRole: isChange && satoshis >= Math.max(SPLIT_RESERVE_MIN_SATS, estimateSplitRequirement(Math.min(outputCount, SPLIT_BATCH)))
+            ? 'reserve' as const
+            : 'pool' as const,
+        }
+      })
+      await admitSplitOutputs({
+        topic: inputSource.topic,
+        walletIndex,
+        spentTxid: inputSource.txid,
+        spentVout: inputSource.vout,
+        spendingTxid: txid,
+        rawTx: raw,
+        outputs,
+      })
+    } catch (inventoryError) {
+      const message = inventoryError instanceof Error ? inventoryError.message : String(inventoryError)
+      console.error(`❌ Split inventory admit failed for ${txid.substring(0, 12)}...: ${message}`)
+    }
+    try {
+      await submitSplitToSpendSource(walletIndex, txid, raw, scriptHex, Number(inputSource.satoshis))
     } catch (submitError) {
       const message = submitError instanceof Error ? submitError.message : String(submitError)
       console.warn(`⚠️ Split overlay submit failed for ${txid.substring(0, 12)}...: ${message}`)
     }
-    // Keep reservations on success for a short hold period; indexers may still
-    // report the spent UTXO for a while, and immediate reuse causes doublespends.
     return { txid, address, outputs: outputCount }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    if (dbReserved) {
-      try { const { releaseUtxoKeys } = await import('./utxo-locks'); await releaseUtxoKeys([inputKey]) } catch {}
-    }
-    releaseSplitInputHold(address, inputKey)
+    await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout)
     if (msg.includes('MEMPOOL_CHAIN_LIMIT')) {
       // Backoff this wallet for 10 minutes (wait for block)
       maintState.mempoolBackoffUntil.set(address, Date.now() + 10 * 60 * 1000)
@@ -317,7 +291,7 @@ export async function logUtxoHealthDiagnostics(): Promise<void> {
           console.log(`   Overlay ${row.walletLabel} (${row.topic}): ❌ ${row.error}`)
         } else {
           console.log(
-            `   Overlay ${row.walletLabel}: ${row.totalSpendable} row(s) total, ${row.confirmedSpendable} confirmed in DB`,
+            `   Overlay ${row.walletLabel}: pool=${row.totalSpendable} (${row.confirmedSpendable} confirmed, ${row.lockedPool} locked), reserve=${row.totalReserve} (${row.confirmedReserve} confirmed, ${row.lockedReserve} locked)`,
           )
         }
       }

@@ -3,12 +3,10 @@ import { z } from 'zod'
 
 import { bsvConfig } from './bsv-config'
 import { buildTreasuryTopic } from './spend-source'
-import { ensureUtxoLocksTable } from './utxo-locks'
 import { getOverlayServerConfig } from './overlay-config'
 import {
   assertOverlaySchemaReady,
   countLookupOutputs,
-  getCachedTopicCount,
   getExistingOutputsForTopicTxid,
   insertAdmittedOutput,
   listLookupOutputs,
@@ -378,6 +376,8 @@ export async function submitOverlayTransaction(input: unknown): Promise<OverlayS
           raw_tx: normalized.rawTx,
           beef: normalized.beef,
           confirmed: normalized.confirmed,
+          wallet_index: getBindingForTopic(topic).walletIndex,
+          utxo_role: 'pool',
         })
         outputsToAdmit.push(toPublicOutput(inserted))
       }
@@ -446,14 +446,7 @@ export async function lookupOverlaySpendables(input: unknown): Promise<OverlayLo
     throw new Error(`Unsupported overlay provider "${normalized.provider}"`)
   }
 
-  if (normalized.query.excludeReserved) {
-    await ensureUtxoLocksTable()
-  }
-
-  const canUseCachedCount = !normalized.query.excludeReserved && normalized.query.minSatoshis <= 0
-  const total = canUseCachedCount
-    ? (await getCachedTopicCount(normalized.query.topic, normalized.query.confirmedOnly) ?? await countLookupOutputs(normalized.query))
-    : await countLookupOutputs(normalized.query)
+  const total = await countLookupOutputs(normalized.query)
 
   const rows = normalized.countOnly
     ? []

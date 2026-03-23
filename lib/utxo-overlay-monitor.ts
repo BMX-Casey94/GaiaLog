@@ -3,10 +3,8 @@
  */
 
 import { walletManager } from './wallet-manager'
-import {
-  getSpendSourceForWallet,
-  getTreasuryTopicForWallet,
-} from './spend-source'
+import { getTreasuryTopicForWallet } from './spend-source'
+import { getWalletInventorySummary } from './utxo-inventory'
 import { getMinSpendConfirmations, getQueueGateMinConfirmations } from './utxo-spend-policy'
 
 const lastDriftLogAt = new Map<string, number>()
@@ -26,6 +24,10 @@ export interface TreasuryOverlayInventoryRow {
   topic: string
   totalSpendable: number
   confirmedSpendable: number
+  totalReserve: number
+  confirmedReserve: number
+  lockedPool: number
+  lockedReserve: number
   error?: string
 }
 
@@ -40,29 +42,17 @@ export async function fetchTreasuryOverlayInventorySnapshot(): Promise<TreasuryO
       const topic = getTreasuryTopicForWallet(walletIndex)
       const label = `W${walletIndex + 1}`
       try {
-        const spendSource = getSpendSourceForWallet(walletIndex)
-        const [totalSpendable, confirmedSpendable] = await Promise.all([
-          spendSource.countSpendable({
-            topic,
-            minSatoshis: 0,
-            excludeReserved: false,
-            confirmedOnly: false,
-            allowDegradedStale: true,
-          }),
-          spendSource.countSpendable({
-            topic,
-            minSatoshis: 0,
-            excludeReserved: false,
-            confirmedOnly: true,
-            allowDegradedStale: true,
-          }),
-        ])
+        const summary = await getWalletInventorySummary(walletIndex)
         return {
           walletIndex,
           walletLabel: label,
           topic,
-          totalSpendable,
-          confirmedSpendable,
+          totalSpendable: summary.totalPool,
+          confirmedSpendable: summary.confirmedPool,
+          totalReserve: summary.totalReserve,
+          confirmedReserve: summary.confirmedReserve,
+          lockedPool: summary.lockedPool,
+          lockedReserve: summary.lockedReserve,
         } satisfies TreasuryOverlayInventoryRow
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e)
@@ -72,6 +62,10 @@ export async function fetchTreasuryOverlayInventorySnapshot(): Promise<TreasuryO
           topic,
           totalSpendable: 0,
           confirmedSpendable: 0,
+          totalReserve: 0,
+          confirmedReserve: 0,
+          lockedPool: 0,
+          lockedReserve: 0,
           error: message,
         } satisfies TreasuryOverlayInventoryRow
       }
@@ -127,7 +121,7 @@ export async function logTreasuryOverlayInventorySummary(): Promise<void> {
       if (r.confirmedSpendable === 0 && r.totalSpendable > 0) {
         if (shouldLog(`inv-unconf-${r.walletIndex}`)) {
           console.log(
-            `[UTXO inventory] ${r.walletLabel}: overlay ${r.totalSpendable} row(s), 0 marked confirmed in DB. ` +
+            `[UTXO inventory] ${r.walletLabel}: pool=${r.totalSpendable} row(s), reserve=${r.totalReserve}, 0 pool rows marked confirmed in DB. ` +
               `minSpendConf=${minSpend}, queueGateMinConf=${gateMin}. ` +
               (minSpend === 0
                 ? 'Spends may use unconfirmed rows (BSV_MIN_SPEND_CONFIRMATIONS=0).'
