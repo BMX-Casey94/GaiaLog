@@ -7,6 +7,26 @@ import dotenv from 'dotenv'
 dotenv.config({ path: '.env.local' })
 dotenv.config()
 
+/** Migrations that start with their own BEGIN; ... COMMIT; (after optional -- comments). */
+function migrationOpensOwnTransaction(sql: string): boolean {
+  for (const rawLine of sql.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (line === '' || line.startsWith('--')) continue
+    return /^BEGIN\s*;/i.test(line)
+  }
+  return false
+}
+
+/** Each file is a single CREATE INDEX CONCURRENTLY (cannot batch multiple in one transaction). */
+const CONCURRENT_INDEX_MIGRATIONS = new Set([
+  '0017_overlay_utxo_inventory_idx_concurrent.sql',
+  '0018_overlay_utxo_wallet_outpoint_idx_concurrent.sql',
+])
+
+function isConcurrentIndexMigration(file: string): boolean {
+  return CONCURRENT_INDEX_MIGRATIONS.has(file)
+}
+
 async function run() {
   const { dbPool } = await import('@/lib/db')
   const migrationsDir = path.resolve(process.cwd(), 'db', 'migrations')
@@ -17,7 +37,9 @@ async function run() {
 
   const client = await dbPool.connect()
   try {
-    await client.query('BEGIN')
+    await client.query('SET statement_timeout = 0')
+    await client.query('SET lock_timeout = 0')
+
     await client.query(
       'CREATE TABLE IF NOT EXISTS _migrations (id SERIAL PRIMARY KEY, filename TEXT UNIQUE, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())',
     )
@@ -29,13 +51,31 @@ async function run() {
       if (applied.has(file)) continue
       const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8')
       console.log(`Applying migration: ${file}`)
-      await client.query(sql)
-      await client.query('INSERT INTO _migrations(filename) VALUES($1)', [file])
+
+      if (isConcurrentIndexMigration(file)) {
+        await client.query(sql)
+        await client.query('INSERT INTO _migrations(filename) VALUES($1)', [file])
+        continue
+      }
+
+      if (migrationOpensOwnTransaction(sql)) {
+        await client.query(sql)
+        await client.query('INSERT INTO _migrations(filename) VALUES($1)', [file])
+        continue
+      }
+
+      await client.query('BEGIN')
+      try {
+        await client.query(sql)
+        await client.query('INSERT INTO _migrations(filename) VALUES($1)', [file])
+        await client.query('COMMIT')
+      } catch (e) {
+        await client.query('ROLLBACK')
+        throw e
+      }
     }
-    await client.query('COMMIT')
     console.log('Migrations completed')
   } catch (e) {
-    await client.query('ROLLBACK')
     console.error('Migration failed:', e)
     process.exitCode = 1
   } finally {
@@ -45,5 +85,3 @@ async function run() {
 }
 
 run()
-
-
