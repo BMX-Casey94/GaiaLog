@@ -17,10 +17,13 @@ ALTER TABLE overlay_admitted_utxos
 ALTER TABLE overlay_admitted_utxos
   ADD COLUMN IF NOT EXISTS locked_at timestamptz;
 
--- Narrow backfill: only topics that encode a wallet suffix (not every row).
+-- Backfill only live spendable rows. Historical removed rows do not need a
+-- wallet_index for runtime inventory acquisition, and touching them all is too
+-- expensive on large production tables.
 UPDATE overlay_admitted_utxos
    SET wallet_index = GREATEST(0, ((regexp_match(topic, ':W([0-9]+)$'))[1])::int - 1)
- WHERE topic ~ ':W[0-9]+$';
+ WHERE removed = false
+   AND topic ~ ':W[0-9]+$';
 
 ALTER TABLE overlay_admitted_utxos
   ALTER COLUMN utxo_role SET DEFAULT 'pool';
