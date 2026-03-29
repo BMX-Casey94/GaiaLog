@@ -25,12 +25,17 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
+
+
+SAVE_INTERVAL_SECONDS = 10
 
 
 def utc_now_iso() -> str:
@@ -78,69 +83,107 @@ def normalise_utxo(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 
 class UtxoStore:
-    def __init__(self, state_path: Path):
+    def __init__(self, state_path: Path, save_interval: float = SAVE_INTERVAL_SECONDS):
         self.state_path = state_path
-        self.lock = threading.RLock()
+        self.lock = threading.Lock()
         self.data: dict[str, Any] = {"wallets": {}, "updated_at": utc_now_iso()}
+        self._dirty = False
+        self._save_interval = save_interval
+        self._shutdown = threading.Event()
         self._load()
+        self._save_thread = threading.Thread(target=self._periodic_save, daemon=True)
+        self._save_thread.start()
 
     def _load(self) -> None:
         with self.lock:
             if not self.state_path.exists():
                 self.state_path.parent.mkdir(parents=True, exist_ok=True)
-                self._save_unlocked()
+                self._flush_to_disk()
                 return
             try:
-                loaded = json.loads(self.state_path.read_text(encoding="utf-8"))
+                with open(self.state_path, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
                 wallets = loaded.get("wallets", {})
                 if not isinstance(wallets, dict):
                     wallets = {}
                 clean_wallets: dict[str, list[dict[str, Any]]] = {}
                 for address, utxos in wallets.items():
-                    if not isinstance(address, str):
-                        continue
-                    if not isinstance(utxos, list):
+                    if not isinstance(address, str) or not isinstance(utxos, list):
                         continue
                     normalised: list[dict[str, Any]] = []
                     for raw in utxos:
-                        if not isinstance(raw, dict):
-                            continue
-                        n = normalise_utxo(raw)
-                        if n:
-                            normalised.append(n)
+                        if isinstance(raw, dict):
+                            n = normalise_utxo(raw)
+                            if n:
+                                normalised.append(n)
                     clean_wallets[address] = normalised
                 self.data = {
                     "wallets": clean_wallets,
                     "updated_at": loaded.get("updated_at", utc_now_iso()),
                 }
-            except Exception:
-                # If state is corrupt, keep service alive with empty state.
+                total = sum(len(v) for v in clean_wallets.values())
+                print(f"[utxo-manager] loaded {total} UTXOs across {len(clean_wallets)} wallets")
+            except Exception as exc:
+                print(f"[utxo-manager] failed to load state, starting empty: {exc}", file=sys.stderr)
                 self.data = {"wallets": {}, "updated_at": utc_now_iso()}
-                self._save_unlocked()
+                self._flush_to_disk()
 
-    def _save_unlocked(self) -> None:
+    def _mark_dirty(self) -> None:
+        self._dirty = True
+
+    def _flush_to_disk(self) -> None:
+        """Write state to disk. Must be called with self.lock held."""
         self.data["updated_at"] = utc_now_iso()
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.state_path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, separators=(",", ":"))
+            tmp.replace(self.state_path)
+            self._dirty = False
+        except Exception as exc:
+            print(f"[utxo-manager] save failed: {exc}", file=sys.stderr)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _periodic_save(self) -> None:
+        while not self._shutdown.is_set():
+            self._shutdown.wait(self._save_interval)
+            if self._dirty:
+                with self.lock:
+                    if self._dirty:
+                        self._flush_to_disk()
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+        with self.lock:
+            if self._dirty:
+                self._flush_to_disk()
+        print("[utxo-manager] final save complete")
 
     def list_for_address(self, address: str, confirmed_only: bool, min_satoshis: int) -> list[dict[str, Any]]:
         with self.lock:
-            utxos = list(self.data.get("wallets", {}).get(address, []))
+            wallet_utxos = self.data.get("wallets", {}).get(address)
+            if wallet_utxos is None:
+                return []
+            snapshot = wallet_utxos[:]
+
         filtered = []
-        for utxo in utxos:
-            if confirmed_only and not bool(utxo.get("confirmed")):
+        for utxo in snapshot:
+            if confirmed_only and not utxo.get("confirmed"):
                 continue
-            if parse_int(utxo.get("satoshis", 0), 0) < min_satoshis:
+            sats = utxo.get("satoshis", 0)
+            if sats < min_satoshis:
                 continue
             filtered.append(
                 {
                     "tx_hash": utxo["txid"],
-                    "tx_pos": int(utxo["vout"]),
-                    "value": int(utxo["satoshis"]),
-                    "confirmations": int(utxo.get("confirmations", 0)),
-                    "height": int(utxo.get("height", 0)),
+                    "tx_pos": utxo["vout"],
+                    "value": sats,
+                    "confirmations": utxo.get("confirmations", 0),
+                    "height": utxo.get("height", 0),
                     "script": utxo.get("script", ""),
                 }
             )
@@ -158,12 +201,12 @@ class UtxoStore:
 
         with self.lock:
             wallets = self.data.setdefault("wallets", {})
-            current = list(wallets.get(address, []))
+            current = wallets.get(address, [])
             before = len(current)
             current = [
                 item
                 for item in current
-                if not (item.get("txid") == spent_txid and int(item.get("vout", -1)) == spent_vout)
+                if not (item.get("txid") == spent_txid and item.get("vout") == spent_vout)
             ]
             removed = before - len(current)
 
@@ -172,20 +215,19 @@ class UtxoStore:
                 satoshis = parse_int(change.get("satoshis", 0), 0)
                 vout = parse_int(change.get("vout", -1), -1)
                 if satoshis > 0 and vout >= 0:
-                    raw = {
+                    normalised = normalise_utxo({
                         "txid": spending_txid,
                         "vout": vout,
                         "satoshis": satoshis,
                         "confirmed": bool(change.get("confirmed", False)),
                         "script": str(change.get("outputScript", "")).strip(),
-                    }
-                    normalised = normalise_utxo(raw)
+                    })
                     if normalised:
                         current.append(normalised)
                         added = 1
 
             wallets[address] = current
-            self._save_unlocked()
+            self._mark_dirty()
             return {"removed": removed, "added": added, "remaining": len(current)}
 
     def seed(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -225,11 +267,11 @@ class UtxoStore:
                 if replace:
                     wallets[address] = normalised
                 else:
-                    wallets[address] = list(wallets.get(address, [])) + normalised
+                    wallets[address] = wallets.get(address, []) + normalised
                 seeded_wallets = 1
                 seeded_utxos = len(normalised)
 
-            self._save_unlocked()
+            self._mark_dirty()
 
         return {"wallets": seeded_wallets, "utxos": seeded_utxos}
 
@@ -240,6 +282,7 @@ class UtxoStore:
                 "wallets": len(wallets),
                 "utxos": sum(len(items) for items in wallets.values()),
                 "updatedAt": self.data.get("updated_at"),
+                "dirty": self._dirty,
             }
 
 
@@ -249,16 +292,18 @@ class Handler(BaseHTTPRequestHandler):
     allowed_addresses: set[str]
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # Keep logs concise for pm2.
         print(f"[utxo-manager] {self.address_string()} - {fmt % args}")
 
-    def _json(self, status: int, payload: Any) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def _safe_write(self, status: int, payload: Any) -> None:
+        try:
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def _read_json(self) -> dict[str, Any]:
         length = parse_int(self.headers.get("content-length"), 0)
@@ -286,27 +331,26 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
 
         if path == "/health":
-            self._json(200, {"ok": True, **self.store.stats()})
+            self._safe_write(200, {"ok": True, **self.store.stats()})
             return
 
         if path.startswith("/utxos/"):
             address = unquote(path.split("/utxos/", 1)[1]).strip()
             if not address:
-                self._json(400, {"ok": False, "error": "address is required"})
+                self._safe_write(400, {"ok": False, "error": "address is required"})
                 return
             if not self._address_allowed(address):
-                self._json(403, {"ok": False, "error": "address is not allow-listed"})
+                self._safe_write(403, {"ok": False, "error": "address is not allow-listed"})
                 return
 
             q = parse_qs(parsed.query)
             confirmed_only = parse_bool((q.get("confirmedOnly") or [None])[0], False)
             min_sats = parse_int((q.get("minSatoshis") or [0])[0], 0)
             utxos = self.store.list_for_address(address, confirmed_only, max(0, min_sats))
-            # Return plain list because GaiaLog custom UTXO provider expects an array.
-            self._json(200, utxos)
+            self._safe_write(200, utxos)
             return
 
-        self._json(404, {"ok": False, "error": "not found"})
+        self._safe_write(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -315,31 +359,33 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/consume-admit":
                 if not self._authorised():
-                    self._json(401, {"ok": False, "error": "unauthorised"})
+                    self._safe_write(401, {"ok": False, "error": "unauthorised"})
                     return
                 payload = self._read_json()
                 address = str(payload.get("address", "")).strip()
                 if not self._address_allowed(address):
-                    self._json(403, {"ok": False, "error": "address is not allow-listed"})
+                    self._safe_write(403, {"ok": False, "error": "address is not allow-listed"})
                     return
                 result = self.store.consume_admit(payload)
-                self._json(200, {"ok": True, **result})
+                self._safe_write(200, {"ok": True, **result})
                 return
 
             if path == "/admin/seed":
                 if not self._authorised():
-                    self._json(401, {"ok": False, "error": "unauthorised"})
+                    self._safe_write(401, {"ok": False, "error": "unauthorised"})
                     return
                 payload = self._read_json()
                 result = self.store.seed(payload)
-                self._json(200, {"ok": True, **result})
+                self._safe_write(200, {"ok": True, **result})
                 return
 
-            self._json(404, {"ok": False, "error": "not found"})
+            self._safe_write(404, {"ok": False, "error": "not found"})
         except ValueError as err:
-            self._json(400, {"ok": False, "error": str(err)})
+            self._safe_write(400, {"ok": False, "error": str(err)})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         except Exception as err:
-            self._json(500, {"ok": False, "error": str(err)})
+            self._safe_write(500, {"ok": False, "error": str(err)})
 
 
 def main() -> None:
@@ -366,18 +412,18 @@ def main() -> None:
     server = ThreadingHTTPServer((host, port), Handler)
     print(
         f"[utxo-manager] listening on http://{host}:{port} "
-        f"(state={state_path}, allowList={len(allowed)})"
+        f"(state={state_path}, allowList={len(allowed)}, saveInterval={SAVE_INTERVAL_SECONDS}s)"
     )
 
-    def shutdown(*_: Any) -> None:
+    def shutdown_handler(*_: Any) -> None:
         print("[utxo-manager] shutting down...")
+        store.shutdown()
         server.shutdown()
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
     server.serve_forever(poll_interval=0.5)
 
 
 if __name__ == "__main__":
     main()
-
