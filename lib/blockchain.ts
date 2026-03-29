@@ -103,6 +103,10 @@ const SPEND_SOURCE_LIST_LIMIT = Math.max(100, Number(process.env.BSV_SPEND_SOURC
 const BROADCAST_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.BSV_BROADCAST_TIMEOUT_MS || 15000))
 const SLOW_WRITE_TO_CHAIN_MS = Math.max(1000, Number(process.env.BSV_SLOW_WRITE_TO_CHAIN_MS || 5000))
 const SLOW_UTXO_LOOKUP_MS = Math.max(250, Number(process.env.BSV_SLOW_UTXO_LOOKUP_MS || 2000))
+const EMERGENCY_LEGACY_UTXO_MODE = process.env.GAIALOG_EMERGENCY_LEGACY_UTXO === 'true'
+const EMERGENCY_UTXO_MANAGER_URL = String(process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_URL || '').trim()
+const EMERGENCY_UTXO_MANAGER_SECRET = String(process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_SECRET || '').trim()
+const EMERGENCY_UTXO_MANAGER_TIMEOUT_MS = Math.max(1000, Number(process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_TIMEOUT_MS || 5000))
 
 // Data credibility features (opt-in for now)
 const ENABLE_CREDIBILITY = process.env.GAIALOG_ENABLE_CREDIBILITY === 'true'
@@ -800,10 +804,80 @@ export class BlockchainService {
   private walletEmptyUntil: Map<number, number> = new Map()
   private static readonly WALLET_EMPTY_CACHE_MS = 60_000
 
+  private toEmergencyInventoryUtxo(walletIndex: number, raw: any): InventoryUtxo | null {
+    const txid = String(raw?.tx_hash || raw?.txid || raw?.hash || '')
+    const vout = Number(raw?.tx_pos ?? raw?.vout ?? 0)
+    const satoshis = Number(raw?.value ?? raw?.satoshis ?? 0)
+    if (!txid || !Number.isFinite(vout) || !Number.isFinite(satoshis) || satoshis < 0) return null
+
+    const outputScript = String(raw?.script || raw?.outputScript || raw?.lockingScript || '')
+    const confirmations = Number(raw?.confirmations || 0)
+    const height = typeof raw?.height === 'number' ? raw.height : 0
+    const confirmed = confirmations > 0 || height > 0
+
+    return {
+      topic: getTreasuryTopicForWallet(walletIndex),
+      txid,
+      vout: Math.floor(vout),
+      satoshis: Math.floor(satoshis),
+      output_script: outputScript,
+      raw_tx: typeof raw?.rawTx === 'string' ? raw.rawTx : '',
+      beef: null,
+      admitted_at: new Date().toISOString(),
+      confirmed,
+      removed: false,
+      removed_at: null,
+      spending_txid: null,
+      wallet_index: walletIndex,
+      utxo_role: 'pool',
+      locked: false,
+      locked_by: null,
+      locked_at: null,
+    }
+  }
+
+  private async notifyEmergencyUtxoManager(input: {
+    address: string
+    walletIndex: number
+    topic: string
+    spentTxid: string
+    spentVout: number
+    spendingTxid: string
+    change: { vout: number; satoshis: number; outputScript: string; confirmed?: boolean } | null
+  }): Promise<void> {
+    if (!EMERGENCY_UTXO_MANAGER_URL) return
+
+    const base = EMERGENCY_UTXO_MANAGER_URL.replace(/\/+$/, '')
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), EMERGENCY_UTXO_MANAGER_TIMEOUT_MS)
+    try {
+      const headers: Record<string, string> = { 'content-type': 'application/json' }
+      if (EMERGENCY_UTXO_MANAGER_SECRET) {
+        headers['x-gaialog-utxo-manager-secret'] = EMERGENCY_UTXO_MANAGER_SECRET
+      }
+
+      const response = await fetch(`${base}/consume-admit`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(input),
+        signal: controller.signal,
+      })
+      if (!response.ok) {
+        const body = await response.text().catch(() => '')
+        throw new Error(`HTTP ${response.status} ${body || response.statusText}`.trim())
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.warn(`⚠️ Emergency UTXO manager sync failed for ${input.spendingTxid.substring(0, 12)}...: ${message}`)
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
   private async getFirstWalletWithSpendableUtxos(
     minSatoshis: number,
     traceId?: string,
-  ): Promise<{ wif: string; index: number; address: string; utxo: InventoryUtxo } | null> {
+  ): Promise<{ wif: string; index: number; address: string; utxo: InventoryUtxo; inventoryBacked: boolean } | null> {
     const list = this.wifsForSend && this.wifsForSend.length > 0
       ? this.wifsForSend
       : (BSV_PRIVATE_KEY ? [BSV_PRIVATE_KEY] : (BSV_FALLBACK_WIF ? [BSV_FALLBACK_WIF] : []))
@@ -817,6 +891,79 @@ export class BlockchainService {
 
     const pickByConfirmedFirst = process.env.BSV_WALLET_PICK_BY_CONFIRMED_FIRST !== 'false'
     const confirmedPasses = pickByConfirmedFirst && MIN_SPEND_CONF <= 0 ? [true, false] : [MIN_SPEND_CONF > 0]
+
+    if (EMERGENCY_LEGACY_UTXO_MODE) {
+      for (const confirmedOnly of confirmedPasses) {
+        const now = Date.now()
+        for (let i = 0; i < list.length; i++) {
+          const pick = (this.rrIndex + i) % list.length
+          const wif = list[pick]
+          try {
+            const sdkKey = SDKPrivateKey.fromWif(wif)
+            const addr = sdkKey.toPublicKey().toAddress().toString()
+
+            if (isBackedOff && isBackedOff(addr)) continue
+
+            const emptyUntil = this.walletEmptyUntil.get(pick) || 0
+            if (emptyUntil > now) continue
+
+            const startedAt = Date.now()
+            const spendables = await this.getSpendableUtxos(addr, wif, pick, traceId)
+            const candidate = spendables
+              .filter((row: any) => Number(row?.value ?? row?.satoshis ?? 0) >= minSatoshis)
+              .sort((left: any, right: any) => {
+                const l = Number(left?.value ?? left?.satoshis ?? 0)
+                const r = Number(right?.value ?? right?.satoshis ?? 0)
+                return l - r
+              })[0]
+
+            if (candidate) {
+              const synthetic = this.toEmergencyInventoryUtxo(pick, candidate)
+              if (!synthetic) continue
+              const utxoKey = `${synthetic.txid}:${synthetic.vout}`
+              this.markUtxosUsed([utxoKey])
+
+              this.walletEmptyUntil.delete(pick)
+              this.rrIndex = (pick + 1) % list.length
+              this.logUtxoLookupTrace({
+                traceId,
+                walletIndex: pick,
+                address: addr,
+                source: 'legacy-emergency',
+                spendableCount: spendables.length,
+                durationMs: Date.now() - startedAt,
+                note: `minSats=${minSatoshis};confirmedOnly=${confirmedOnly};dbBypass=true`,
+              })
+              return { wif, index: pick, address: addr, utxo: synthetic, inventoryBacked: false }
+            }
+
+            if (!confirmedOnly || confirmedPasses.length === 1) {
+              this.walletEmptyUntil.set(pick, now + BlockchainService.WALLET_EMPTY_CACHE_MS)
+            }
+          } catch (error) {
+            const addr = (() => {
+              try {
+                return SDKPrivateKey.fromWif(wif).toPublicKey().toAddress().toString()
+              } catch {
+                return ''
+              }
+            })()
+            if (addr) {
+              this.logUtxoLookupTrace({
+                traceId,
+                walletIndex: pick,
+                address: addr,
+                source: 'legacy-emergency-error',
+                spendableCount: 0,
+                durationMs: 0,
+                note: error instanceof Error ? error.message : String(error),
+              })
+            }
+          }
+        }
+      }
+      return null
+    }
 
     for (const confirmedOnly of confirmedPasses) {
       const now = Date.now()
@@ -851,7 +998,7 @@ export class BlockchainService {
               durationMs: Date.now() - startedAt,
               note: `minSats=${minSatoshis};confirmedOnly=${confirmedOnly}`,
             })
-            return { wif, index: pick, address: addr, utxo: acquired }
+            return { wif, index: pick, address: addr, utxo: acquired, inventoryBacked: true }
           }
 
           if (!confirmedOnly || confirmedPasses.length === 1) {
@@ -1114,9 +1261,13 @@ export class BlockchainService {
       const walletLookupStartedAt = Date.now()
       const picked = await this.getFirstWalletWithSpendableUtxos(minInputSatoshis, traceId)
       walletLookupMs = Date.now() - walletLookupStartedAt
-      if (!picked) throw new Error(`No inventory UTXOs available across wallets for minSats=${minInputSatoshis}`)
+      if (!picked) {
+        const modeLabel = EMERGENCY_LEGACY_UTXO_MODE ? 'emergency spendable' : 'inventory'
+        throw new Error(`No ${modeLabel} UTXOs available across wallets for minSats=${minInputSatoshis}`)
+      }
 
-      const { wif, index: walletIndexForLog, address, utxo: acquiredUtxo } = picked
+      const { wif, index: walletIndexForLog, address, utxo: acquiredUtxo, inventoryBacked } = picked
+      const acquiredUtxoKey = `${acquiredUtxo.txid}:${acquiredUtxo.vout}`
       selectedWalletIndex = walletIndexForLog
       selectedWalletAddress = address
       selectedSpendableCount = 1
@@ -1228,31 +1379,52 @@ export class BlockchainService {
         acceptedVia = acceptedViaResult
         acceptedTxid = txid
       } catch (innerErr) {
-        await releaseUtxo(acquiredUtxo.topic, acquiredUtxo.txid, acquiredUtxo.vout)
+        if (inventoryBacked) {
+          await releaseUtxo(acquiredUtxo.topic, acquiredUtxo.txid, acquiredUtxo.vout)
+        } else {
+          this.releaseUtxos([acquiredUtxoKey])
+        }
         throw innerErr
       }
 
       const txid = acceptedTxid!
 
-      try {
-        await consumeAndAdmitChange({
-          topic: acquiredUtxo.topic,
+      if (inventoryBacked) {
+        try {
+          await consumeAndAdmitChange({
+            topic: acquiredUtxo.topic,
+            walletIndex: walletIndexForLog,
+            spentTxid: acquiredUtxo.txid,
+            spentVout: acquiredUtxo.vout,
+            spendingTxid: txid,
+            rawTx: normalHex,
+            change: changeOutput ? {
+              vout: changeOutput.vout,
+              satoshis: changeOutput.satoshis,
+              outputScript: changeOutput.outputScript,
+              confirmed: false,
+              utxoRole: 'pool',
+            } : null,
+          })
+        } catch (inventoryErr) {
+          const inventoryMsg = inventoryErr instanceof Error ? inventoryErr.message : String(inventoryErr)
+          console.error(`❌ Inventory consume/admit failed for ${txid.substring(0, 12)}...: ${inventoryMsg}`)
+        }
+      } else {
+        void this.notifyEmergencyUtxoManager({
+          address,
           walletIndex: walletIndexForLog,
+          topic: acquiredUtxo.topic,
           spentTxid: acquiredUtxo.txid,
           spentVout: acquiredUtxo.vout,
           spendingTxid: txid,
-          rawTx: normalHex,
           change: changeOutput ? {
             vout: changeOutput.vout,
             satoshis: changeOutput.satoshis,
             outputScript: changeOutput.outputScript,
             confirmed: false,
-            utxoRole: 'pool',
           } : null,
         })
-      } catch (inventoryErr) {
-        const inventoryMsg = inventoryErr instanceof Error ? inventoryErr.message : String(inventoryErr)
-        console.error(`❌ Inventory consume/admit failed for ${txid.substring(0, 12)}...: ${inventoryMsg}`)
       }
 
       // Log transaction
@@ -1278,25 +1450,27 @@ export class BlockchainService {
       // Feed accepted transactions into the spend-source admission path.
       // In legacy mode this is a no-op; overlay mode can admit the outputs
       // immediately without waiting for external indexers to converge.
-      try {
-        const spendSource = getSpendSourceForWallet(walletIndexForLog)
-        const treasuryTopic = getTreasuryTopicForWallet(walletIndexForLog)
-        void spendSource.submitAcceptedTx({
-          clientRequestId: txid,
-          topics: [treasuryTopic],
-          rawTxEnvelope: {
-            txid,
-            rawTx: normalHex,
-            acceptedVia,
-            prevouts: prevoutsForArc,
-            broadcastedAt: new Date().toISOString(),
-          },
-        }).catch((submitErr) => {
-          const msg = submitErr instanceof Error ? submitErr.message : String(submitErr)
-          console.warn(`⚠️ Spend-source submit failed for ${txid.substring(0, 12)}...: ${msg}`)
-        })
-      } catch {
-        // Non-fatal – on-chain acceptance already succeeded.
+      if (inventoryBacked) {
+        try {
+          const spendSource = getSpendSourceForWallet(walletIndexForLog)
+          const treasuryTopic = getTreasuryTopicForWallet(walletIndexForLog)
+          void spendSource.submitAcceptedTx({
+            clientRequestId: txid,
+            topics: [treasuryTopic],
+            rawTxEnvelope: {
+              txid,
+              rawTx: normalHex,
+              acceptedVia,
+              prevouts: prevoutsForArc,
+              broadcastedAt: new Date().toISOString(),
+            },
+          }).catch((submitErr) => {
+            const msg = submitErr instanceof Error ? submitErr.message : String(submitErr)
+            console.warn(`⚠️ Spend-source submit failed for ${txid.substring(0, 12)}...: ${msg}`)
+          })
+        } catch {
+          // Non-fatal – on-chain acceptance already succeeded.
+        }
       }
 
       // ── Feed reading to /explorer store (zero API calls) ──
@@ -1395,7 +1569,7 @@ export class BlockchainService {
         txid: acceptedTxid,
         error: msg,
       })
-      const transient = /already reserved|No UTXOs available across wallets|No inventory UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(msg)
+      const transient = /already reserved|No UTXOs available across wallets|No inventory UTXOs available across wallets|No emergency spendable UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(msg)
       const failedProviderValue = (data as any)?.payload?.source || 'unknown'
       const failedProviderId = (data as any)?.providerId || (data as any)?.payload?.provider_id || resolveProviderIdFromSource(failedProviderValue) || undefined
       const failedDatasetId = (data as any)?.datasetId || (data as any)?.payload?.dataset_id || undefined
@@ -1792,7 +1966,7 @@ export class BlockchainService {
   }
 
   private markUtxosUsed(keys: string[]): void {
-    if (!ENABLE_UTXO_POOL) return
+    if (!ENABLE_UTXO_POOL && !EMERGENCY_LEGACY_UTXO_MODE) return
     const exp = Date.now() + Math.max(1000, UTXO_USED_KEY_TTL_MS)
     // Mark in every address cache (keys are globally unique per address anyway)
     for (const cache of this.utxoCacheByAddress.values()) {
@@ -1801,7 +1975,7 @@ export class BlockchainService {
   }
 
   private releaseUtxos(keys: string[]): void {
-    if (!ENABLE_UTXO_POOL) return
+    if (!ENABLE_UTXO_POOL && !EMERGENCY_LEGACY_UTXO_MODE) return
     for (const cache of this.utxoCacheByAddress.values()) {
       for (const k of keys) cache.usedKeys.delete(k)
     }

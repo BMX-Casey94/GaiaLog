@@ -84,6 +84,8 @@ async function main() {
         `timeout=${Math.max(3000, Number(process.env.BSV_BROADCAST_TIMEOUT_MS || 15000))}ms ` +
         `minSpendConf=${getMinSpendConfirmations()} queueGateMinConf=${getQueueGateMinConfirmations()} ` +
         `utxoPool=${process.env.BSV_ENABLE_UTXO_POOL === 'true' ? 'on' : 'off'} ` +
+        `emergencyLegacyUtxo=${process.env.GAIALOG_EMERGENCY_LEGACY_UTXO === 'true' ? 'on' : 'off'} ` +
+        `maintainer=${process.env.BSV_UTXO_MAINTAINER_DISABLED === 'true' ? 'off' : 'on'} ` +
         `poolMinSats=${Math.max(0, Number(process.env.BSV_UTXO_POOL_MIN_SATS || 0))} ` +
         `reserveMinSats=${Math.max(0, Number(process.env.BSV_UTXO_RESERVE_MIN_SATS || 0))} ` +
         `trace=${traceMode}`
