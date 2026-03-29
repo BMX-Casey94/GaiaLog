@@ -47,11 +47,15 @@ async function main() {
     const { workerManager } = await import('../lib/worker-threads')
     const { workerQueue } = await import('../lib/worker-queue')
     const { startUtxoMaintainer } = await import('../lib/utxo-maintainer')
-    const { initializeProviderBudgets } = await import('../lib/provider-registry')
+    const { initializeProviderBudgets, recomputeProviderConfigs } = await import('../lib/provider-registry')
     const { blockchainService } = await import('../lib/blockchain')
     const fs = await import('fs')
     const path = await import('path')
     const os = await import('os')
+
+    // Guarantee configs reflect the current process.env (guards against
+    // module-evaluation timing races with dotenv / PM2 env injection).
+    recomputeProviderConfigs()
 
     // Apply provider budgets from env
     await initializeProviderBudgets()

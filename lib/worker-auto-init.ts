@@ -9,7 +9,7 @@
 import { workerManager } from './worker-threads'
 import { workerQueue } from './worker-queue'
 import { startUtxoMaintainer } from './utxo-maintainer'
-import { initializeProviderBudgets } from './provider-registry'
+import { initializeProviderBudgets, recomputeProviderConfigs } from './provider-registry'
 import { walletManager } from './wallet-manager'
 import { bsvConfig } from './bsv-config'
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
@@ -102,7 +102,8 @@ export async function autoInitializeWorkers(): Promise<{
   try {
     console.log('🚀 Auto-initializing GaiaLog workers...')
     
-    // Step 1: Apply provider budgets from environment
+    // Step 1: Recompute configs from current env then apply budgets
+    recomputeProviderConfigs()
     await initializeProviderBudgets()
     console.log('✅ Provider budgets initialized')
 

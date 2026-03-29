@@ -501,95 +501,136 @@ const PROVIDER_ROLLOUT_RULES: Record<ProviderId, RolloutRule> = {
   nsw_planning: { phase: 3, minimumGate: 'gate_d', note: 'NSW Planning Portal / Planning Alerts AU. Requires API key.' },
 }
 
-export const providerConfigs: Record<ProviderId, ProviderConfig> = Object.fromEntries(
-  (Object.keys(PROVIDER_DESCRIPTORS) as ProviderId[]).map((providerId) => {
-    const descriptor = PROVIDER_DESCRIPTORS[providerId]
-    const budgets = getProviderBudgets(providerId)
-    const configuredEnabled = isProviderEnabled(providerId)
-    const requestedRolloutGate = getRequestedRolloutGate()
-    const rollout = PROVIDER_ROLLOUT_RULES[providerId]
-    const rolloutEnabled = isProviderRolloutActive(descriptor.keyRequired, rollout.minimumGate, requestedRolloutGate)
-    return [providerId, {
-      id: providerId,
-      purpose: descriptor.displayName,
-      cadence: {
-        intervalMs: getProviderInterval(providerId),
-        minIntervalMs: Math.max(60 * 1000, Math.floor(getProviderInterval(providerId) / 2)),
-        maxIntervalMs: Math.max(getProviderInterval(providerId), getProviderInterval(providerId) * 4),
-      },
-      budgets,
-      throttle: { perSecond: budgets.perSecond },
-      breaker: DEFAULT_BREAKER,
-      queueLane: getProviderQueueLane(providerId),
-      defaultPriority: getProviderPriority(providerId),
-      configuredEnabled,
-      enabled: configuredEnabled && rolloutEnabled,
-      chunkSize: getProviderChunkSize(providerId),
-      maxInFlight: getProviderMaxInFlight(providerId),
-      tokenCost: getProviderTokenCost(providerId),
-      kind: descriptor.kind,
-      throughputClass: descriptor.throughputClass,
-      keyRequired: descriptor.keyRequired,
-      blockchainFriendly: descriptor.blockchainFriendly,
-      attributionRequired: descriptor.attributionRequired,
-      sourceAliases: descriptor.sourceAliases,
-      countries: PROVIDER_COUNTRIES[providerId],
-      requestedRolloutGate,
-      rolloutEnabled,
-      rollout,
-    } satisfies ProviderConfig]
-  }),
-) as Record<ProviderId, ProviderConfig>
+function buildProviderConfigs(): Record<ProviderId, ProviderConfig> {
+  return Object.fromEntries(
+    (Object.keys(PROVIDER_DESCRIPTORS) as ProviderId[]).map((providerId) => {
+      const descriptor = PROVIDER_DESCRIPTORS[providerId]
+      const budgets = getProviderBudgets(providerId)
+      const configuredEnabled = isProviderEnabled(providerId)
+      const requestedRolloutGate = getRequestedRolloutGate()
+      const rollout = PROVIDER_ROLLOUT_RULES[providerId]
+      const rolloutEnabled = isProviderRolloutActive(descriptor.keyRequired, rollout.minimumGate, requestedRolloutGate)
+      return [providerId, {
+        id: providerId,
+        purpose: descriptor.displayName,
+        cadence: {
+          intervalMs: getProviderInterval(providerId),
+          minIntervalMs: Math.max(60 * 1000, Math.floor(getProviderInterval(providerId) / 2)),
+          maxIntervalMs: Math.max(getProviderInterval(providerId), getProviderInterval(providerId) * 4),
+        },
+        budgets,
+        throttle: { perSecond: budgets.perSecond },
+        breaker: DEFAULT_BREAKER,
+        queueLane: getProviderQueueLane(providerId),
+        defaultPriority: getProviderPriority(providerId),
+        configuredEnabled,
+        enabled: configuredEnabled && rolloutEnabled,
+        chunkSize: getProviderChunkSize(providerId),
+        maxInFlight: getProviderMaxInFlight(providerId),
+        tokenCost: getProviderTokenCost(providerId),
+        kind: descriptor.kind,
+        throughputClass: descriptor.throughputClass,
+        keyRequired: descriptor.keyRequired,
+        blockchainFriendly: descriptor.blockchainFriendly,
+        attributionRequired: descriptor.attributionRequired,
+        sourceAliases: descriptor.sourceAliases,
+        countries: PROVIDER_COUNTRIES[providerId],
+        requestedRolloutGate,
+        rolloutEnabled,
+        rollout,
+      } satisfies ProviderConfig]
+    }),
+  ) as Record<ProviderId, ProviderConfig>
+}
 
-export const datasetConfigs: Record<DatasetId, ProviderDatasetConfig> = Object.fromEntries(
-  (Object.keys(DATASET_DESCRIPTORS) as DatasetId[]).map((datasetId) => {
-    const descriptor = DATASET_DESCRIPTORS[datasetId]
-    const provider = providerConfigs[descriptor.providerId]
-    const prefix = toEnvPrefix(datasetId)
-    const configuredEnabled = bool(process.env[`${prefix}_ENABLED`], provider.configuredEnabled)
-    const requestedRolloutGate = provider.requestedRolloutGate
-    const rollout = provider.rollout
-    const rolloutEnabled = isProviderRolloutActive(descriptor.keyRequired, rollout.minimumGate, requestedRolloutGate)
-    const enabled = configuredEnabled && rolloutEnabled && provider.enabled
-    const intervalMs = Math.max(60 * 1000, n(process.env[`${prefix}_INTERVAL_MS`], provider.cadence.intervalMs || descriptor.defaultIntervalMs))
-    const chunkSize = Math.max(1, n(process.env[`${prefix}_CHUNK_SIZE`], provider.chunkSize || descriptor.defaultChunkSize))
-    const maxInFlight = Math.max(1, n(process.env[`${prefix}_MAX_IN_FLIGHT`], provider.maxInFlight || Math.max(100, chunkSize * 4)))
-    const perSecond = n(process.env[`${prefix}_RPS`], provider.budgets.perSecond ?? 0)
-    const perDayEnv = process.env[`${prefix}_PER_DAY`]
-    const budgets: BudgetLimits = {}
-    if ((provider.budgets.perSecond ?? 0) > 0 || perSecond > 0) budgets.perSecond = perSecond
-    if (perDayEnv != null && perDayEnv !== '') budgets.perDay = n(perDayEnv, provider.budgets.perDay ?? 0)
-    else if (provider.budgets.perDay != null) budgets.perDay = provider.budgets.perDay
-    return [datasetId, {
-      id: datasetId,
-      providerId: descriptor.providerId,
-      family: descriptor.family,
-      displayName: descriptor.displayName,
-      sourceLabel: descriptor.sourceLabel,
-      cadence: {
-        intervalMs,
-        minIntervalMs: Math.max(60 * 1000, Math.floor(intervalMs / 2)),
-        maxIntervalMs: Math.max(intervalMs, intervalMs * 4),
-      },
-      budgets,
-      throttle: { perSecond: budgets.perSecond },
-      queueLane: text(process.env[`${prefix}_QUEUE_LANE`], descriptor.queueLane) === 'coverage' ? 'coverage' : 'throughput',
-      defaultPriority: text(process.env[`${prefix}_QUEUE_PRIORITY`], descriptor.defaultPriority) === 'high' ? 'high' : 'normal',
-      configuredEnabled,
-      enabled,
-      chunkSize,
-      maxInFlight,
-      tokenCost: Math.max(1, n(process.env[`${prefix}_TOKEN_COST`], provider.tokenCost)),
-      keyRequired: descriptor.keyRequired,
-      blockchainFriendly: descriptor.blockchainFriendly,
-      kind: descriptor.kind,
-      metricPreviewKeys: descriptor.metricPreviewKeys,
-      requestedRolloutGate,
-      rolloutEnabled,
-      rollout,
-    } satisfies ProviderDatasetConfig]
-  }),
-) as Record<DatasetId, ProviderDatasetConfig>
+function buildDatasetConfigs(providers: Record<ProviderId, ProviderConfig>): Record<DatasetId, ProviderDatasetConfig> {
+  return Object.fromEntries(
+    (Object.keys(DATASET_DESCRIPTORS) as DatasetId[]).map((datasetId) => {
+      const descriptor = DATASET_DESCRIPTORS[datasetId]
+      const provider = providers[descriptor.providerId]
+      const prefix = toEnvPrefix(datasetId)
+      const configuredEnabled = bool(process.env[`${prefix}_ENABLED`], provider.configuredEnabled)
+      const requestedRolloutGate = provider.requestedRolloutGate
+      const rollout = provider.rollout
+      const rolloutEnabled = isProviderRolloutActive(descriptor.keyRequired, rollout.minimumGate, requestedRolloutGate)
+      const enabled = configuredEnabled && rolloutEnabled && provider.enabled
+      const intervalMs = Math.max(60 * 1000, n(process.env[`${prefix}_INTERVAL_MS`], provider.cadence.intervalMs || descriptor.defaultIntervalMs))
+      const chunkSize = Math.max(1, n(process.env[`${prefix}_CHUNK_SIZE`], provider.chunkSize || descriptor.defaultChunkSize))
+      const maxInFlight = Math.max(1, n(process.env[`${prefix}_MAX_IN_FLIGHT`], provider.maxInFlight || Math.max(100, chunkSize * 4)))
+      const perSecond = n(process.env[`${prefix}_RPS`], provider.budgets.perSecond ?? 0)
+      const perDayEnv = process.env[`${prefix}_PER_DAY`]
+      const budgets: BudgetLimits = {}
+      if ((provider.budgets.perSecond ?? 0) > 0 || perSecond > 0) budgets.perSecond = perSecond
+      if (perDayEnv != null && perDayEnv !== '') budgets.perDay = n(perDayEnv, provider.budgets.perDay ?? 0)
+      else if (provider.budgets.perDay != null) budgets.perDay = provider.budgets.perDay
+      return [datasetId, {
+        id: datasetId,
+        providerId: descriptor.providerId,
+        family: descriptor.family,
+        displayName: descriptor.displayName,
+        sourceLabel: descriptor.sourceLabel,
+        cadence: {
+          intervalMs,
+          minIntervalMs: Math.max(60 * 1000, Math.floor(intervalMs / 2)),
+          maxIntervalMs: Math.max(intervalMs, intervalMs * 4),
+        },
+        budgets,
+        throttle: { perSecond: budgets.perSecond },
+        queueLane: text(process.env[`${prefix}_QUEUE_LANE`], descriptor.queueLane) === 'coverage' ? 'coverage' : 'throughput',
+        defaultPriority: text(process.env[`${prefix}_QUEUE_PRIORITY`], descriptor.defaultPriority) === 'high' ? 'high' : 'normal',
+        configuredEnabled,
+        enabled,
+        chunkSize,
+        maxInFlight,
+        tokenCost: Math.max(1, n(process.env[`${prefix}_TOKEN_COST`], provider.tokenCost)),
+        keyRequired: descriptor.keyRequired,
+        blockchainFriendly: descriptor.blockchainFriendly,
+        kind: descriptor.kind,
+        metricPreviewKeys: descriptor.metricPreviewKeys,
+        requestedRolloutGate,
+        rolloutEnabled,
+        rollout,
+      } satisfies ProviderDatasetConfig]
+    }),
+  ) as Record<DatasetId, ProviderDatasetConfig>
+}
+
+export let providerConfigs: Record<ProviderId, ProviderConfig> = buildProviderConfigs()
+export let datasetConfigs: Record<DatasetId, ProviderDatasetConfig> = buildDatasetConfigs(providerConfigs)
+
+/**
+ * Re-evaluate provider and dataset configs from the current process.env.
+ * Call after dotenv.config() to guarantee env vars are visible, regardless
+ * of module-evaluation timing (PM2, tsx loader, dotenv v17 auto-inject).
+ */
+export function recomputeProviderConfigs(): void {
+  providerConfigs = buildProviderConfigs()
+  datasetConfigs = buildDatasetConfigs(providerConfigs)
+  const en = Object.values(datasetConfigs).filter(d => d.enabled).length
+  const tot = Object.values(datasetConfigs).length
+  const gate = Object.values(providerConfigs)[0]?.requestedRolloutGate ?? '?'
+  console.log(
+    `📋 provider-registry recomputed: datasets=${en}/${tot} gate=${gate} ` +
+    `WAQI_API_KEY=${!!process.env.WAQI_API_KEY} waqi.enabled=${providerConfigs.waqi?.enabled} ` +
+    `GAIALOG_NO_DB=${process.env.GAIALOG_NO_DB ?? '(unset)'} ` +
+    `GAIALOG_ROLLOUT_GATE=${process.env.GAIALOG_ROLLOUT_GATE ?? '(unset)'}`
+  )
+}
+
+// Module-init diagnostic
+{
+  const _en = Object.values(datasetConfigs).filter(d => d.enabled).length
+  const _tot = Object.values(datasetConfigs).length
+  const _gate = Object.values(providerConfigs)[0]?.requestedRolloutGate ?? '?'
+  const _waqiKey = !!process.env.WAQI_API_KEY
+  const _waqiProv = providerConfigs.waqi?.enabled
+  console.log(
+    `📋 provider-registry init: datasets=${_en}/${_tot} gate=${_gate} ` +
+    `WAQI_API_KEY=${_waqiKey} waqi.enabled=${_waqiProv} ` +
+    `GAIALOG_NO_DB=${process.env.GAIALOG_NO_DB ?? '(unset)'} ` +
+    `GAIALOG_ROLLOUT_GATE=${process.env.GAIALOG_ROLLOUT_GATE ?? '(unset)'}`
+  )
+}
 
 export async function initializeProviderBudgets(): Promise<void> {
   for (const cfg of Object.values(providerConfigs)) {
