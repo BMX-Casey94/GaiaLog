@@ -908,7 +908,7 @@ export class BlockchainService {
             if (emptyUntil > now) continue
 
             const startedAt = Date.now()
-            const spendables = await this.getSpendableUtxos(addr, wif, pick, traceId)
+            const spendables = await this.getSpendableUtxos(addr, wif, pick, traceId, minSatoshis)
             const candidate = spendables
               .filter((row: any) => Number(row?.value ?? row?.satoshis ?? 0) >= minSatoshis)
               .sort((left: any, right: any) => {
@@ -1691,7 +1691,7 @@ export class BlockchainService {
   private overlayInFlight: Map<string, Promise<any[]>> = new Map()
   private static readonly OVERLAY_CACHE_TTL_MS = 5_000
 
-  private async getSpendableUtxosFromSpendSource(address: string, walletIndex: number): Promise<any[]> {
+  private async getSpendableUtxosFromSpendSource(address: string, walletIndex: number, minSatoshisHint: number = 0): Promise<any[]> {
     const now = Date.now()
     const cached = this.overlayResponseCache.get(address)
     if (cached && (now - cached.fetchedAt) < BlockchainService.OVERLAY_CACHE_TTL_MS) {
@@ -1707,12 +1707,13 @@ export class BlockchainService {
       const topic = getTreasuryTopicForWallet(walletIndex)
       const spendSource = getSpendSourceForWallet(walletIndex)
       const confirmedOnly = MIN_SPEND_CONF > 0
+      const effectiveMinSats = EMERGENCY_LEGACY_UTXO_MODE ? Math.max(minSatoshisHint, UTXO_POOL_MIN_SATS) : 0
       const listOnce = async () => {
         const outputs = await spendSource.listSpendable({
           topic,
           limit: SPEND_SOURCE_LIST_LIMIT,
           order: 'asc',
-          minSatoshis: 0,
+          minSatoshis: effectiveMinSats,
           excludeReserved: false,
           confirmedOnly,
         })
@@ -1794,7 +1795,7 @@ export class BlockchainService {
     await cache.inFlight
   }
 
-  private async getSpendableUtxos(address: string, explicitWif?: string, walletIndex?: number, traceId?: string): Promise<any[]> {
+  private async getSpendableUtxos(address: string, explicitWif?: string, walletIndex?: number, traceId?: string, minSatoshisHint: number = 0): Promise<any[]> {
     const startedAt = Date.now()
     const notes: string[] = []
     const resolvedWalletIndex = typeof walletIndex === 'number'
@@ -1802,7 +1803,7 @@ export class BlockchainService {
       : getWalletIndexForAddress(address)
     if (resolvedWalletIndex != null) {
       try {
-        const spendables = await this.getSpendableUtxosFromSpendSource(address, resolvedWalletIndex)
+        const spendables = await this.getSpendableUtxosFromSpendSource(address, resolvedWalletIndex, minSatoshisHint)
         const filtered = this.filterLocallyUsedUtxos(address, spendables)
         this.logUtxoLookupTrace({
           traceId,

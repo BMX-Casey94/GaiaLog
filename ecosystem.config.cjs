@@ -1,10 +1,11 @@
 /**
  * PM2 Ecosystem Configuration for GaiaLog VPS Deployment
  *
- * Runs three processes:
+ * Runs four processes:
  *   1. gaialog-web  — Next.js production server (port 3000)
  *   2. gaialog-overlay — Private loopback overlay lookup/submit service
  *   3. gaialog-workers — Background workers (data collection, queue, UTXO maintainer)
+ *   4. gaialog-utxo-manager — Emergency file-backed UTXO provider (port 8787)
  *
  * Usage:
  *   pm2 start ecosystem.config.cjs
@@ -132,6 +133,30 @@ module.exports = {
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       error_file: 'logs/workers-error.log',
       out_file: 'logs/workers-out.log',
+      merge_logs: true,
+      log_type: 'json',
+    },
+
+    {
+      name: 'gaialog-utxo-manager',
+      script: 'scripts/emergency-utxo-manager.py',
+      interpreter: 'python3',
+      cwd: __dirname,
+      instances: 1,
+      exec_mode: 'fork',
+      env: {
+        UTXO_MANAGER_PORT: '8787',
+        UTXO_MANAGER_SECRET: process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_SECRET || '',
+      },
+      max_memory_restart: '512M',
+      kill_timeout: 5000,
+      restart_delay: 3000,
+      max_restarts: 50,
+      min_uptime: '10s',
+      watch: false,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      error_file: 'logs/utxo-manager-error.log',
+      out_file: 'logs/utxo-manager-out.log',
       merge_logs: true,
       log_type: 'json',
     },
