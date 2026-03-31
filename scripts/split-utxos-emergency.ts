@@ -1,6 +1,6 @@
 /**
  * Emergency UTXO splitter — takes large UTXOs from the emergency manager,
- * splits them into many 2000-sat outputs on-chain, and seeds the results back.
+ * splits them into many small outputs on-chain, and seeds the results back.
  *
  * Usage (on VPS):
  *   node --import tsx scripts/split-utxos-emergency.ts
@@ -11,7 +11,7 @@ import * as bsv from 'bsv'
 
 import { broadcastSplitTransactionRaw } from '../lib/broadcast-raw-tx'
 
-const SPLIT_OUTPUT_SATS = Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 500)
+const SPLIT_OUTPUT_SATS = Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 100)
 const FEE_RATE = Number(process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE || 0.105)
 const MAX_OUTPUTS_PER_TX = 2500
 const MANAGER_URL = process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_URL || 'http://127.0.0.1:8787'
