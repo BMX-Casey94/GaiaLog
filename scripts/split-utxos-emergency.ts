@@ -11,9 +11,9 @@ import * as bsv from 'bsv'
 
 import { broadcastSplitTransactionRaw } from '../lib/broadcast-raw-tx'
 
-const SPLIT_OUTPUT_SATS = Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 2000)
+const SPLIT_OUTPUT_SATS = Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 500)
 const FEE_RATE = Number(process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE || 0.105)
-const MAX_OUTPUTS_PER_TX = 600
+const MAX_OUTPUTS_PER_TX = 2500
 const MANAGER_URL = process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_URL || 'http://127.0.0.1:8787'
 const MANAGER_SECRET = process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_SECRET || ''
 
