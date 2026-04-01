@@ -14,6 +14,7 @@ import { broadcastSplitTransactionRaw } from '../lib/broadcast-raw-tx'
 const SPLIT_OUTPUT_SATS = Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 130)
 const FEE_RATE = Number(process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE || 0.105)
 const MAX_OUTPUTS_PER_TX = 2500
+const LARGE_UTXO_THRESHOLD = Number(process.env.BSV_UTXO_SPLIT_MIN_INPUT_SATS || 5000)
 const MANAGER_URL = process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_URL || 'http://127.0.0.1:8787'
 const MANAGER_SECRET = process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_SECRET || ''
 
@@ -41,9 +42,9 @@ async function managerPost(path: string, body: any): Promise<any> {
 }
 
 async function splitForWallet(wif: string, address: string): Promise<void> {
-  const utxos = await managerGet(`/utxos/${address}?minSatoshis=100000`)
+  const utxos = await managerGet(`/utxos/${address}?minSatoshis=${LARGE_UTXO_THRESHOLD}`)
   if (!Array.isArray(utxos) || utxos.length === 0) {
-    console.log(`  ${address.substring(0, 10)}...: no large UTXOs (>= 100k sats) to split`)
+    console.log(`  ${address.substring(0, 10)}...: no UTXOs >= ${LARGE_UTXO_THRESHOLD} sats to split`)
     return
   }
 
