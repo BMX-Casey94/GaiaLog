@@ -2650,6 +2650,371 @@ export class MovebankWorker extends BaseWorker {
   }
 }
 
+// ─── Open-Meteo Worker ───────────────────────────────────────────────────────
+
+export class OpenMeteoWorker extends BaseWorker {
+  constructor() {
+    super('Open-Meteo')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.open_meteo_forecast?.cadence.intervalMs || 15 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.open_meteo_forecast
+    if (!config?.enabled) return []
+
+    const { collectOpenMeteoCurrent } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectOpenMeteoCurrent(config.chunkSize || 100)
+      for (const item of batch) {
+        data.push({
+          type: 'advanced',
+          timestamp: item.timestamp,
+          location: item.city,
+          measurement: {
+            temperature_c: item.temperatureC,
+            humidity_pct: item.humidityPct,
+            pressure_mb: item.pressureMb,
+            wind_kph: item.windKph,
+            wind_direction_deg: item.windDirectionDeg,
+            precipitation_mm: item.precipitationMm,
+            cloud_cover_pct: item.cloudCoverPct,
+            weather_code: item.weatherCode,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'advanced_metrics',
+          providerId: 'open_meteo',
+          datasetId: 'open_meteo_forecast',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching Open-Meteo data:', error)
+    }
+    return data
+  }
+}
+
+// ─── NOAA NWS Alerts Worker ──────────────────────────────────────────────────
+
+export class NoaaNwsAlertsWorker extends BaseWorker {
+  constructor() {
+    super('NOAA-NWS-Alerts')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.noaa_alerts_active?.cadence.intervalMs || 5 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.noaa_alerts_active
+    if (!config?.enabled) return []
+
+    const { collectNoaaNwsAlerts } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectNoaaNwsAlerts(config.chunkSize || 500)
+      for (const item of batch) {
+        const isHighImpact = ['Extreme', 'Severe'].includes(item.severity) || ['Immediate', 'Expected'].includes(item.urgency)
+        data.push({
+          type: 'natural-event',
+          timestamp: item.timestamp,
+          location: item.areaDesc || item.headline,
+          measurement: {
+            event_type: item.eventType,
+            severity: item.severity,
+            urgency: item.urgency,
+            certainty: item.certainty,
+            headline: item.headline,
+            area_desc: item.areaDesc,
+            effective: item.effective,
+            expires: item.expires,
+            status: item.status,
+            category: item.category,
+            message_type: item.messageType,
+          },
+          source: item.source,
+          priority: isHighImpact ? 'high' : 'normal',
+          family: 'natural_events',
+          providerId: 'noaa_alerts',
+          datasetId: 'noaa_alerts_active',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          eventId: item.alertId,
+          coordinates: item.latitude !== 0 || item.longitude !== 0
+            ? { lat: item.latitude, lon: item.longitude }
+            : undefined,
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching NOAA NWS alerts:', error)
+    }
+    return data
+  }
+}
+
+// ─── GDACS Worker ────────────────────────────────────────────────────────────
+
+export class GdacsWorker extends BaseWorker {
+  constructor() {
+    super('GDACS')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.gdacs_events?.cadence.intervalMs || 30 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.gdacs_events
+    if (!config?.enabled) return []
+
+    const { collectGdacsEvents } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectGdacsEvents(config.chunkSize || 200)
+      for (const item of batch) {
+        const isCritical = item.alertLevel?.toLowerCase() === 'red'
+        data.push({
+          type: 'natural-event',
+          timestamp: item.timestamp,
+          location: item.country || item.name,
+          measurement: {
+            event_type: item.eventType,
+            alert_level: item.alertLevel,
+            severity: item.severity,
+            name: item.name,
+            country: item.country,
+            from_date: item.fromDate,
+            to_date: item.toDate,
+            population_affected: item.populationAffected,
+            episode_id: item.episodeId,
+          },
+          source: item.source,
+          priority: isCritical ? 'high' : 'normal',
+          family: 'natural_events',
+          providerId: 'gdacs',
+          datasetId: 'gdacs_events',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          eventId: `${item.eventType}-${item.eventId}`,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching GDACS data:', error)
+    }
+    return data
+  }
+}
+
+// ─── ReliefWeb Worker ────────────────────────────────────────────────────────
+
+export class ReliefWebWorker extends BaseWorker {
+  constructor() {
+    super('ReliefWeb')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.reliefweb_disasters?.cadence.intervalMs || 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.reliefweb_disasters
+    if (!config?.enabled) return []
+
+    const { collectReliefWebDisasters } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectReliefWebDisasters(config.chunkSize || 100)
+      for (const item of batch) {
+        data.push({
+          type: 'natural-event',
+          timestamp: item.timestamp,
+          location: item.primaryCountry || item.name,
+          measurement: {
+            event_type: item.primaryType,
+            status: item.status,
+            country: item.primaryCountry,
+            glide: item.glide,
+            description: item.description,
+            url: item.url,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'natural_events',
+          providerId: 'reliefweb',
+          datasetId: 'reliefweb_disasters',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          eventId: item.disasterId,
+          coordinates: item.latitude !== 0 || item.longitude !== 0
+            ? { lat: item.latitude, lon: item.longitude }
+            : undefined,
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching ReliefWeb data:', error)
+    }
+    return data
+  }
+}
+
+// ─── MET Norway Worker ───────────────────────────────────────────────────────
+
+export class MetNorwayWorker extends BaseWorker {
+  constructor() {
+    super('MET-Norway')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.met_no_locationforecast?.cadence.intervalMs || 60 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.met_no_locationforecast
+    if (!config?.enabled) return []
+
+    const { collectMetNoForecast } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectMetNoForecast(config.chunkSize || 100)
+      for (const item of batch) {
+        data.push({
+          type: 'advanced',
+          timestamp: item.timestamp,
+          location: item.city,
+          measurement: {
+            temperature_c: item.temperatureC,
+            humidity_pct: item.humidityPct,
+            pressure_mb: item.pressureMb,
+            wind_kph: item.windKph,
+            wind_direction_deg: item.windDirectionDeg,
+            cloud_cover_pct: item.cloudCoverPct,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'advanced_metrics',
+          providerId: 'met_no',
+          datasetId: 'met_no_locationforecast',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching MET Norway data:', error)
+    }
+    return data
+  }
+}
+
+// ─── Hub'Eau France Worker ───────────────────────────────────────────────────
+
+export class HubeauFranceWorker extends BaseWorker {
+  constructor() {
+    super("Hub'Eau-France")
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.hubeau_france_hydrometry?.cadence.intervalMs || 15 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.hubeau_france_hydrometry
+    if (!config?.enabled) return []
+
+    const { collectHubeauObservations } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectHubeauObservations(config.chunkSize || 1000)
+      for (const item of batch) {
+        const isLevel = item.parameter === 'H'
+        data.push({
+          type: 'hydrology',
+          timestamp: item.timestamp,
+          location: item.stationName || item.stationCode,
+          measurement: {
+            station_name: item.stationName,
+            station_code: item.stationCode,
+            parameter: item.parameter,
+            parameter_name: item.parameterName,
+            unit_name: item.unit,
+            ...(isLevel ? { river_level_m: item.value } : { discharge_cfs: item.value * 0.0353147 }),
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'hydrology',
+          providerId: 'hubeau_france',
+          datasetId: 'hubeau_france_hydrometry',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          stationId: item.stationCode,
+          coordinates: item.latitude !== 0 || item.longitude !== 0
+            ? { lat: item.latitude, lon: item.longitude }
+            : undefined,
+        })
+      }
+    } catch (error) {
+      console.error("Error fetching Hub'Eau France data:", error)
+    }
+    return data
+  }
+}
+
+// ─── NOAA SWPC Indices Worker ────────────────────────────────────────────────
+// Augments SpaceWeather worker (RTSW) with Kp, 10cm flux, R/S/G scales, aurora.
+
+export class NoaaSwpcIndicesWorker extends BaseWorker {
+  constructor() {
+    super('NOAA-SWPC-Indices')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.noaa_swpc_aurora?.cadence.intervalMs || 15 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.noaa_swpc_aurora
+    if (!config?.enabled) return []
+
+    const { collectNoaaSwpcIndices } = await import('./data-collector')
+    const data: EnvironmentalData[] = []
+    try {
+      const batch = await collectNoaaSwpcIndices()
+      for (const item of batch) {
+        data.push({
+          type: 'space-weather',
+          timestamp: item.timestamp,
+          location: item.measurementName,
+          measurement: {
+            measurement_id: item.measurementId,
+            measurement_name: item.measurementName,
+            value: item.value,
+            unit: item.unit,
+            category: item.category,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'space_weather',
+          providerId: 'noaa_space_weather',
+          datasetId: 'noaa_swpc_aurora',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+        })
+      }
+    } catch (error) {
+      console.error('Error fetching NOAA SWPC indices:', error)
+    }
+    return data
+  }
+}
+
 // Worker Manager
 export class WorkerManager {
   private workers: Map<string, BaseWorker> = new Map()
@@ -2692,6 +3057,13 @@ export class WorkerManager {
       const aisWorker = new AisStreamWorker()
       const movebankWorker = new MovebankWorker()
       const internationalPlanningWorker = new InternationalPlanningWorker()
+      const openMeteoWorker = new OpenMeteoWorker()
+      const noaaNwsAlertsWorker = new NoaaNwsAlertsWorker()
+      const gdacsWorker = new GdacsWorker()
+      const reliefWebWorker = new ReliefWebWorker()
+      const metNorwayWorker = new MetNorwayWorker()
+      const hubeauFranceWorker = new HubeauFranceWorker()
+      const noaaSwpcIndicesWorker = new NoaaSwpcIndicesWorker()
 
       this.workers.set('waqi-environmental', waqiWorker)
       this.workers.set('noaa-weather', noaaWorker)
@@ -2724,6 +3096,13 @@ export class WorkerManager {
       this.workers.set('aisstream', aisWorker)
       this.workers.set('movebank', movebankWorker)
       this.workers.set('international-planning', internationalPlanningWorker)
+      this.workers.set('open-meteo', openMeteoWorker)
+      this.workers.set('noaa-nws-alerts', noaaNwsAlertsWorker)
+      this.workers.set('gdacs', gdacsWorker)
+      this.workers.set('reliefweb', reliefWebWorker)
+      this.workers.set('met-norway', metNorwayWorker)
+      this.workers.set('hubeau-france', hubeauFranceWorker)
+      this.workers.set('noaa-swpc-indices', noaaSwpcIndicesWorker)
 
       this.isInitialized = true
       try { console.log(`✅ Worker Manager initialized with ${this.workers.size} workers`) } catch {}

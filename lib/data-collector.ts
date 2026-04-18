@@ -3782,3 +3782,846 @@ export async function collectMovebankTracking(limit: number = 200): Promise<Move
   }
   return out
 }
+
+// ─── Open-Meteo Current Conditions ───────────────────────────────────────────
+// Free, no-key, global gridded weather. Aligned with https://open-meteo.com/en/docs
+
+export interface OpenMeteoReading {
+  timestamp: number
+  source: string
+  city: string
+  latitude: number
+  longitude: number
+  temperatureC: number | null
+  humidityPct: number | null
+  pressureMb: number | null
+  windKph: number | null
+  windDirectionDeg: number | null
+  precipitationMm: number | null
+  cloudCoverPct: number | null
+  weatherCode: number | null
+}
+
+const OPEN_METEO_CITY_COORDS: Array<{ city: string; lat: number; lon: number }> = [
+  { city: 'Tokyo', lat: 35.6762, lon: 139.6503 },
+  { city: 'Delhi', lat: 28.6139, lon: 77.2090 },
+  { city: 'Shanghai', lat: 31.2304, lon: 121.4737 },
+  { city: 'Sao Paulo', lat: -23.5505, lon: -46.6333 },
+  { city: 'Mexico City', lat: 19.4326, lon: -99.1332 },
+  { city: 'Cairo', lat: 30.0444, lon: 31.2357 },
+  { city: 'Dhaka', lat: 23.8103, lon: 90.4125 },
+  { city: 'Mumbai', lat: 19.0760, lon: 72.8777 },
+  { city: 'Beijing', lat: 39.9042, lon: 116.4074 },
+  { city: 'Osaka', lat: 34.6937, lon: 135.5023 },
+  { city: 'Karachi', lat: 24.8607, lon: 67.0011 },
+  { city: 'Istanbul', lat: 41.0082, lon: 28.9784 },
+  { city: 'Buenos Aires', lat: -34.6037, lon: -58.3816 },
+  { city: 'Kolkata', lat: 22.5726, lon: 88.3639 },
+  { city: 'Lagos', lat: 6.5244, lon: 3.3792 },
+  { city: 'Manila', lat: 14.5995, lon: 120.9842 },
+  { city: 'Tianjin', lat: 39.3434, lon: 117.3616 },
+  { city: 'Guangzhou', lat: 23.1291, lon: 113.2644 },
+  { city: 'Rio de Janeiro', lat: -22.9068, lon: -43.1729 },
+  { city: 'Lahore', lat: 31.5204, lon: 74.3587 },
+  { city: 'Bangalore', lat: 12.9716, lon: 77.5946 },
+  { city: 'Shenzhen', lat: 22.5431, lon: 114.0579 },
+  { city: 'Moscow', lat: 55.7558, lon: 37.6173 },
+  { city: 'Chennai', lat: 13.0827, lon: 80.2707 },
+  { city: 'Bogota', lat: 4.7110, lon: -74.0721 },
+  { city: 'Jakarta', lat: -6.2088, lon: 106.8456 },
+  { city: 'Lima', lat: -12.0464, lon: -77.0428 },
+  { city: 'Bangkok', lat: 13.7563, lon: 100.5018 },
+  { city: 'Seoul', lat: 37.5665, lon: 126.9780 },
+  { city: 'Hyderabad', lat: 17.3850, lon: 78.4867 },
+  { city: 'London', lat: 51.5074, lon: -0.1278 },
+  { city: 'Tehran', lat: 35.6892, lon: 51.3890 },
+  { city: 'Chicago', lat: 41.8781, lon: -87.6298 },
+  { city: 'Ho Chi Minh City', lat: 10.8231, lon: 106.6297 },
+  { city: 'Ahmedabad', lat: 23.0225, lon: 72.5714 },
+  { city: 'Kuala Lumpur', lat: 3.1390, lon: 101.6869 },
+  { city: 'Hong Kong', lat: 22.3193, lon: 114.1694 },
+  { city: 'Riyadh', lat: 24.7136, lon: 46.6753 },
+  { city: 'Baghdad', lat: 33.3152, lon: 44.3661 },
+  { city: 'Santiago', lat: -33.4489, lon: -70.6693 },
+  { city: 'Madrid', lat: 40.4168, lon: -3.7038 },
+  { city: 'Houston', lat: 29.7604, lon: -95.3698 },
+  { city: 'Dallas', lat: 32.7767, lon: -96.7970 },
+  { city: 'Toronto', lat: 43.6532, lon: -79.3832 },
+  { city: 'Singapore', lat: 1.3521, lon: 103.8198 },
+  { city: 'Philadelphia', lat: 39.9526, lon: -75.1652 },
+  { city: 'Atlanta', lat: 33.7490, lon: -84.3880 },
+  { city: 'Barcelona', lat: 41.3851, lon: 2.1734 },
+  { city: 'Johannesburg', lat: -26.2041, lon: 28.0473 },
+  { city: 'Saint Petersburg', lat: 59.9311, lon: 30.3609 },
+  { city: 'Washington', lat: 38.9072, lon: -77.0369 },
+  { city: 'Boston', lat: 42.3601, lon: -71.0589 },
+  { city: 'Sydney', lat: -33.8688, lon: 151.2093 },
+  { city: 'Melbourne', lat: -37.8136, lon: 144.9631 },
+  { city: 'Phoenix', lat: 33.4484, lon: -112.0740 },
+  { city: 'Casablanca', lat: 33.5731, lon: -7.5898 },
+  { city: 'Montreal', lat: 45.5017, lon: -73.5673 },
+  { city: 'Ankara', lat: 39.9334, lon: 32.8597 },
+  { city: 'Berlin', lat: 52.5200, lon: 13.4050 },
+  { city: 'Cape Town', lat: -33.9249, lon: 18.4241 },
+  { city: 'Nairobi', lat: -1.2921, lon: 36.8219 },
+  { city: 'Addis Ababa', lat: 9.0320, lon: 38.7469 },
+  { city: 'Rome', lat: 41.9028, lon: 12.4964 },
+  { city: 'Athens', lat: 37.9838, lon: 23.7275 },
+  { city: 'Bucharest', lat: 44.4268, lon: 26.1025 },
+  { city: 'Hanoi', lat: 21.0285, lon: 105.8542 },
+  { city: 'Prague', lat: 50.0755, lon: 14.4378 },
+  { city: 'Vienna', lat: 48.2082, lon: 16.3738 },
+  { city: 'Paris', lat: 48.8566, lon: 2.3522 },
+  { city: 'New York', lat: 40.7128, lon: -74.0060 },
+  { city: 'Los Angeles', lat: 34.0522, lon: -118.2437 },
+  { city: 'Stockholm', lat: 59.3293, lon: 18.0686 },
+  { city: 'Helsinki', lat: 60.1699, lon: 24.9384 },
+  { city: 'Oslo', lat: 59.9139, lon: 10.7522 },
+  { city: 'Copenhagen', lat: 55.6761, lon: 12.5683 },
+  { city: 'Amsterdam', lat: 52.3676, lon: 4.9041 },
+  { city: 'Brussels', lat: 50.8503, lon: 4.3517 },
+  { city: 'Dublin', lat: 53.3498, lon: -6.2603 },
+  { city: 'Lisbon', lat: 38.7223, lon: -9.1393 },
+  { city: 'Reykjavik', lat: 64.1466, lon: -21.9426 },
+  { city: 'Auckland', lat: -36.8485, lon: 174.7633 },
+  { city: 'Wellington', lat: -41.2865, lon: 174.7762 },
+  { city: 'Vancouver', lat: 49.2827, lon: -123.1207 },
+  { city: 'Anchorage', lat: 61.2181, lon: -149.9003 },
+  { city: 'Honolulu', lat: 21.3099, lon: -157.8581 },
+  { city: 'Fairbanks', lat: 64.8378, lon: -147.7164 },
+  { city: 'Nuuk', lat: 64.1814, lon: -51.6941 },
+  { city: 'Ulaanbaatar', lat: 47.8864, lon: 106.9057 },
+  { city: 'Tashkent', lat: 41.2995, lon: 69.2401 },
+  { city: 'Almaty', lat: 43.2220, lon: 76.8512 },
+  { city: 'Vladivostok', lat: 43.1198, lon: 131.8869 },
+  { city: 'Perth', lat: -31.9505, lon: 115.8605 },
+  { city: 'Brisbane', lat: -27.4698, lon: 153.0251 },
+  { city: 'Adelaide', lat: -34.9285, lon: 138.6007 },
+  { city: 'Suva', lat: -18.1248, lon: 178.4501 },
+  { city: 'Quito', lat: -0.1807, lon: -78.4678 },
+  { city: 'Caracas', lat: 10.4806, lon: -66.9036 },
+  { city: 'Havana', lat: 23.1136, lon: -82.3666 },
+  { city: 'Panama City', lat: 8.9824, lon: -79.5199 },
+  { city: 'San Jose', lat: 9.9281, lon: -84.0907 },
+  { city: 'Tegucigalpa', lat: 14.0723, lon: -87.1921 },
+  { city: 'Antananarivo', lat: -18.8792, lon: 47.5079 },
+  { city: 'Dakar', lat: 14.7167, lon: -17.4677 },
+]
+
+const _openMeteoBatchCursor = { idx: 0 }
+
+function chunkArray<T>(input: T[], size: number): T[][] {
+  if (size <= 0) return [input]
+  const out: T[][] = []
+  for (let i = 0; i < input.length; i += size) out.push(input.slice(i, i + size))
+  return out
+}
+
+export async function collectOpenMeteoCurrent(limit: number = 100): Promise<OpenMeteoReading[]> {
+  const cities = OPEN_METEO_CITY_COORDS
+  if (cities.length === 0) return []
+
+  const cap = Math.max(1, Math.min(limit, cities.length))
+  const start = _openMeteoBatchCursor.idx % cities.length
+  const window = cities.slice(start, start + cap)
+  if (window.length < cap) {
+    window.push(...cities.slice(0, cap - window.length))
+  }
+  _openMeteoBatchCursor.idx = (start + cap) % cities.length
+
+  const out: OpenMeteoReading[] = []
+  // Open-Meteo supports up to ~100 lat/lon pairs in a single multi-location request.
+  for (const batch of chunkArray(window, 50)) {
+    const lats = batch.map(c => c.lat).join(',')
+    const lons = batch.map(c => c.lon).join(',')
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&current=temperature_2m,relative_humidity_2m,pressure_msl,wind_speed_10m,wind_direction_10m,precipitation,cloud_cover,weather_code&wind_speed_unit=kmh&timezone=UTC`
+
+    let payload: any
+    try {
+      payload = await fetchJsonWithRetry<any>(url, { retries: 2, providerId: 'open_meteo', timeoutMs: 25000 })
+    } catch (error) {
+      console.error('Open-Meteo fetch failed:', error)
+      continue
+    }
+
+    const responses = Array.isArray(payload) ? payload : [payload]
+
+    for (let i = 0; i < responses.length && i < batch.length; i++) {
+      const r = responses[i]
+      const meta = batch[i]
+      const current = r?.current
+      if (!current?.time) continue
+
+      const ts = new Date(current.time + 'Z').getTime()
+      if (!Number.isFinite(ts)) continue
+
+      const key = `openmeteo:${meta.city}:${current.time}`
+      if (!(await dedupeStore.add(key))) continue
+
+      out.push({
+        timestamp: ts,
+        source: 'Open-Meteo',
+        city: meta.city,
+        latitude: meta.lat,
+        longitude: meta.lon,
+        temperatureC: typeof current.temperature_2m === 'number' ? current.temperature_2m : null,
+        humidityPct: typeof current.relative_humidity_2m === 'number' ? current.relative_humidity_2m : null,
+        pressureMb: typeof current.pressure_msl === 'number' ? current.pressure_msl : null,
+        windKph: typeof current.wind_speed_10m === 'number' ? current.wind_speed_10m : null,
+        windDirectionDeg: typeof current.wind_direction_10m === 'number' ? current.wind_direction_10m : null,
+        precipitationMm: typeof current.precipitation === 'number' ? current.precipitation : null,
+        cloudCoverPct: typeof current.cloud_cover === 'number' ? current.cloud_cover : null,
+        weatherCode: typeof current.weather_code === 'number' ? current.weather_code : null,
+      })
+    }
+  }
+
+  return out
+}
+
+// ─── NOAA NWS Active Alerts ──────────────────────────────────────────────────
+// Public, no-key. Aligned with https://www.weather.gov/documentation/services-web-api
+
+export interface NoaaNwsAlert {
+  timestamp: number
+  source: string
+  alertId: string
+  eventType: string
+  severity: string
+  urgency: string
+  certainty: string
+  headline: string
+  areaDesc: string
+  state: string
+  effective: string
+  expires: string
+  latitude: number
+  longitude: number
+  status: string
+  category: string
+  messageType: string
+}
+
+const _noaaAlertsWm = { ts: 0 }
+
+function alertCentroid(geometry: any): { lat: number; lon: number } | null {
+  if (!geometry) return null
+  const type = geometry.type
+  const coords = geometry.coordinates
+  if (!coords) return null
+
+  if (type === 'Point' && Array.isArray(coords) && coords.length >= 2) {
+    return { lat: coords[1], lon: coords[0] }
+  }
+
+  // Polygon / MultiPolygon: compute simple centroid from outer ring of first polygon
+  const flatten = (input: any): number[][] => {
+    const result: number[][] = []
+    const walk = (node: any) => {
+      if (!Array.isArray(node)) return
+      if (node.length > 0 && Array.isArray(node[0]) && typeof node[0][0] === 'number') {
+        for (const pt of node) {
+          if (Array.isArray(pt) && pt.length >= 2 && typeof pt[0] === 'number' && typeof pt[1] === 'number') {
+            result.push([pt[0], pt[1]])
+          }
+        }
+      } else {
+        for (const child of node) walk(child)
+      }
+    }
+    walk(input)
+    return result
+  }
+
+  const points = flatten(coords)
+  if (points.length === 0) return null
+  let sumLat = 0
+  let sumLon = 0
+  for (const [lon, lat] of points) {
+    sumLon += lon
+    sumLat += lat
+  }
+  return { lat: sumLat / points.length, lon: sumLon / points.length }
+}
+
+export async function collectNoaaNwsAlerts(limit: number = 500): Promise<NoaaNwsAlert[]> {
+  const url = 'https://api.weather.gov/alerts/active?status=actual&message_type=alert,update'
+  const data = await fetchJsonWithRetry<any>(url, {
+    retries: 2,
+    providerId: 'noaa_alerts',
+    timeoutMs: 25000,
+    headers: {
+      'User-Agent': process.env.NOAA_NWS_USER_AGENT || 'GaiaLog/1.0 (https://gaialog.com; ops@gaialog.com)',
+      Accept: 'application/geo+json',
+    },
+  })
+
+  const features = Array.isArray(data?.features) ? data.features : []
+  const lastSeen = _noaaAlertsWm.ts
+  let maxTs = lastSeen
+  const out: NoaaNwsAlert[] = []
+
+  for (const feat of features) {
+    if (out.length >= limit) break
+    const props = feat?.properties
+    if (!props) continue
+
+    const sentRaw = props.sent || props.effective || props.onset
+    const ts = sentRaw ? new Date(sentRaw).getTime() : Date.now()
+    if (!Number.isFinite(ts)) continue
+    if (ts > maxTs) maxTs = ts
+
+    const id = props.id || feat?.id
+    if (!id) continue
+    const key = `nwsalert:${id}:${sentRaw || ts}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const centroid = alertCentroid(feat.geometry) || { lat: 0, lon: 0 }
+
+    out.push({
+      timestamp: ts,
+      source: 'NOAA NWS Alerts',
+      alertId: String(id),
+      eventType: String(props.event || ''),
+      severity: String(props.severity || 'Unknown'),
+      urgency: String(props.urgency || 'Unknown'),
+      certainty: String(props.certainty || 'Unknown'),
+      headline: String(props.headline || ''),
+      areaDesc: String(props.areaDesc || ''),
+      state: Array.isArray(props.geocode?.SAME) ? String(props.geocode.SAME[0] || '') : '',
+      effective: String(props.effective || sentRaw || ''),
+      expires: String(props.expires || props.ends || ''),
+      latitude: centroid.lat,
+      longitude: centroid.lon,
+      status: String(props.status || 'Actual'),
+      category: String(props.category || ''),
+      messageType: String(props.messageType || ''),
+    })
+  }
+
+  if (maxTs > lastSeen) _noaaAlertsWm.ts = maxTs
+  return out
+}
+
+// ─── GDACS Disaster Events ───────────────────────────────────────────────────
+// Public, no-key. Uses GeoJSON event search endpoint.
+
+export interface GdacsEvent {
+  timestamp: number
+  source: string
+  eventId: string
+  eventType: string
+  alertLevel: string
+  severity: string
+  name: string
+  country: string
+  latitude: number
+  longitude: number
+  fromDate: string
+  toDate: string
+  populationAffected: number | null
+  episodeId: string
+}
+
+const _gdacsWm = { ts: 0 }
+
+export async function collectGdacsEvents(limit: number = 200): Promise<GdacsEvent[]> {
+  const url = 'https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH?eventlist=EQ,TC,FL,VO,DR,WF&alertlevel=Green;Orange;Red'
+  const data = await fetchJsonWithRetry<any>(url, {
+    retries: 2,
+    providerId: 'gdacs',
+    timeoutMs: 25000,
+    headers: { Accept: 'application/json' },
+  })
+
+  const features = Array.isArray(data?.features) ? data.features : []
+  const lastSeen = _gdacsWm.ts
+  let maxTs = lastSeen
+  const out: GdacsEvent[] = []
+
+  for (const feat of features) {
+    if (out.length >= limit) break
+    const props = feat?.properties
+    if (!props) continue
+
+    const fromDate = props.fromdate || props.todate
+    const ts = fromDate ? new Date(fromDate).getTime() : Date.now()
+    if (!Number.isFinite(ts)) continue
+    if (ts > maxTs) maxTs = ts
+
+    const eventType = String(props.eventtype || '')
+    const eventId = String(props.eventid ?? props.eventId ?? '')
+    const episodeId = String(props.episodeid ?? props.episodeId ?? '')
+    if (!eventType || !eventId) continue
+
+    const key = `gdacs:${eventType}:${eventId}:${episodeId || 'na'}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const coords = feat?.geometry?.coordinates
+    const lon = Array.isArray(coords) && typeof coords[0] === 'number' ? coords[0] : 0
+    const lat = Array.isArray(coords) && typeof coords[1] === 'number' ? coords[1] : 0
+
+    const populationAffected = (() => {
+      const raw = props.population ?? props.populationAffected ?? null
+      if (raw == null) return null
+      const num = Number(raw)
+      return Number.isFinite(num) ? num : null
+    })()
+
+    out.push({
+      timestamp: ts,
+      source: 'GDACS',
+      eventId,
+      eventType,
+      alertLevel: String(props.alertlevel || ''),
+      severity: String(props.severitydata?.severitytext || props.severity || ''),
+      name: String(props.name || props.htmldescription || ''),
+      country: String(props.country || ''),
+      latitude: lat,
+      longitude: lon,
+      fromDate: String(props.fromdate || ''),
+      toDate: String(props.todate || ''),
+      populationAffected,
+      episodeId,
+    })
+  }
+
+  if (maxTs > lastSeen) _gdacsWm.ts = maxTs
+  return out
+}
+
+// ─── ReliefWeb Disasters ─────────────────────────────────────────────────────
+// Public, no-key. https://apidoc.reliefweb.int/
+
+export interface ReliefWebDisaster {
+  timestamp: number
+  source: string
+  disasterId: string
+  name: string
+  status: string
+  primaryType: string
+  primaryCountry: string
+  glide: string
+  latitude: number
+  longitude: number
+  description: string
+  url: string
+}
+
+const _reliefWebWm = { ts: 0 }
+
+export async function collectReliefWebDisasters(limit: number = 100): Promise<ReliefWebDisaster[]> {
+  const cap = Math.max(1, Math.min(limit, 100))
+  const url = `https://api.reliefweb.int/v1/disasters?appname=gaialog&limit=${cap}&sort[]=date:desc&fields[include][]=name&fields[include][]=description&fields[include][]=status&fields[include][]=date&fields[include][]=primary_type&fields[include][]=primary_country&fields[include][]=glide&fields[include][]=url&fields[include][]=country`
+  const data = await fetchJsonWithRetry<any>(url, {
+    retries: 2,
+    providerId: 'reliefweb',
+    timeoutMs: 25000,
+    headers: { Accept: 'application/json' },
+  })
+
+  const items = Array.isArray(data?.data) ? data.data : []
+  const lastSeen = _reliefWebWm.ts
+  let maxTs = lastSeen
+  const out: ReliefWebDisaster[] = []
+
+  for (const item of items) {
+    if (out.length >= limit) break
+    const fields = item?.fields
+    if (!fields) continue
+
+    const dateRaw = fields?.date?.changed || fields?.date?.created
+    const ts = dateRaw ? new Date(dateRaw).getTime() : Date.now()
+    if (!Number.isFinite(ts)) continue
+    if (ts > maxTs) maxTs = ts
+
+    const id = String(item.id ?? '')
+    if (!id) continue
+    const key = `reliefweb:${id}:${dateRaw || ts}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const country = fields?.primary_country
+    const lat = typeof country?.location?.lat === 'number' ? country.location.lat : 0
+    const lon = typeof country?.location?.lon === 'number' ? country.location.lon : 0
+
+    out.push({
+      timestamp: ts,
+      source: 'ReliefWeb',
+      disasterId: id,
+      name: String(fields.name || ''),
+      status: String(fields.status || ''),
+      primaryType: String(fields?.primary_type?.name || ''),
+      primaryCountry: String(country?.name || ''),
+      glide: String(fields.glide || ''),
+      latitude: lat,
+      longitude: lon,
+      description: String(fields.description || '').slice(0, 500),
+      url: String(fields.url || ''),
+    })
+  }
+
+  if (maxTs > lastSeen) _reliefWebWm.ts = maxTs
+  return out
+}
+
+// ─── MET Norway Location Forecast ────────────────────────────────────────────
+// No API key; MET Norway requires a unique identifying User-Agent per their TOU.
+// https://api.met.no/doc/TermsOfService
+
+const MET_NO_CITY_COORDS: Array<{ city: string; lat: number; lon: number }> = [
+  { city: 'Oslo', lat: 59.9139, lon: 10.7522 },
+  { city: 'Bergen', lat: 60.3913, lon: 5.3221 },
+  { city: 'Stockholm', lat: 59.3293, lon: 18.0686 },
+  { city: 'Gothenburg', lat: 57.7089, lon: 11.9746 },
+  { city: 'Copenhagen', lat: 55.6761, lon: 12.5683 },
+  { city: 'Helsinki', lat: 60.1699, lon: 24.9384 },
+  { city: 'Reykjavik', lat: 64.1466, lon: -21.9426 },
+  { city: 'Tórshavn', lat: 62.0079, lon: -6.7728 },
+  { city: 'London', lat: 51.5074, lon: -0.1278 },
+  { city: 'Edinburgh', lat: 55.9533, lon: -3.1883 },
+  { city: 'Dublin', lat: 53.3498, lon: -6.2603 },
+  { city: 'Amsterdam', lat: 52.3676, lon: 4.9041 },
+  { city: 'Brussels', lat: 50.8503, lon: 4.3517 },
+  { city: 'Paris', lat: 48.8566, lon: 2.3522 },
+  { city: 'Berlin', lat: 52.5200, lon: 13.4050 },
+  { city: 'Munich', lat: 48.1351, lon: 11.5820 },
+  { city: 'Vienna', lat: 48.2082, lon: 16.3738 },
+  { city: 'Warsaw', lat: 52.2297, lon: 21.0122 },
+  { city: 'Prague', lat: 50.0755, lon: 14.4378 },
+  { city: 'Budapest', lat: 47.4979, lon: 19.0402 },
+  { city: 'Tromsø', lat: 69.6492, lon: 18.9553 },
+  { city: 'Longyearbyen', lat: 78.2232, lon: 15.6267 },
+  { city: 'Murmansk', lat: 68.9585, lon: 33.0827 },
+  { city: 'Riga', lat: 56.9496, lon: 24.1052 },
+  { city: 'Tallinn', lat: 59.4370, lon: 24.7536 },
+  { city: 'Vilnius', lat: 54.6872, lon: 25.2797 },
+  { city: 'Madrid', lat: 40.4168, lon: -3.7038 },
+  { city: 'Lisbon', lat: 38.7223, lon: -9.1393 },
+  { city: 'Rome', lat: 41.9028, lon: 12.4964 },
+  { city: 'Athens', lat: 37.9838, lon: 23.7275 },
+]
+
+export interface MetNoReading {
+  timestamp: number
+  source: string
+  city: string
+  latitude: number
+  longitude: number
+  temperatureC: number | null
+  humidityPct: number | null
+  pressureMb: number | null
+  windKph: number | null
+  windDirectionDeg: number | null
+  cloudCoverPct: number | null
+}
+
+const _metNoBatchCursor = { idx: 0 }
+
+export async function collectMetNoForecast(limit: number = 100): Promise<MetNoReading[]> {
+  const cities = MET_NO_CITY_COORDS
+  if (cities.length === 0) return []
+
+  const cap = Math.max(1, Math.min(limit, cities.length))
+  const start = _metNoBatchCursor.idx % cities.length
+  const window = cities.slice(start, start + cap)
+  if (window.length < cap) {
+    window.push(...cities.slice(0, cap - window.length))
+  }
+  _metNoBatchCursor.idx = (start + cap) % cities.length
+
+  const userAgent = process.env.MET_NO_USER_AGENT || 'GaiaLog/1.0 (https://gaialog.com; ops@gaialog.com)'
+  const out: MetNoReading[] = []
+
+  for (const meta of window) {
+    const url = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${meta.lat.toFixed(4)}&lon=${meta.lon.toFixed(4)}`
+    let payload: any
+    try {
+      payload = await fetchJsonWithRetry<any>(url, {
+        retries: 1,
+        providerId: 'met_no',
+        timeoutMs: 20000,
+        headers: { 'User-Agent': userAgent, Accept: 'application/json' },
+      })
+    } catch (error) {
+      console.error(`MET Norway fetch failed for ${meta.city}:`, error)
+      continue
+    }
+
+    const series = payload?.properties?.timeseries
+    if (!Array.isArray(series) || series.length === 0) continue
+
+    const latest = series[0]
+    const time = latest?.time
+    const details = latest?.data?.instant?.details
+    if (!time || !details) continue
+
+    const ts = new Date(time).getTime()
+    if (!Number.isFinite(ts)) continue
+
+    const key = `metno:${meta.city}:${time}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const windMs = typeof details.wind_speed === 'number' ? details.wind_speed : null
+    const windKph = windMs != null ? windMs * 3.6 : null
+
+    out.push({
+      timestamp: ts,
+      source: 'MET Norway',
+      city: meta.city,
+      latitude: meta.lat,
+      longitude: meta.lon,
+      temperatureC: typeof details.air_temperature === 'number' ? details.air_temperature : null,
+      humidityPct: typeof details.relative_humidity === 'number' ? details.relative_humidity : null,
+      pressureMb: typeof details.air_pressure_at_sea_level === 'number' ? details.air_pressure_at_sea_level : null,
+      windKph,
+      windDirectionDeg: typeof details.wind_from_direction === 'number' ? details.wind_from_direction : null,
+      cloudCoverPct: typeof details.cloud_area_fraction === 'number' ? details.cloud_area_fraction : null,
+    })
+  }
+
+  return out
+}
+
+// ─── Hub'Eau France River Observations ───────────────────────────────────────
+// Public, no-key. https://hubeau.eaufrance.fr/page/api-hydrometrie
+
+export interface HubeauReading {
+  timestamp: number
+  source: string
+  stationCode: string
+  stationName: string
+  latitude: number
+  longitude: number
+  parameter: 'H' | 'Q' // H = water level (mm), Q = discharge (l/s)
+  parameterName: string
+  value: number
+  unit: string
+}
+
+const _hubeauWm = { ts: 0 }
+
+export async function collectHubeauObservations(limit: number = 1000): Promise<HubeauReading[]> {
+  const cap = Math.max(1, Math.min(limit, 5000))
+  // Latest real-time hydrometric observations.  date_debut_obs ensures fresh data only.
+  const sinceIso = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString()
+  const url = `https://hubeau.eaufrance.fr/api/v1/hydrometrie/observations_tr?size=${cap}&sort=desc&date_debut_obs=${encodeURIComponent(sinceIso)}`
+
+  const data = await fetchJsonWithRetry<any>(url, {
+    retries: 2,
+    providerId: 'hubeau_france',
+    timeoutMs: 30000,
+    headers: { Accept: 'application/json' },
+  })
+
+  const items = Array.isArray(data?.data) ? data.data : []
+  const lastSeen = _hubeauWm.ts
+  let maxTs = lastSeen
+  const out: HubeauReading[] = []
+
+  for (const item of items) {
+    if (out.length >= limit) break
+    const observedAt = item?.date_obs
+    const ts = observedAt ? new Date(observedAt).getTime() : 0
+    if (!Number.isFinite(ts) || ts <= lastSeen) continue
+    if (ts > maxTs) maxTs = ts
+
+    const stationCode = String(item?.code_station || '')
+    const grandeur = item?.grandeur_hydro as 'H' | 'Q' | undefined
+    if (!stationCode || (grandeur !== 'H' && grandeur !== 'Q')) continue
+
+    const key = `hubeau:${stationCode}:${grandeur}:${observedAt}`
+    if (!(await dedupeStore.add(key))) continue
+
+    const rawValue = Number(item?.resultat_obs)
+    if (!Number.isFinite(rawValue)) continue
+
+    // Hub'Eau returns level in millimetres and discharge in litres/second.
+    // Normalise to metres and litres per second respectively for downstream stats.
+    const value = grandeur === 'H' ? rawValue / 1000 : rawValue
+    const unit = grandeur === 'H' ? 'm' : 'l/s'
+    const parameterName = grandeur === 'H' ? 'River level' : 'Discharge'
+
+    const lat = typeof item?.latitude === 'number' ? item.latitude : 0
+    const lon = typeof item?.longitude === 'number' ? item.longitude : 0
+
+    out.push({
+      timestamp: ts,
+      source: "Hub'Eau France",
+      stationCode,
+      stationName: String(item?.libelle_station || stationCode),
+      latitude: lat,
+      longitude: lon,
+      parameter: grandeur,
+      parameterName,
+      value,
+      unit,
+    })
+  }
+
+  if (maxTs > lastSeen) _hubeauWm.ts = maxTs
+  return out
+}
+
+// ─── NOAA SWPC Aurora & Solar Indices ────────────────────────────────────────
+// All endpoints are public and key-free.
+
+export interface NoaaSwpcIndexReading {
+  timestamp: number
+  source: string
+  measurementId: string
+  measurementName: string
+  value: number
+  unit: string
+  category: string
+}
+
+const _noaaSwpcIndicesWm = new Map<string, number>()
+
+export async function collectNoaaSwpcIndices(): Promise<NoaaSwpcIndexReading[]> {
+  const out: NoaaSwpcIndexReading[] = []
+
+  const endpoints: Array<{
+    id: string
+    url: string
+    parse: (data: any) => Array<Omit<NoaaSwpcIndexReading, 'source'>>
+  }> = [
+    {
+      id: 'kp-index',
+      url: 'https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json',
+      parse: (data) => {
+        if (!Array.isArray(data) || data.length < 2) return []
+        const rows = data.slice(1)
+        const last = rows[rows.length - 1]
+        if (!Array.isArray(last)) return []
+        const [ts, kp] = last
+        const timestamp = ts ? new Date(String(ts).replace(' ', 'T') + 'Z').getTime() : Date.now()
+        const value = Number(kp)
+        if (!Number.isFinite(timestamp) || !Number.isFinite(value)) return []
+        return [{
+          timestamp,
+          measurementId: 'kp_index',
+          measurementName: 'Planetary K-index',
+          value,
+          unit: 'index',
+          category: 'geomagnetic',
+        }]
+      },
+    },
+    {
+      id: '10cm-flux',
+      url: 'https://services.swpc.noaa.gov/products/summary/10cm-flux.json',
+      parse: (data) => {
+        if (!data) return []
+        const ts = data.TimeStamp || data.time_tag
+        const flux = Number(data.Flux ?? data.flux)
+        const timestamp = ts ? new Date(String(ts).replace(' ', 'T') + 'Z').getTime() : Date.now()
+        if (!Number.isFinite(timestamp) || !Number.isFinite(flux)) return []
+        return [{
+          timestamp,
+          measurementId: 'f10_7_flux',
+          measurementName: 'Solar 10.7cm radio flux',
+          value: flux,
+          unit: 'sfu',
+          category: 'solar',
+        }]
+      },
+    },
+    {
+      id: 'noaa-scales',
+      url: 'https://services.swpc.noaa.gov/products/noaa-scales.json',
+      parse: (data) => {
+        if (!data) return []
+        const todayKey = Object.keys(data).find(k => k === '0' || /T00:00$/.test(k)) || Object.keys(data)[0]
+        const today = data[todayKey]
+        if (!today) return []
+        const ts = today?.DateStamp ? new Date(today.DateStamp + 'T00:00:00Z').getTime() : Date.now()
+        const result: Array<Omit<NoaaSwpcIndexReading, 'source'>> = []
+        const scaleIds = ['R', 'S', 'G'] as const
+        const labels: Record<string, string> = {
+          R: 'Radio blackout (R-scale)',
+          S: 'Solar radiation storm (S-scale)',
+          G: 'Geomagnetic storm (G-scale)',
+        }
+        for (const scale of scaleIds) {
+          const scaleData = today[scale]
+          if (!scaleData) continue
+          const scaleVal = Number(String(scaleData?.Scale ?? '').replace(/[^0-9.]/g, '') || '0')
+          if (!Number.isFinite(scaleVal)) continue
+          result.push({
+            timestamp: ts,
+            measurementId: `swpc_${scale.toLowerCase()}_scale`,
+            measurementName: labels[scale],
+            value: scaleVal,
+            unit: 'scale',
+            category: 'space-weather-scale',
+          })
+        }
+        return result
+      },
+    },
+    {
+      id: 'aurora-forecast',
+      url: 'https://services.swpc.noaa.gov/products/animations/ovation_aurora_latest.json',
+      parse: (data) => {
+        if (!data) return []
+        const ts = data?.['Forecast Time'] || data?.['Observation Time']
+        const timestamp = ts ? new Date(String(ts).replace(' ', 'T').replace('Z', '') + 'Z').getTime() : Date.now()
+        if (!Number.isFinite(timestamp)) return []
+        const coords: Array<[number, number, number]> = Array.isArray(data?.coordinates) ? data.coordinates : []
+        if (coords.length === 0) return []
+        let totalProb = 0
+        let weighted = 0
+        for (const [, lat, prob] of coords) {
+          if (typeof lat !== 'number' || typeof prob !== 'number') continue
+          if (Math.abs(lat) < 50) continue
+          totalProb += prob
+          weighted += prob * Math.abs(lat)
+        }
+        const meanLat = totalProb > 0 ? weighted / totalProb : 0
+        return [{
+          timestamp,
+          measurementId: 'aurora_intensity',
+          measurementName: 'Aurora hemispheric power proxy',
+          value: Number(totalProb.toFixed(1)),
+          unit: 'integrated_probability',
+          category: 'aurora',
+        }, {
+          timestamp,
+          measurementId: 'aurora_mean_latitude',
+          measurementName: 'Aurora probability-weighted mean latitude',
+          value: Number(meanLat.toFixed(2)),
+          unit: 'degrees',
+          category: 'aurora',
+        }]
+      },
+    },
+  ]
+
+  for (const endpoint of endpoints) {
+    let payload: any
+    try {
+      payload = await fetchJsonWithRetry<any>(endpoint.url, {
+        retries: 2,
+        providerId: 'noaa_space_weather',
+        timeoutMs: 20000,
+      })
+    } catch (error) {
+      console.error(`NOAA SWPC ${endpoint.id} fetch failed:`, error)
+      continue
+    }
+
+    const readings = endpoint.parse(payload)
+    for (const reading of readings) {
+      const lastSeen = _noaaSwpcIndicesWm.get(`${endpoint.id}:${reading.measurementId}`) ?? 0
+      if (reading.timestamp <= lastSeen) continue
+      _noaaSwpcIndicesWm.set(`${endpoint.id}:${reading.measurementId}`, reading.timestamp)
+
+      const key = `swpcidx:${reading.measurementId}:${reading.timestamp}`
+      if (!(await dedupeStore.add(key))) continue
+
+      out.push({ ...reading, source: 'NOAA Space Weather' })
+    }
+  }
+
+  return out
+}

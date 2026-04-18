@@ -297,6 +297,36 @@ const PROVIDER_ENV_OVERRIDES: Partial<Record<ProviderId, {
     perDayEnv: 'NSW_PLANNING_PER_DAY',
     intervalEnv: 'NSW_PLANNING_WORKER_INTERVAL_MS',
   },
+  open_meteo: {
+    rpsEnv: 'OPEN_METEO_RPS',
+    perDayEnv: 'OPEN_METEO_PER_DAY',
+    intervalEnv: 'OPEN_METEO_WORKER_INTERVAL_MS',
+  },
+  noaa_alerts: {
+    rpsEnv: 'NOAA_ALERTS_RPS',
+    perDayEnv: 'NOAA_ALERTS_PER_DAY',
+    intervalEnv: 'NOAA_ALERTS_WORKER_INTERVAL_MS',
+  },
+  gdacs: {
+    rpsEnv: 'GDACS_RPS',
+    perDayEnv: 'GDACS_PER_DAY',
+    intervalEnv: 'GDACS_WORKER_INTERVAL_MS',
+  },
+  reliefweb: {
+    rpsEnv: 'RELIEFWEB_RPS',
+    perDayEnv: 'RELIEFWEB_PER_DAY',
+    intervalEnv: 'RELIEFWEB_WORKER_INTERVAL_MS',
+  },
+  met_no: {
+    rpsEnv: 'MET_NO_RPS',
+    perDayEnv: 'MET_NO_PER_DAY',
+    intervalEnv: 'MET_NO_WORKER_INTERVAL_MS',
+  },
+  hubeau_france: {
+    rpsEnv: 'HUBEAU_FRANCE_RPS',
+    perDayEnv: 'HUBEAU_FRANCE_PER_DAY',
+    intervalEnv: 'HUBEAU_FRANCE_WORKER_INTERVAL_MS',
+  },
 }
 
 const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
@@ -334,6 +364,12 @@ const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
   uk_planning: { perSecond: 1, perDay: 5000 },
   scotland_planning: { perSecond: 1, perDay: 5000 },
   nsw_planning: { perSecond: 1, perDay: 5000 },
+  open_meteo: { perSecond: 5, perDay: 100000 },
+  noaa_alerts: { perSecond: 3, perDay: 50000 },
+  gdacs: { perSecond: 1, perDay: 5000 },
+  reliefweb: { perSecond: 1, perDay: 1000 },
+  met_no: { perSecond: 2, perDay: 20000 },
+  hubeau_france: { perSecond: 5, perDay: 50000 },
 }
 
 const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
@@ -371,6 +407,12 @@ const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
   uk_planning: 24 * 60 * 60 * 1000,
   scotland_planning: 24 * 60 * 60 * 1000,
   nsw_planning: 24 * 60 * 60 * 1000,
+  open_meteo: 15 * 60 * 1000,
+  noaa_alerts: 5 * 60 * 1000,
+  gdacs: 30 * 60 * 1000,
+  reliefweb: 60 * 60 * 1000,
+  met_no: 60 * 60 * 1000,
+  hubeau_france: 15 * 60 * 1000,
 }
 
 const PROVIDER_KEY_ENV: Partial<Record<ProviderId, string>> = {
@@ -499,6 +541,12 @@ const PROVIDER_ROLLOUT_RULES: Record<ProviderId, RolloutRule> = {
   uk_planning: { phase: 3, minimumGate: 'gate_d', note: 'UK planning applications and land-use change decisions.' },
   scotland_planning: { phase: 3, minimumGate: 'gate_d', note: 'Scotland planning applications from 34 authorities.' },
   nsw_planning: { phase: 3, minimumGate: 'gate_d', note: 'NSW Planning Portal / Planning Alerts AU. Requires API key.' },
+  open_meteo: { phase: 1, minimumGate: 'gate_a', recommendedOrder: 1, note: 'Keyless global weather grid; very high cadence with broad city coverage.' },
+  noaa_alerts: { phase: 1, minimumGate: 'gate_a', note: 'Keyless NWS active alerts firehose covering all US hazards.' },
+  gdacs: { phase: 2, minimumGate: 'gate_c', note: 'Keyless global disaster events feed (GDACS).' },
+  reliefweb: { phase: 2, minimumGate: 'gate_c', note: 'Keyless humanitarian disasters feed (UN OCHA ReliefWeb).' },
+  met_no: { phase: 1, minimumGate: 'gate_b', note: 'Keyless European weather forecasts from MET Norway (User-Agent only).' },
+  hubeau_france: { phase: 2, minimumGate: 'gate_c', note: 'Keyless French river observations (Hub\'Eau / Eau France).' },
 }
 
 function buildProviderConfigs(): Record<ProviderId, ProviderConfig> {
