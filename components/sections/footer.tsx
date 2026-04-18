@@ -1,5 +1,6 @@
 "use client"
 
+import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { ExternalLink, Mail } from "lucide-react"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from "@/components/ui/dialog"
@@ -120,24 +121,24 @@ export function Footer() {
             <h4 className="font-semibold text-white mb-4">Resources</h4>
             <ul className="space-y-2 text-sm text-slate-400">
               <li>
-                <a href="/#monitoring" className="hover:text-white transition-colors">
+                <Link href="/#monitoring" className="hover:text-white transition-colors">
                   Live Alerts
-                </a>
+                </Link>
               </li>
               <li>
-                <a href="/#blockchain" className="hover:text-white transition-colors">
+                <Link href="/#blockchain" className="hover:text-white transition-colors">
                   Blockchain Explorer
-                </a>
+                </Link>
               </li>
               <li>
-                <a href="/#data-sources" className="hover:text-white transition-colors">
+                <Link href="/#data-sources" className="hover:text-white transition-colors">
                   Data Sources
-                </a>
+                </Link>
               </li>
               <li>
-                <a href="/#how-it-works" className="hover:text-white transition-colors">
+                <Link href="/#how-it-works" className="hover:text-white transition-colors">
                   How It Works
-                </a>
+                </Link>
               </li>
             </ul>
           </div>

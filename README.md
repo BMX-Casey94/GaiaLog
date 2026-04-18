@@ -1,158 +1,109 @@
 # GaiaLog
 
-**Immutable environmental data on the BSV blockchain.**
+GaiaLog collects public environmental readings from multiple global data sources, writes normalised payloads to the BSV blockchain, and exposes a searchable explorer over the indexed results.
 
-GaiaLog ingests real-time environmental readings from dozens of public data sources worldwide and records them as OP_RETURN transactions on the Bitcoin SV blockchain, creating a permanent, tamper-proof archive of Earth observation data.
+This repository contains:
+
+- a `Next.js` web app and API surface
+- a dedicated worker pipeline for collection, queueing, signing, and broadcast
+- an overlay-backed UTXO and explorer data path
+- deployment templates for a split `Vercel` plus `VPS` production topology
 
 ## Architecture
 
-```
-Data Providers  -->  Worker Threads  -->  Queue  -->  BSV Blockchain
-  (APIs)             (collectors)        (FIFO)       (OP_RETURN TXs)
-                                           |
-                                      Overlay Service
-                                       (UTXO mgmt)
+```text
+Data providers -> workers -> queue -> BSV broadcast
+                         \-> overlay services -> explorer index
 ```
 
-- **Next.js** frontend + API routes (hosted on Vercel)
-- **VPS worker processes** managed by PM2 (data collection + blockchain writes)
-- **Overlay Service** for UTXO tracking and transaction admission
-- **Supabase PostgreSQL** for metadata, explorer index, and cursor persistence
-- **BSV SDK** (`@bsv/sdk`) for transaction construction and broadcast
+Production is designed as:
 
-## Data Sources
-
-| Provider | Data Type | Stations | Update Cadence |
-|----------|-----------|----------|----------------|
-| WAQI | Air Quality | 14,000+ | 15 min |
-| NOAA CO-OPS | Water Levels | 3,000+ | 6 min |
-| NOAA NDBC | Ocean Buoys | 1,000+ | 5 min |
-| Sensor.Community | Air Quality (citizen) | 35,000+ | 5 min |
-| USGS Earthquakes | Seismic Activity | Global | 5 min |
-| EMSC | Seismic (EU) | Global | Real-time (WebSocket) |
-| GeoNet NZ | Seismic + Volcanic | 700+ | 5 min |
-| NOAA DSCOVR/ACE | Space Weather | L1 satellite | 1 min |
-| USGS Geomagnetism | Magnetic Field | 14 observatories | 1 min |
-| USGS Volcanoes | Volcanic Alerts | 170+ | 10 min |
-| IGRA v2 | Upper Atmosphere | 2,700+ | 12 hours |
-| OpenWeatherMap | Advanced Metrics | Configurable | 30 min |
-
-See [`earth_apis_bonus.md`](earth_apis_bonus.md) for the full API reference.
+- `Vercel` for the web UI and read-side API routes
+- a `VPS` for workers, queue mutation, overlay services, and signing
+- `Supabase / Postgres` as the shared system of record
 
 ## Quick Start
 
 ### Prerequisites
 
-- Node.js 20+
-- BSV wallet private keys (WIF format)
-- Supabase project (free tier works)
-- WAQI API key (free at [aqicn.org/data-platform/token](https://aqicn.org/data-platform/token))
+- `Node.js 20+`
+- a `Supabase` project
+- `BSV` mainnet wallet WIFs
+- provider API keys for the data families you want enabled
 
-### 1. Clone and install
+### Install
 
 ```bash
-git clone https://github.com/your-org/GaiaLog.git
+git clone <your-repository-url>
 cd GaiaLog
 npm install
 ```
 
-### 2. Configure environment
+### Configure environment
 
 ```bash
-cp env.template .env
-# Edit .env with your keys — see env.template for all options
+cp env.example .env
 ```
 
-Required variables:
+`env.example` is the accurate minimal local starter file. It covers the database, wallet, admin, and overlay settings needed for the default local development flow.
 
-```bash
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-PGHOST=aws-0-eu-west-1.pooler.supabase.com
-PGPORT=5432
-PGDATABASE=postgres
-PGUSER=postgres.your-project-ref
-PGPASSWORD=your-db-password
-
-BSV_PRIVATE_KEY_1=your-wif-key-1
-BSV_PRIVATE_KEY_2=your-wif-key-2
-BSV_PRIVATE_KEY_3=your-wif-key-3
-
-WAQI_API_KEY=your-waqi-token
-```
-
-### 3. Run database migrations
+Run the migrations:
 
 ```bash
 npm run db:migrate
 ```
 
-### 4. Development
+Start the local services:
 
 ```bash
-# Terminal 1: Next.js frontend
 npm run dev
-
-# Terminal 2: Overlay service
 npm run overlay
-
-# Terminal 3: Worker processes
 npm run workers
 ```
 
-### 5. Production (VPS)
+## Documentation
 
-```bash
-npm run build
-pm2 start ecosystem.config.cjs
-pm2 save
+Canonical project documentation now lives under `docs/`.
+
+- `docs/README.md`: documentation index
+- `docs/getting-started.md`: local setup and development
+- `docs/deployment.md`: production topology, env split, and verification
+- `docs/bsv-and-blockchain.md`: wallets, queueing, overlay, broadcast, and rollout
+- `docs/data-sources-and-keys.md`: provider coverage, API keys, and rollout gates
+- `docs/explorer-and-indexing.md`: explorer, overlay indexing, and wallet address sync
+- `docs/operations-and-runbooks.md`: VPS updates, monitoring, and emergency procedures
+- `docs/whats-on-chain-plugin.md`: overview of the standalone WoC plugin package
+- `docs/project-history.md`: compact historical context for the retired phase and fix notes
+
+## Community
+
+- `CONTRIBUTING.md`: contributor workflow and expectations
+- `SECURITY.md`: vulnerability reporting guidance
+- `CODE_OF_CONDUCT.md`: participation standards
+
+## Key Conventions
+
+- `Mainnet` only
+- keep all real secrets in environment variables or deployment platform settings
+- do not place wallet WIFs or ARC credentials in `Vercel`
+- start from `env.example` for local development, then use `env.template`, `env.vercel.template`, and `env.vps.template` for advanced and production configuration
+- use `env.vercel.template` and `env.vps.template` for production, not the generic merged template alone
+
+## Repository Layout
+
+```text
+app/                  Next.js app router, pages, and API routes
+db/migrations/        SQL migrations
+docs/                 Canonical project documentation
+lib/                  Core runtime, blockchain, overlay, and explorer logic
+scripts/              Operational and development scripts
+woc-plugin/           Standalone WhatsOnChain plugin package
 ```
 
-See [`DEPLOYMENT_QUICKSTART.md`](DEPLOYMENT_QUICKSTART.md) and [`VERCEL_VPS_SPLIT_DEPLOYMENT.md`](VERCEL_VPS_SPLIT_DEPLOYMENT.md) for detailed deployment guides.
+## Related Package
 
-## Project Structure
-
-```
-app/                    Next.js app directory (pages + API routes)
-lib/                    Core library
-  blockchain.ts         BSV transaction construction + broadcast
-  worker-threads.ts     Data provider worker implementations
-  data-collector.ts     API data collection functions
-  worker-queue.ts       FIFO queue with parallel processing
-  overlay-server.ts     Local overlay HTTP server
-  overlay-service.ts    UTXO admission + tracking
-  provider-registry.ts  Provider configuration + rollout gates
-  stream-registry.ts    Dataset descriptors + family mappings
-  rollout-controls.ts   Phased provider enablement
-db/migrations/          SQL migration files
-scripts/                CLI tools (migrate, split-utxos, etc.)
-ecosystem.config.cjs    PM2 process configuration
-```
-
-## Generating Wallet Keys
-
-```bash
-node -e "const { PrivateKey } = require('@bsv/sdk'); console.log(PrivateKey.fromRandom().toWif())"
-```
-
-Run this three times and set the results as `BSV_PRIVATE_KEY_1`, `_2`, and `_3` in your `.env`.
-
-## Explorer
-
-The `/explorer` page provides a searchable index of all blockchain-recorded environmental readings, with filtering by location, data type, and time range.
-
-## Rollout Gates
-
-Providers are enabled progressively via rollout gates (`gate_a` through `gate_d`) to control load during scaling. Set `GAIALOG_ROLLOUT_GATE=gate_b` (or higher) in your `.env` to enable more providers. The default is `gate_b`.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/new-provider`)
-3. Commit your changes
-4. Push to the branch and open a Pull Request
+The WhatsOnChain data plugin lives in `woc-plugin/gaialog-plugin`. Its package-specific usage and webhook details are documented in `woc-plugin/gaialog-plugin/README.md`.
 
 ## Licence
 
-[MIT](LICENSE)
+This project is released under the [MIT Licence](LICENSE).

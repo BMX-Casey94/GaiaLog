@@ -3,11 +3,16 @@
  *
  * GET /api/explorer/stats
  *
- * Returns overall statistics about the indexed data.
+ * Returns overall statistics about the indexed data, including the all-time
+ * archived (pruned) totals so the home-page can show a complete count of
+ * readings ever recorded — not just the live Supabase row count.  Pruned
+ * records remain immutable on the BSV chain itself and can be backfilled
+ * via explorer-sync at any time.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { getIndexStats, getUniqueLocationCountFast } from '@/lib/explorer-read-source'
+import { getIndexStats, getUniqueLocationCountFast, getArchivedTotals } from '@/lib/explorer-read-source'
+import { applyPublicReadCacheHeaders } from '@/lib/cache-headers'
 
 export const dynamic = 'force-dynamic'
 
@@ -18,6 +23,12 @@ type StatsAggregates = {
 }
 
 type IndexStats = { totalReadings: number; lastBlock: number; lastUpdated: number }
+type ArchivedSnapshot = {
+  totalArchived: number
+  totalArchivedConfirmed: number
+  byFamily: Record<string, number>
+}
+
 type ExplorerStatsPayload = {
   totalReadings: number
   uniqueLocations: number | null
@@ -32,16 +43,29 @@ type ExplorerStatsPayload = {
     dateRange: { min: string | null; max: string | null }
     byType: Record<string, number>
   }
+  archive: {
+    totalArchived: number
+    totalArchivedConfirmed: number
+    byFamily: Record<string, number>
+    note: string
+  }
+  grandTotalReadings: number
 }
 
 let lastKnownAggregates: StatsAggregates | null = null
 let lastKnownIndexStats: IndexStats | null = null
+let lastKnownArchive: ArchivedSnapshot | null = null
 let cachedPayload: { data: ExplorerStatsPayload; ts: number } | null = null
 let refreshInFlight: Promise<void> | null = null
 
 const STATS_CACHE_TTL_MS = Math.max(5000, Number(process.env.EXPLORER_STATS_CACHE_TTL_MS || 30000))
 const INDEX_TIMEOUT_MS = Math.max(1000, Number(process.env.EXPLORER_INDEX_TIMEOUT_MS || 2500))
 const LOCATION_TIMEOUT_MS = Math.max(500, Number(process.env.EXPLORER_LOCATION_TIMEOUT_MS || 1200))
+const ARCHIVE_TIMEOUT_MS = Math.max(500, Number(process.env.EXPLORER_ARCHIVE_TIMEOUT_MS || 1500))
+
+const ARCHIVE_NOTE =
+  'Pruned from Supabase to control storage and egress; the original transactions ' +
+  'remain immutable on the BSV chain and can be re-indexed on demand.'
 
 function defaultAggregates(): StatsAggregates {
   return { uniqueLocations: null, dateRange: { min: null, max: null }, byType: {} }
@@ -49,6 +73,10 @@ function defaultAggregates(): StatsAggregates {
 
 function defaultIndexStats(): IndexStats {
   return { totalReadings: 0, lastBlock: 0, lastUpdated: Date.now() }
+}
+
+function defaultArchive(): ArchivedSnapshot {
+  return { totalArchived: 0, totalArchivedConfirmed: 0, byFamily: {} }
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -60,7 +88,11 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   ])
 }
 
-function buildPayload(indexStats: IndexStats, aggregates: StatsAggregates): ExplorerStatsPayload {
+function buildPayload(
+  indexStats: IndexStats,
+  aggregates: StatsAggregates,
+  archive: ArchivedSnapshot,
+): ExplorerStatsPayload {
   return {
     totalReadings: indexStats.totalReadings,
     uniqueLocations: aggregates.uniqueLocations,
@@ -78,13 +110,21 @@ function buildPayload(indexStats: IndexStats, aggregates: StatsAggregates): Expl
       },
       byType: aggregates.byType,
     },
+    archive: {
+      totalArchived: archive.totalArchived,
+      totalArchivedConfirmed: archive.totalArchivedConfirmed,
+      byFamily: archive.byFamily,
+      note: ARCHIVE_NOTE,
+    },
+    grandTotalReadings: indexStats.totalReadings + archive.totalArchived,
   }
 }
 
 async function refreshSnapshot(): Promise<void> {
-  const [indexResult, uniqueLocationsResult] = await Promise.allSettled([
+  const [indexResult, uniqueLocationsResult, archiveResult] = await Promise.allSettled([
     withTimeout(getIndexStats(), INDEX_TIMEOUT_MS, 'Explorer index stats'),
     withTimeout(getUniqueLocationCountFast(), LOCATION_TIMEOUT_MS, 'Explorer unique locations'),
+    withTimeout(getArchivedTotals(), ARCHIVE_TIMEOUT_MS, 'Explorer archived totals'),
   ])
 
   const indexStats: IndexStats =
@@ -110,8 +150,16 @@ async function refreshSnapshot(): Promise<void> {
     console.warn('Explorer unique locations unavailable:', uniqueLocationsResult.reason)
   }
 
+  const archive: ArchivedSnapshot =
+    archiveResult.status === 'fulfilled' ? archiveResult.value : (lastKnownArchive ?? defaultArchive())
+  if (archiveResult.status === 'fulfilled') {
+    lastKnownArchive = archiveResult.value
+  } else {
+    console.warn('Explorer archived totals unavailable:', archiveResult.reason)
+  }
+
   cachedPayload = {
-    data: buildPayload(indexStats, aggregates),
+    data: buildPayload(indexStats, aggregates, archive),
     ts: Date.now(),
   }
 }
@@ -123,6 +171,10 @@ function triggerRefresh(): void {
   })
 }
 
+function jsonWithCache(body: unknown, init?: ResponseInit): NextResponse {
+  return applyPublicReadCacheHeaders(NextResponse.json(body, init))
+}
+
 export async function GET(_request: NextRequest) {
   try {
     const now = Date.now()
@@ -130,7 +182,7 @@ export async function GET(_request: NextRequest) {
     const fresh = age != null && age <= STATS_CACHE_TTL_MS
 
     if (fresh && cachedPayload) {
-      return NextResponse.json({
+      return jsonWithCache({
         success: true,
         data: cachedPayload.data,
         cached: true,
@@ -142,7 +194,7 @@ export async function GET(_request: NextRequest) {
     if (cachedPayload) {
       // Serve stale immediately and refresh in background to keep latency low.
       triggerRefresh()
-      return NextResponse.json({
+      return jsonWithCache({
         success: true,
         data: cachedPayload.data,
         cached: true,
@@ -155,9 +207,13 @@ export async function GET(_request: NextRequest) {
     await refreshSnapshot()
     const payload =
       cachedPayload?.data ??
-      buildPayload(lastKnownIndexStats ?? defaultIndexStats(), lastKnownAggregates ?? defaultAggregates())
+      buildPayload(
+        lastKnownIndexStats ?? defaultIndexStats(),
+        lastKnownAggregates ?? defaultAggregates(),
+        lastKnownArchive ?? defaultArchive(),
+      )
 
-    return NextResponse.json({
+    return jsonWithCache({
       success: true,
       data: payload,
       cached: true,
@@ -168,8 +224,12 @@ export async function GET(_request: NextRequest) {
     console.error('Explorer stats error:', error)
     const payload =
       cachedPayload?.data ??
-      buildPayload(lastKnownIndexStats ?? defaultIndexStats(), lastKnownAggregates ?? defaultAggregates())
-    return NextResponse.json({
+      buildPayload(
+        lastKnownIndexStats ?? defaultIndexStats(),
+        lastKnownAggregates ?? defaultAggregates(),
+        lastKnownArchive ?? defaultArchive(),
+      )
+    return jsonWithCache({
       success: true,
       data: payload,
       cached: !!cachedPayload,

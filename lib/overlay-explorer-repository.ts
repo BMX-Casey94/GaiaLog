@@ -246,6 +246,51 @@ export async function getStats(): Promise<{
   return { totalReadings, totalConfirmed, byType }
 }
 
+/**
+ * All-time pruned-row aggregates per data family.
+ *
+ * Reads from overlay_explorer_archive_totals, which the AFTER DELETE trigger
+ * on overlay_explorer_readings maintains transactionally on every retention
+ * pass.  These rows represent records that have been removed from Supabase
+ * to control storage / egress, but which remain immutable on the BSV chain
+ * itself and can be backfilled at any time via explorer-sync.
+ *
+ * Returns zeroes if the trigger / table has not been deployed yet.
+ */
+export async function getArchivedTotals(): Promise<{
+  totalArchived: number
+  totalArchivedConfirmed: number
+  byFamily: Record<string, number>
+}> {
+  try {
+    const result = await query<{ data_family: string; pruned_count: string; pruned_confirmed_count: string }>(
+      `SELECT data_family, pruned_count::text, pruned_confirmed_count::text
+         FROM overlay_explorer_archive_totals`,
+    )
+
+    let totalArchived = 0
+    let totalArchivedConfirmed = 0
+    const byFamily: Record<string, number> = {}
+    for (const row of result.rows || []) {
+      const family = normaliseDataFamily(row.data_family) || row.data_family
+      const count = Number(row.pruned_count || 0)
+      const conf = Number(row.pruned_confirmed_count || 0)
+      byFamily[family] = (byFamily[family] || 0) + count
+      totalArchived += count
+      totalArchivedConfirmed += conf
+    }
+    return { totalArchived, totalArchivedConfirmed, byFamily }
+  } catch (err) {
+    // Pre-migration deployments will hit "relation does not exist".  Treat as
+    // a zero archive so the stats endpoint stays healthy until 0020 is run.
+    const msg = err instanceof Error ? err.message : String(err)
+    if (msg.toLowerCase().includes('does not exist')) {
+      return { totalArchived: 0, totalArchivedConfirmed: 0, byFamily: {} }
+    }
+    throw err
+  }
+}
+
 export async function getIndexStats(): Promise<{
   totalReadings: number
   lastBlock: number

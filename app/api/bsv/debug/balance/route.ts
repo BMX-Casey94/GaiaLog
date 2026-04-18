@@ -1,9 +1,13 @@
 import { NextResponse } from 'next/server'
 import { blockchainService } from '@/lib/blockchain'
+import { requireInternalApiAccess } from '@/lib/internal-api-auth'
 
 export const runtime = 'nodejs'
 
-export async function GET() {
+export async function GET(request: Request) {
+  const denied = requireInternalApiAccess(request)
+  if (denied) return denied
+
   try {
     const net = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
     const address: string | null = (blockchainService as any).getAddress ? (blockchainService as any).getAddress() : null

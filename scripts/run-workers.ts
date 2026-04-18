@@ -47,6 +47,7 @@ async function main() {
     const { workerManager } = await import('../lib/worker-threads')
     const { workerQueue } = await import('../lib/worker-queue')
     const { startUtxoMaintainer } = await import('../lib/utxo-maintainer')
+    const { startConfirmationWorker } = await import('../lib/confirmation-worker')
     const { initializeProviderBudgets, recomputeProviderConfigs } = await import('../lib/provider-registry')
     const { blockchainService } = await import('../lib/blockchain')
     const fs = await import('fs')
@@ -99,6 +100,12 @@ async function main() {
     workerManager.startAll()
     // Start UTXO maintainer first to prioritize split at boot
     startUtxoMaintainer()
+    // Confirmation worker: marks broadcast txs as confirmed once WoC sees
+    // them in a block.  Without this, every overlay row stays confirmed=false
+    // forever, retention undercounts confirmed rows, and any spend path
+    // requiring confirmations stalls.  Self-throttled, opt-out via
+    // BSV_CONFIRMATION_WORKER_DISABLED=true.
+    startConfirmationWorker()
     // Slight delay to let maintainer kick off before queue
     setTimeout(() => {
       workerQueue.startProcessing()
@@ -168,21 +175,25 @@ async function main() {
       }, 30000) // 30 seconds
     }
 
-    const gracefulShutdown = (signal: string) => {
+    const gracefulShutdown = async (signal: string) => {
       console.log(`\n🛑 Shutting down GaiaLog worker service (${signal})...`)
       // Stop workers so no new collection cycles start
       workerManager.stopAll()
       // Stop queue processing interval — in-flight DB-persisted items are
       // automatically reclaimed as 'queued' after 2 minutes on next startup
       workerQueue.stop()
+      try {
+        const { stopConfirmationWorker } = await import('../lib/confirmation-worker')
+        stopConfirmationWorker()
+      } catch {}
       console.log('✅ Worker service shut down cleanly.')
       process.exit(0)
     }
 
     // SIGINT  — manual Ctrl-C or pm2 stop
     // SIGTERM — sent by PM2 on cron_restart, pm2 reload, and some OS signals
-    process.on('SIGINT', () => gracefulShutdown('SIGINT'))
-    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+    process.on('SIGINT', () => { void gracefulShutdown('SIGINT') })
+    process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM') })
   } catch (e) {
     console.error('❌ Failed to start worker service:', e)
     process.exit(1)

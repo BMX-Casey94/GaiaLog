@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
@@ -105,7 +105,7 @@ export function BSVBlockchainPanel() {
   const [txNetwork, setTxNetwork] = useState<'main' | 'test'>('test')
 
   // Fetch real data from our BSV services
-  const fetchRealData = async () => {
+  const fetchRealData = useCallback(async () => {
     try {
       // Fetch wallet information from wallet manager
       const walletResponse = await fetch('/api/bsv/wallets')
@@ -218,7 +218,7 @@ export function BSVBlockchainPanel() {
       // Fallback to simulated data if API calls fail
       setSimulatedData()
     }
-  }
+  }, [])
 
   // Fallback simulated data (for development/testing)
   const setSimulatedData = () => {
@@ -301,7 +301,7 @@ export function BSVBlockchainPanel() {
     const interval = setInterval(fetchRealData, 5000) // Update every 5 seconds
 
     return () => clearInterval(interval)
-  }, [])
+  }, [fetchRealData])
 
   const handleRefresh = async () => {
     setIsRefreshing(true)

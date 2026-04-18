@@ -4,8 +4,8 @@
  * Single point of control for the explorer data path.  Governed by two
  * independent environment flags:
  *
- *   EXPLORER_READ_SOURCE   = legacy | shadow | overlay   (default: legacy)
- *   EXPLORER_WRITE_MODE    = legacy | dual   | overlay   (default: legacy)
+ *   EXPLORER_READ_SOURCE   = legacy | shadow | overlay   (default: overlay)
+ *   EXPLORER_WRITE_MODE    = legacy | dual   | overlay   (default: overlay)
  *
  * Read modes:
  *   legacy  – serve from supabase-explorer (current behaviour)
@@ -284,6 +284,28 @@ export async function getIndexStats(): Promise<{
   }
 
   return legacyIndexStats()
+}
+
+export interface ArchivedTotals {
+  totalArchived: number
+  totalArchivedConfirmed: number
+  byFamily: Record<string, number>
+}
+
+/**
+ * All-time aggregate of rows pruned by retention.  Kept on the chain and
+ * recoverable via explorer-sync; tracked here only so the home page can show
+ * an honest "total readings ever recorded" alongside the live count.
+ *
+ * Legacy read source returns zeroes (it has no equivalent of the overlay
+ * archive_totals table).
+ */
+export async function getArchivedTotals(): Promise<ArchivedTotals> {
+  const source = getExplorerReadSource()
+  if (source === 'overlay') {
+    return overlayService.getArchivedTotals()
+  }
+  return { totalArchived: 0, totalArchivedConfirmed: 0, byFamily: {} }
 }
 
 export async function getUniqueLocationCountFast(): Promise<number | null> {

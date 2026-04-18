@@ -9,12 +9,15 @@
 
 import { NextResponse } from 'next/server'
 import { autoInitializeWorkers } from '@/lib/worker-auto-init'
+import { requireInternalApiAccess } from '@/lib/internal-api-auth'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60 // Allow up to 60 seconds for warmup
 
-export async function GET() {
+export async function GET(request: Request) {
   const startTime = Date.now()
+  const denied = requireInternalApiAccess(request)
+  if (denied) return denied
   
   try {
     console.log('🔥 Warming up application...')
@@ -65,7 +68,7 @@ export async function GET() {
   }
 }
 
-export async function POST() {
-  return GET()
+export async function POST(request: Request) {
+  return GET(request)
 }
 

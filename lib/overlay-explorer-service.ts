@@ -196,6 +196,7 @@ export function invalidateAggregateCache(): void {
   _aggregateCache = null
   _indexStatsCache = null
   _locationCountCache = null
+  _archiveCache = null
 }
 
 // ─── Priority Alerts ─────────────────────────────────────────────────────────
@@ -210,6 +211,23 @@ export async function getPriorityAlerts(limit: number = 8): Promise<import('./ov
   const alerts = await repo.getPriorityAlerts(limit)
   _priorityAlertsCache = { value: alerts, expiresAt: Date.now() + PRIORITY_ALERTS_CACHE_TTL_MS }
   return alerts
+}
+
+// ─── Archived (pruned) totals ────────────────────────────────────────────────
+// These are O(1) reads against overlay_explorer_archive_totals (one row per
+// family) so the cache window can be relatively long without staleness issues —
+// the archive only changes when the retention cron fires (default daily).
+
+const ARCHIVE_CACHE_TTL_MS = Math.max(15_000, Number(process.env.EXPLORER_ARCHIVE_CACHE_TTL_MS || 300_000))
+let _archiveCache: CacheEntry<Awaited<ReturnType<typeof repo.getArchivedTotals>>> | null = null
+
+export async function getArchivedTotals(): Promise<Awaited<ReturnType<typeof repo.getArchivedTotals>>> {
+  if (_archiveCache && _archiveCache.expiresAt > Date.now()) {
+    return _archiveCache.value
+  }
+  const totals = await repo.getArchivedTotals()
+  _archiveCache = { value: totals, expiresAt: Date.now() + ARCHIVE_CACHE_TTL_MS }
+  return totals
 }
 
 // ─── Latest Readings With Metrics ────────────────────────────────────────────

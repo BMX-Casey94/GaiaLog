@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { query } from '@/lib/db'
+import { requireInternalApiAccess } from '@/lib/internal-api-auth'
 
 export const runtime = 'nodejs'
 
 // Debug endpoint to see what data exists in the database
 export async function GET(req: NextRequest) {
+  const denied = requireInternalApiAccess(req)
+  if (denied) return denied
+
   try {
     const checks = await Promise.all([
       // Check latest air quality record (with or without txid)

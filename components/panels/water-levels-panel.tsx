@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
@@ -68,7 +68,7 @@ export function WaterLevelsPanel() {
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
 
   // Fetch real water level data
-  const fetchWaterLevelData = async () => {
+  const fetchWaterLevelData = useCallback(async () => {
     try {
       const response = await fetch('/api/water-levels')
       if (response.ok) {
@@ -108,7 +108,7 @@ export function WaterLevelsPanel() {
       // Fallback to simulated data
       setSimulatedData()
     }
-  }
+  }, [])
 
   // Fallback simulated data
   const setSimulatedData = () => {
@@ -147,7 +147,7 @@ export function WaterLevelsPanel() {
     const interval = setInterval(fetchWaterLevelData, 60000) // Update every 60 seconds
 
     return () => clearInterval(interval)
-  }, [])
+  }, [fetchWaterLevelData])
 
   const handleRefresh = async () => {
     setIsRefreshing(true)

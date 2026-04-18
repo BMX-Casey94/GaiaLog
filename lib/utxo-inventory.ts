@@ -95,6 +95,14 @@ function mapInventoryRow(row: InventoryUtxo): InventoryUtxo {
 async function acquireInventoryUtxo(client: PoolClient, input: AcquireInventoryUtxoInput): Promise<InventoryUtxo | null> {
   const lockedBy = input.lockedBy || getLockOwnerId()
   const preferLargest = input.preferLargest === true
+  // raw_tx and beef are intentionally NOT included in RETURNING.  Neither the
+  // spend path (lib/blockchain.ts) nor the maintainer (lib/utxo-maintainer.ts)
+  // reads them — they only need (txid, vout, output_script, satoshis) to build
+  // a fresh signed transaction.  Streaming raw_tx (often 200-2000 bytes) on
+  // every acquisition was a major contributor to Supabase egress at load.
+  // Both columns remain populated on disk for live rows in case future code
+  // paths need them; they can be lazy-loaded by a follow-up SELECT keyed on
+  // (topic, txid, vout) when actually required.
   const res = await client.query<InventoryUtxo>(
     `WITH candidate AS (
        SELECT topic, txid, vout
@@ -118,7 +126,7 @@ async function acquireInventoryUtxo(client: PoolClient, input: AcquireInventoryU
       WHERE u.topic = c.topic
         AND u.txid = c.txid
         AND u.vout = c.vout
-    RETURNING u.topic, u.txid, u.vout, u.satoshis, u.output_script, u.raw_tx, u.beef,
+    RETURNING u.topic, u.txid, u.vout, u.satoshis, u.output_script,
               u.admitted_at, u.confirmed, u.removed, u.removed_at, u.spending_txid,
               u.wallet_index, u.utxo_role, u.locked, u.locked_by, u.locked_at`,
     [

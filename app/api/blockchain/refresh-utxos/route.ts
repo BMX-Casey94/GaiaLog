@@ -7,6 +7,7 @@
 
 import { NextResponse } from 'next/server'
 import { blockchainService } from '@/lib/blockchain'
+import { requireInternalApiAccess } from '@/lib/internal-api-auth'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -14,7 +15,10 @@ export const runtime = 'nodejs'
 /**
  * POST handler - Force refresh all UTXO caches
  */
-export async function POST() {
+export async function POST(request: Request) {
+  const denied = requireInternalApiAccess(request)
+  if (denied) return denied
+
   try {
     console.log('🔄 Manual UTXO cache refresh requested via API')
     await blockchainService.forceRefreshAllUtxoCaches()
@@ -42,7 +46,7 @@ export async function POST() {
 /**
  * GET handler - Same as POST for convenience
  */
-export async function GET() {
-  return POST()
+export async function GET(request: Request) {
+  return POST(request)
 }
 

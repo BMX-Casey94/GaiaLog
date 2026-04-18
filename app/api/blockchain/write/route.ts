@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { blockchainService } from '@/lib/blockchain'
+import { requireInternalApiAccess } from '@/lib/internal-api-auth'
 
 export async function POST(request: NextRequest) {
+  const denied = requireInternalApiAccess(request)
+  if (denied) return denied
+
   try {
     const body = await request.json()
     const { stream, payload } = body

@@ -4,6 +4,11 @@ import { blockchainService } from '@/lib/blockchain'
 import { DATA_FAMILY_DESCRIPTORS } from '@/lib/stream-registry'
 import { getExplorerReadSource } from '@/lib/explorer-read-source'
 import { getLatestReadingsWithMetrics } from '@/lib/overlay-explorer-repository'
+import { applyPublicReadCacheHeaders } from '@/lib/cache-headers'
+
+function jsonWithCache(body: unknown, init?: ResponseInit): NextResponse {
+  return applyPublicReadCacheHeaders(NextResponse.json(body, init))
+}
 
 function getBSVNetwork(): 'main' | 'test' {
   return process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
@@ -46,7 +51,7 @@ export async function GET(req: NextRequest) {
               },
             }))
             .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-          return NextResponse.json({ success: true, network, readings, source: 'overlay' })
+          return jsonWithCache({ success: true, network, readings, source: 'overlay' })
         }
       } catch (overlayErr) {
         console.warn('Overlay recent-readings fallback:', overlayErr instanceof Error ? overlayErr.message : overlayErr)
@@ -82,7 +87,7 @@ export async function GET(req: NextRequest) {
       }).filter(Boolean) as any[]
       
       if (readings.length > 0) {
-        return NextResponse.json({ success: true, network, readings, source: 'local-log' })
+        return jsonWithCache({ success: true, network, readings, source: 'local-log' })
       }
     }
 
@@ -123,12 +128,12 @@ export async function GET(req: NextRequest) {
           },
         }))
         .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      return NextResponse.json({ success: true, network, readings })
+      return jsonWithCache({ success: true, network, readings })
     }
 
     // If WoC reads are disabled, return empty rather than hitting WoC
     if (process.env.GAIALOG_DISABLE_WOC_READS === 'true') {
-      return NextResponse.json({ success: true, network, readings: [] })
+      return jsonWithCache({ success: true, network, readings: [] })
     }
 
     // Fallback: fast WoC lookup for latest of each type (no DB)
@@ -166,12 +171,12 @@ export async function GET(req: NextRequest) {
     })()
 
     const resultReadings = await Promise.race<[any[] | null]>([work as any, timeoutPromise as any])
-    return NextResponse.json({ success: true, network, readings: resultReadings || [] })
+    return jsonWithCache({ success: true, network, readings: resultReadings || [] })
   } catch (error) {
     // Final fallback: Return empty array
-    return NextResponse.json({ 
-      success: true, 
-      network, 
+    return jsonWithCache({
+      success: true,
+      network,
       readings: [],
       error: 'Unable to fetch recent readings'
     })

@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server"
 import { createSupabaseAdminClient } from "@/lib/supabase/admin"
+import { requireInternalApiAccess } from "@/lib/internal-api-auth"
 
 export async function POST(request: Request) {
+	const denied = requireInternalApiAccess(request)
+	if (denied) return denied
+
 	const resetSecret = process.env.ADMIN_RESET_SECRET
 	if (!resetSecret) return NextResponse.json({ error: "Reset secret not configured" }, { status: 500 })
 

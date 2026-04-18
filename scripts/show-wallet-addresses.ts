@@ -51,11 +51,11 @@ for (const { name, key } of privateKeys) {
 console.log()
 
 if (foundCount > 0) {
-  console.log('Add the above addresses to your .env.local file to enable the Data Explorer indexer.')
+  console.log('Add the above addresses to your environment file to enable explorer sync.')
   console.log()
   console.log('Then run: npm run explorer:sync')
 } else {
-  console.log('No valid private keys found. Configure your wallet keys in .env.local first.')
+  console.log('No valid private keys found. Configure your wallet keys in your environment file first.')
 }
 
 console.log()

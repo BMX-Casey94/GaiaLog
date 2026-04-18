@@ -166,6 +166,55 @@ export async function enrichWithGeocodedLocation(
 
 // ─── Metrics Preview Builder ─────────────────────────────────────────────────
 
+// Per-value and total-payload size caps keep metrics_preview from blowing up
+// row size on noisy providers (e.g. planning proposals, biodiversity
+// descriptions, OWM raw text).  Tuned against the home-page card needs:
+// the UI never reads more than ~80 chars from any single string field.
+const MAX_PREVIEW_STRING_CHARS = 256
+const MAX_PREVIEW_BYTES = 2048
+const TRUNCATION_MARKER = '…'
+
+function clampPreviewValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    if (value.length <= MAX_PREVIEW_STRING_CHARS) return value
+    return value.slice(0, MAX_PREVIEW_STRING_CHARS - 1) + TRUNCATION_MARKER
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 8).map(clampPreviewValue)
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    let i = 0
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (i++ >= 16) break
+      out[k] = clampPreviewValue(v)
+    }
+    return out
+  }
+  return value
+}
+
+function enforceTotalPreviewByteCap(preview: Record<string, unknown>): Record<string, unknown> {
+  let serialized = JSON.stringify(preview)
+  if (Buffer.byteLength(serialized, 'utf8') <= MAX_PREVIEW_BYTES) return preview
+
+  // Drop string-valued keys (which dominate byte usage) starting from the
+  // longest until we are under the cap.  Numeric metrics are preserved
+  // because the cards depend on them for severity scoring.
+  const entries = Object.entries(preview)
+    .filter(([, v]) => typeof v === 'string')
+    .sort(([, a], [, b]) => String(b).length - String(a).length)
+
+  const out = { ...preview }
+  for (const [key] of entries) {
+    delete out[key]
+    serialized = JSON.stringify(out)
+    if (Buffer.byteLength(serialized, 'utf8') <= MAX_PREVIEW_BYTES) break
+  }
+
+  return out
+}
+
 function buildMetricsPreview(
   metrics: Record<string, unknown> | null | undefined,
   dataFamily: string,
@@ -182,14 +231,14 @@ function buildMetricsPreview(
   if (priorityKeys) {
     for (const key of priorityKeys) {
       const val = metrics[key]
-      if (val != null && val !== '') preview[key] = val
+      if (val != null && val !== '') preview[key] = clampPreviewValue(val)
     }
   }
 
   for (const key of METRIC_PREVIEW_KEYS) {
     if (key in preview) continue
     const val = metrics[key]
-    if (val != null && val !== '') preview[key] = val
+    if (val != null && val !== '') preview[key] = clampPreviewValue(val)
   }
 
   if (preview.lat == null && lat != null) preview.lat = lat
@@ -197,5 +246,5 @@ function buildMetricsPreview(
   if (preview.latitude == null && lat != null) preview.latitude = lat
   if (preview.longitude == null && lon != null) preview.longitude = lon
 
-  return preview
+  return enforceTotalPreviewByteCap(preview)
 }

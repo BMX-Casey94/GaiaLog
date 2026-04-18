@@ -41,7 +41,7 @@ const ShaderCanvas = () => {
     });
     observer.observe(root, { attributes: true });
     return () => observer.disconnect();
-  }, []);
+  }, [backgroundColor]);
 
   useEffect(() => {
     const gl = glRef.current;
@@ -159,7 +159,7 @@ const ShaderCanvas = () => {
       window.removeEventListener('resize', handleResize);
       cancelAnimationFrame(animationFrameId);
     };
-  }, []);
+  }, [backgroundColor]);
 
   return <canvas ref={canvasRef} className="absolute top-0 left-0 w-full h-full block z-0" />;
 };

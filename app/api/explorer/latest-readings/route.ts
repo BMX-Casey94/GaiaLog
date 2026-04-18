@@ -12,14 +12,19 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getExplorerReadSource } from '@/lib/explorer-read-source'
 import { getLatestReadingsWithMetrics } from '@/lib/overlay-explorer-service'
 import { DATA_FAMILY_DESCRIPTORS } from '@/lib/stream-registry'
+import { applyPublicReadCacheHeaders } from '@/lib/cache-headers'
 
 export const dynamic = 'force-dynamic'
+
+function jsonWithCache(body: unknown, init?: ResponseInit): NextResponse {
+  return applyPublicReadCacheHeaders(NextResponse.json(body, init))
+}
 
 export async function GET(req: NextRequest) {
   try {
     const source = getExplorerReadSource()
     if (source !== 'overlay') {
-      return NextResponse.json({ success: true, readings: [], source: 'overlay-unavailable' })
+      return jsonWithCache({ success: true, readings: [], source: 'overlay-unavailable' })
     }
 
     const families = Object.keys(DATA_FAMILY_DESCRIPTORS)
@@ -36,10 +41,10 @@ export async function GET(req: NextRequest) {
       confirmed: row.confirmed,
     }))
 
-    return NextResponse.json({ success: true, readings, source: 'overlay' })
+    return jsonWithCache({ success: true, readings, source: 'overlay' })
   } catch (error) {
     console.error('Latest readings error:', error)
-    return NextResponse.json({
+    return jsonWithCache({
       success: true,
       readings: [],
       error: error instanceof Error ? error.message : 'Failed to fetch latest readings',

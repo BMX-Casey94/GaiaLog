@@ -226,7 +226,7 @@ export function BlockchainTest() {
       <div className="mt-4 p-3 bg-slate-800/30 rounded border border-slate-700">
         <p className="text-xs text-slate-400">
           <strong>Note:</strong> This test component requires proper environment variables and API keys to be configured. 
-          See <code className="bg-slate-900 px-1 rounded">env.template</code> for required configuration.
+          Start with <code className="bg-slate-900 px-1 rounded">env.example</code> for the minimum local setup and use <code className="bg-slate-900 px-1 rounded">env.template</code> for the full configuration surface.
         </p>
       </div>
     </Card>

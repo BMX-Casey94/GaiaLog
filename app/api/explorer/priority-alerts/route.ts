@@ -12,8 +12,13 @@ import { getExplorerReadSource } from '@/lib/explorer-read-source'
 import { getPriorityAlerts } from '@/lib/overlay-explorer-service'
 import { DATA_FAMILY_DESCRIPTORS } from '@/lib/stream-registry'
 import type { DataFamily } from '@/lib/stream-registry'
+import { applyPublicReadCacheHeaders } from '@/lib/cache-headers'
 
 export const dynamic = 'force-dynamic'
+
+function jsonWithCache(body: unknown, init?: ResponseInit): NextResponse {
+  return applyPublicReadCacheHeaders(NextResponse.json(body, init))
+}
 
 function computeSeverityScore(
   dataFamily: string,
@@ -103,7 +108,7 @@ export async function GET(req: NextRequest) {
   try {
     const source = getExplorerReadSource()
     if (source !== 'overlay') {
-      return NextResponse.json({
+      return jsonWithCache({
         success: true,
         alerts: [],
         source: 'overlay-unavailable',
@@ -140,14 +145,14 @@ export async function GET(req: NextRequest) {
       }
     })
 
-    return NextResponse.json({
+    return jsonWithCache({
       success: true,
       alerts,
       source: 'overlay',
     })
   } catch (error) {
     console.error('Priority alerts error:', error)
-    return NextResponse.json({
+    return jsonWithCache({
       success: true,
       alerts: [],
       error: error instanceof Error ? error.message : 'Failed to fetch priority alerts',

@@ -39,7 +39,7 @@ export class WalletManager {
     try {
       if (bsvConfig.wallets.privateKeys.length === 0) {
         throw new Error(
-          'No wallet private keys configured. Set BSV_PRIVATE_KEY_1 (and optionally _2, _3) in your .env file. ' +
+          'No wallet private keys configured. Set BSV_WALLET_1_PRIVATE_KEY (and optionally _2 and _3) in your .env file. ' +
           'Generate keys with: node -e "console.log(require(\'@bsv/sdk\').PrivateKey.fromRandom().toWif())"'
         )
       }

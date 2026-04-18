@@ -1,11 +1,15 @@
 import { NextResponse } from 'next/server'
 import { workerQueue } from '@/lib/worker-queue'
 import { calculateSourceHash } from '@/lib/repositories'
+import { requireInternalApiAccess } from '@/lib/internal-api-auth'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
-export async function POST() {
+export async function POST(request: Request) {
+  const denied = requireInternalApiAccess(request)
+  if (denied) return denied
+
   try {
     const now = Date.now()
     const id = workerQueue.addToQueue({

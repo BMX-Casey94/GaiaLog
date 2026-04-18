@@ -1,9 +1,13 @@
 import { NextResponse } from 'next/server'
 import { insertAirQuality, insertAdvanced, insertSeismic, insertWaterLevel, calculateSourceHash } from '@/lib/repositories'
+import { requireInternalApiAccess } from '@/lib/internal-api-auth'
 
 export const runtime = 'nodejs'
 
-export async function GET() {
+export async function GET(request: Request) {
+  const denied = requireInternalApiAccess(request)
+  if (denied) return denied
+
   const results: Record<string, any> = {}
   try {
     // Seed Air Quality from WeatherAPI (London)

@@ -3,8 +3,12 @@ import { walletManager } from '@/lib/wallet-manager'
 import { workerQueue } from '@/lib/worker-queue'
 import { workerManager } from '@/lib/worker-threads'
 import { bsvTransactionService } from '@/lib/bsv-transaction-service'
+import { requireInternalApiAccess } from '@/lib/internal-api-auth'
 
-export async function POST() {
+export async function POST(request: Request) {
+  const denied = requireInternalApiAccess(request)
+  if (denied) return denied
+
   try {
     // Initialize wallet manager with test data if not already initialized
     if (!walletManager.isReady()) {

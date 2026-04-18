@@ -8,9 +8,8 @@ BEGIN;
 --
 -- Data is owned by the overlay ingest pipeline.  Writes come from:
 --   1. Local accepted broadcasts  (lib/blockchain.ts)
---   2. Live history ingestion     (lib/junglebus.ts)
---   3. Historical backfill        (scripts/backfill-explorer.ts)
---   4. Bulk seed from legacy      (scripts/seed-overlay-explorer.ts)
+--   2. Address-history sync       (lib/explorer-sync.ts)
+--   3. Bulk seed from legacy      (scripts/seed-overlay-explorer.ts)
 
 CREATE TABLE IF NOT EXISTS overlay_explorer_readings (
   txid              text        PRIMARY KEY,

@@ -8,6 +8,7 @@ export const MeshCanvas = () => {
 
   useEffect(() => {
     if (!mountRef.current) return
+    const mountElement = mountRef.current
 
     const scene = new THREE.Scene()
     const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000)
@@ -15,7 +16,7 @@ export const MeshCanvas = () => {
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
     renderer.setSize(window.innerWidth, window.innerHeight)
     renderer.setPixelRatio(window.devicePixelRatio)
-    mountRef.current.appendChild(renderer.domElement)
+    mountElement.appendChild(renderer.domElement)
 
     const clock = new THREE.Clock()
 
@@ -83,8 +84,8 @@ export const MeshCanvas = () => {
 
     return () => {
       window.removeEventListener("resize", handleResize)
-      if (mountRef.current && renderer.domElement) {
-        mountRef.current.removeChild(renderer.domElement)
+      if (mountElement && renderer.domElement) {
+        mountElement.removeChild(renderer.domElement)
       }
     }
   }, [])

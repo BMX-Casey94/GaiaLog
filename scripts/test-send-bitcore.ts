@@ -3,7 +3,6 @@ config({ path: '.env.local' })
 config()
 
 // Use CommonJS-style require to avoid type/esm issues
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const bsv = require('bsv')
 
 async function fetchJson(url: string) {

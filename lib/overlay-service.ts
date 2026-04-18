@@ -153,7 +153,10 @@ function toPublicOutput(row: OverlayAdmittedUtxoRow) {
     vout: row.vout,
     outputScript: row.output_script,
     satoshis: Number(row.satoshis),
-    rawTx: row.raw_tx,
+    // rawTx may legitimately be null on spent rows (see migration 0020 — the
+    // overlay listLookup path filters them out, but defensively normalise
+    // here so downstream consumers always see a string field).
+    rawTx: row.raw_tx ?? '',
     beef: row.beef ?? null,
     confirmed: row.confirmed,
     admittedAt: row.admitted_at,

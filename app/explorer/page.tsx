@@ -542,7 +542,6 @@ export default function ExplorerPage() {
           {/* Filters */}
           <div className="flex flex-wrap justify-center gap-3 mb-6">
             <Button
-              variant={selectedType === null ? "default" : "outline"}
               size="sm"
               onClick={() => setSelectedType(null)}
               variant={selectedType === null ? "purple" : "outline"}

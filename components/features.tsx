@@ -84,7 +84,7 @@ export function Features() {
         <div className="text-center">
           <h3 className="text-3xl font-bold text-white mb-6">Verify Our Data Yourself</h3>
           <p className="text-xl text-slate-300 mb-8 max-w-3xl mx-auto">
-            Don't just trust us - verify every measurement yourself. Each data point includes a blockchain transaction
+            Don&apos;t just trust us - verify every measurement yourself. Each data point includes a blockchain transaction
             ID that you can look up on any BSV blockchain explorer.
           </p>
 

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -38,7 +38,23 @@ export function BlockchainExplorer() {
     { name: 'Wallet 3', address: '127HLeWpr66JU3SDmQJ9dmjBo6RgNsRU1w' },
   ]
 
-  const fetchTransactions = async () => {
+  function formatTimestamp(timestamp: string): string {
+    const date = new Date(timestamp)
+    const now = new Date()
+    const diffMs = now.getTime() - date.getTime()
+    const diffMins = Math.floor(diffMs / 60000)
+
+    if (diffMins < 1) return 'just now'
+    if (diffMins < 60) return `${diffMins} minute${diffMins === 1 ? '' : 's'} ago`
+
+    const diffHours = Math.floor(diffMins / 60)
+    if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`
+
+    const diffDays = Math.floor(diffHours / 24)
+    return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`
+  }
+
+  const fetchTransactions = useCallback(async () => {
     try {
       const response = await fetch('/api/blockchain/recent-readings')
       const result = await response.json()
@@ -71,29 +87,13 @@ export function BlockchainExplorer() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     fetchTransactions()
     const interval = setInterval(fetchTransactions, 45000)
     return () => clearInterval(interval)
-  }, [])
-
-  const formatTimestamp = (timestamp: string): string => {
-    const date = new Date(timestamp)
-    const now = new Date()
-    const diffMs = now.getTime() - date.getTime()
-    const diffMins = Math.floor(diffMs / 60000)
-
-    if (diffMins < 1) return 'just now'
-    if (diffMins < 60) return `${diffMins} minute${diffMins === 1 ? '' : 's'} ago`
-
-    const diffHours = Math.floor(diffMins / 60)
-    if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`
-
-    const diffDays = Math.floor(diffHours / 24)
-    return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`
-  }
+  }, [fetchTransactions])
 
   const buildMetricsSummary = (family: string, metrics: Record<string, unknown>): string | null => {
     const items = getKeyMetrics(family, metrics, 3)

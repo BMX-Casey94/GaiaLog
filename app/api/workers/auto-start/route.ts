@@ -8,6 +8,7 @@
 
 import { NextResponse } from 'next/server'
 import { autoInitializeWorkers, getWorkerStatus } from '@/lib/worker-auto-init'
+import { requireInternalApiAccess } from '@/lib/internal-api-auth'
 
 // This makes the route dynamic so it runs on every request in serverless
 export const dynamic = 'force-dynamic'
@@ -16,7 +17,10 @@ export const runtime = 'nodejs'
 /**
  * GET handler - Initialize workers and return status
  */
-export async function GET() {
+export async function GET(request: Request) {
+  const denied = requireInternalApiAccess(request)
+  if (denied) return denied
+
   try {
     const result = await autoInitializeWorkers()
     
@@ -55,7 +59,7 @@ export async function GET() {
 /**
  * POST handler - Same as GET for flexibility
  */
-export async function POST() {
-  return GET()
+export async function POST(request: Request) {
+  return GET(request)
 }
 

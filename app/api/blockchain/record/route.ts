@@ -1,7 +1,11 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { bsvClient } from "@/lib/bsv-client"
+import { requireInternalApiAccess } from "@/lib/internal-api-auth"
 
 export async function POST(request: NextRequest) {
+  const denied = requireInternalApiAccess(request)
+  if (denied) return denied
+
   try {
     const { dataType, data } = await request.json()
 

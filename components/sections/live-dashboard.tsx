@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -49,7 +49,7 @@ export function LiveDashboard() {
   })
   const [topOverlayAlert, setTopOverlayAlert] = useState<OverlayAlert | null>(null)
 
-  const processDataIntoAlerts = (data: any): AlertData[] => {
+  const processDataIntoAlerts = useCallback((data: any): AlertData[] => {
     const alerts: AlertData[] = []
     const toFixed = (n: any, digits = 1): string => {
       const num = Number(n)
@@ -181,7 +181,7 @@ export function LiveDashboard() {
     }
     
     return alerts
-  }
+  }, [])
 
   const worstAlert = (type: AlertType): AlertData | null => {
     const current = alerts.filter(a => a.type === type)
@@ -191,7 +191,7 @@ export function LiveDashboard() {
     return candidates.reduce((best, a) => SEVERITY_RANK[a.severity] > SEVERITY_RANK[best.severity] ? a : best, candidates[0])
   }
 
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
@@ -280,14 +280,14 @@ export function LiveDashboard() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [processDataIntoAlerts])
 
   useEffect(() => {
     fetchData()
     // Refresh every 45 seconds to align with API cache TTL
     const interval = setInterval(fetchData, 45000)
     return () => clearInterval(interval)
-  }, [])
+  }, [fetchData])
   return (
     <section id="monitoring" className="py-20 px-4 sm:px-6 lg:px-8 relative scroll-mt-24 live-dashboard-section">
       <div className="absolute inset-0 bg-gradient-to-b from-slate-950/50 via-slate-900/30 to-black/80 pointer-events-none"></div>

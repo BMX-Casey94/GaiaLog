@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Prepare environment files
+        run: |
+          cp env.example .env
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate valid local WIFs for CI
+        run: |
+          node - <<'EOF' > .env.local
+          const { PrivateKey } = require('@bsv/sdk')
+          console.log(`BSV_WALLET_1_PRIVATE_KEY=${PrivateKey.fromRandom().toWif()}`)
+          console.log(`BSV_WALLET_2_PRIVATE_KEY=${PrivateKey.fromRandom().toWif()}`)
+          console.log(`BSV_WALLET_3_PRIVATE_KEY=${PrivateKey.fromRandom().toWif()}`)
+          console.log(`GAIALOG_OVERLAY_SERVER_IDENTITY_WIF=${PrivateKey.fromRandom().toWif()}`)
+          EOF
+
+      - name: Verify deployment docs and scripts
+        run: npm run verify:auto-init
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run production build
+        env:
+          CI: "true"
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run build

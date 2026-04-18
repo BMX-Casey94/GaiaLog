@@ -8,7 +8,10 @@ export interface OverlayAdmittedUtxoRow {
   vout: number
   satoshis: number
   output_script: string
-  raw_tx: string
+  // raw_tx and beef may be NULL for already-spent (removed=true) rows or for
+  // rows fetched via projections that omit them (see lib/utxo-inventory.ts
+  // acquireInventoryUtxo, which trims both for egress reasons).
+  raw_tx: string | null
   beef: unknown | null
   admitted_at: string
   confirmed: boolean
