@@ -29,6 +29,18 @@ function getPropagationGraceMs(): number {
   return Math.floor(raw)
 }
 
+// Per-transaction statement timeout for UTXO acquisition. The acquire query
+// targets a partial index and should complete in single-digit milliseconds.
+// If it ever takes longer (table bloat, stale stats, planner regression, lock
+// contention) we want it to fail fast and release the pool client so the
+// caller can fall through to the next wallet, rather than holding a connection
+// hostage for the full server-side statement_timeout (typically 60s on Supabase).
+function getAcquireStatementTimeoutMs(): number {
+  const raw = Number(process.env.BSV_UTXO_ACQUIRE_TIMEOUT_MS)
+  if (!Number.isFinite(raw) || raw < 100) return 5000
+  return Math.floor(raw)
+}
+
 export interface AcquireInventoryUtxoInput {
   walletIndex: number
   role: UtxoRole
@@ -142,11 +154,15 @@ async function acquireInventoryUtxo(client: PoolClient, input: AcquireInventoryU
 }
 
 export async function acquirePoolUtxo(input: Omit<AcquireInventoryUtxoInput, 'role'>): Promise<InventoryUtxo | null> {
-  return withOverlayTransaction(client => acquireInventoryUtxo(client, { ...input, role: 'pool' }))
+  return withOverlayTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = ${getAcquireStatementTimeoutMs()}`)
+    return acquireInventoryUtxo(client, { ...input, role: 'pool' })
+  })
 }
 
 export async function acquireReserveUtxo(input: Omit<AcquireInventoryUtxoInput, 'role'>): Promise<InventoryUtxo | null> {
   return withOverlayTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = ${getAcquireStatementTimeoutMs()}`)
     const reserved = await acquireInventoryUtxo(client, { ...input, role: 'reserve', preferLargest: true })
     if (reserved) return reserved
     return acquireInventoryUtxo(client, { ...input, role: 'pool', preferLargest: true })
