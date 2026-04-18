@@ -38,6 +38,17 @@ curl -s http://localhost:3000/api/workers/status
 curl -s http://localhost:3000/api/throughput/status
 ```
 
+## Database diagnostics
+
+Lightweight read-only diagnostic helpers for verifying connectivity and row counts:
+
+```bash
+npm run db:health      # confirms the worker can reach Postgres
+npm run db:counts      # prints row counts for the main reading tables
+```
+
+Use these when a worker reports DB errors, after a Supabase pooler restart, or as a quick sanity check after running migrations.
+
 ## Quick diagnostic checklist
 
 1. confirm the rollout gate is what you expect
@@ -86,6 +97,8 @@ pm2 save
 ## Incident-only emergency DB-less mode
 
 This mode exists only for incidents where the normal DB-backed path is unavailable or exhausted.
+
+`scripts/emergency-utxo-manager.py` is the only non-Node component in the repository. It is a deliberately small, file-backed UTXO server intended to keep broadcasting alive when the database-backed inventory is unreachable. It is Python so it has no dependency on the same Node runtime, queue, or `pg` pool that may be the cause of the incident. Outside of incidents it should remain stopped.
 
 Enable it only temporarily:
 

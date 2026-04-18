@@ -18,6 +18,8 @@ yarn-error.log*
 .pnpm-debug.log*
 debug-*.log
 .cursor/debug-*.log
+# Catch-all for stray runtime logs (e.g. overlay.observe.log)
+*.log
 
 # env files
 .env*
@@ -25,6 +27,12 @@ debug-*.log
 
 # IDE / local
 .cursor/
+.vscode/
+.idea/
+
+# OS cruft
+.DS_Store
+Thumbs.db
 
 # Project-specific setup notes (contain Supabase project IDs)
 NEW_SUPABASE_SETUP.md
@@ -42,3 +50,8 @@ next-env.d.ts
 # explorer data (JSON index files)
 /data/*
 !/data/.gitkeep
+
+# Bulk provider data (e.g. OpenWeatherMap city.list.json — see scripts/seed-owm-stations.ts)
+city.list.json
+city.list.json.gz
+*.csv

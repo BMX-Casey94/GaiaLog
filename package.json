@@ -15,6 +15,8 @@
     "workers": "tsx scripts/run-workers.ts",
     "db:migrate": "tsx scripts/migrate.ts",
     "db:optimize": "tsx scripts/optimize-tx-log.ts",
+    "db:health": "tsx scripts/db-health.ts",
+    "db:counts": "tsx scripts/db-counts.ts",
     "load:test": "tsx scripts/load-test.ts",
     "test:auto-init": "tsx scripts/test-auto-init.ts",
     "verify:auto-init": "tsx scripts/verify-auto-init-setup.ts",

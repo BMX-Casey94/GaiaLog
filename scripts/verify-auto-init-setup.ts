@@ -45,6 +45,51 @@ function checkFileMissing(filePath: string, description: string): boolean {
   return missing
 }
 
+/**
+ * Validate that vercel.json contains only the supported read-side cron paths
+ * and never reintroduces the retired worker-cron model.
+ */
+function checkVercelConfig(): boolean {
+  const filePath = 'vercel.json'
+  const fullPath = path.join(ROOT, filePath)
+
+  if (!fs.existsSync(fullPath)) {
+    results.push({
+      name: 'Vercel config present',
+      passed: true,
+      message: `OK: ${filePath} is absent (no Vercel-side crons)`,
+    })
+    return true
+  }
+
+  let parsed: { crons?: Array<{ path?: string; schedule?: string }> } = {}
+  try {
+    parsed = JSON.parse(fs.readFileSync(fullPath, 'utf-8'))
+  } catch (err) {
+    results.push({
+      name: 'Vercel config parses',
+      passed: false,
+      message: `Failed to parse ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+    })
+    return false
+  }
+
+  const crons = Array.isArray(parsed.crons) ? parsed.crons : []
+  const allowedPaths = new Set(['/api/maintenance/retention'])
+  const disallowed = crons.filter((c) => !c.path || !allowedPaths.has(c.path))
+
+  results.push({
+    name: 'Vercel config restricted to retention cron',
+    passed: disallowed.length === 0,
+    message:
+      disallowed.length === 0
+        ? `OK: ${filePath} only schedules the retention cron`
+        : `Disallowed cron paths in ${filePath}: ${disallowed.map((c) => c.path ?? '(no path)').join(', ')}`,
+  })
+
+  return disallowed.length === 0
+}
+
 function checkFileContains(filePath: string, searchString: string, description: string): boolean {
   const fullPath = path.join(ROOT, filePath)
 
@@ -92,7 +137,7 @@ async function verifySetup() {
   checkFile('docs/deployment.md', 'Deployment guide')
   checkFile('docs/getting-started.md', 'Getting started guide')
   checkFile('docs/operations-and-runbooks.md', 'Operations runbook')
-  checkFileMissing('vercel.json', 'Retired Vercel worker cron')
+  checkVercelConfig()
 
   console.log('\nDocumentation alignment:')
   checkFileContains('docs/deployment.md', 'Vercel', 'Deployment guide references Vercel')

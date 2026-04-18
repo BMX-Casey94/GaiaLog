@@ -1,7 +1,24 @@
 #!/usr/bin/env tsx
+/**
+ * Seed the `stations` table with the OpenWeatherMap city list.
+ *
+ * The OWM city list is a large (~30 MB) bulk dataset that we intentionally do
+ * not commit. Download it once and place the file at `data/city.list.json`
+ * (or pass an explicit path as the first argument).
+ *
+ * Source:
+ *   https://bulk.openweathermap.org/sample/city.list.json.gz
+ *
+ * Usage:
+ *   curl -L https://bulk.openweathermap.org/sample/city.list.json.gz -o data/city.list.json.gz
+ *   gunzip data/city.list.json.gz
+ *   npx tsx scripts/seed-owm-stations.ts
+ *
+ * Optional explicit path:
+ *   npx tsx scripts/seed-owm-stations.ts /path/to/city.list.json
+ */
 import { config } from 'dotenv'
 import { resolve } from 'path'
-// Load .env.local explicitly (dotenv/config only loads .env by default)
 config({ path: resolve(process.cwd(), '.env.local') })
 
 import fs from 'fs'
@@ -10,9 +27,12 @@ import { upsertStation } from '@/lib/repositories'
 import { dbPool } from '@/lib/db'
 
 async function main() {
-  const filePath = process.argv[2] || path.resolve(process.cwd(), 'app', 'api', 'data', 'city.list.json')
+  const filePath = process.argv[2] || path.resolve(process.cwd(), 'data', 'city.list.json')
   if (!fs.existsSync(filePath)) {
     console.error(`File not found: ${filePath}`)
+    console.error(`\nDownload the OWM city list from:`)
+    console.error(`  https://bulk.openweathermap.org/sample/city.list.json.gz`)
+    console.error(`Then place it at data/city.list.json (gunzip first) or pass an explicit path.`)
     process.exit(1)
   }
   console.log(`Seeding OWM stations from: ${filePath}`)

@@ -5,7 +5,6 @@ import { BlockchainExplorer } from "@/components/sections/blockchain-explorer"
 import { DataSources } from "@/components/sections/data-sources"
 import { HowItWorks } from "@/components/sections/how-it-works"
 import { Footer } from "@/components/sections/footer"
-// Removed BlockchainTest
 
 export default function HomePage() {
   return (
@@ -16,7 +15,6 @@ export default function HomePage() {
       <BlockchainExplorer />
       <DataSources />
       <HowItWorks />
-      {/* BlockchainTest section removed */}
       <Footer />
     </div>
   )
