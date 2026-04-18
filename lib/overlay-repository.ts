@@ -254,12 +254,43 @@ function buildLookupWhere(queryInput: OverlayLookupQuery): { whereSql: string; p
   }
 }
 
-export async function countLookupOutputs(queryInput: OverlayLookupQuery): Promise<number> {
+// Cap the count scan so a single hot-path lookup can't pin a pool client for
+// seconds when the table has lots of physical rows. The queue gate
+// (lib/worker-queue.ts) and the inventory replenisher only need to know
+// "≥ pauseMin spendable?" — an exact total over hundreds of thousands of rows
+// is wasteful and was the dominant source of `IO/DataFileRead` waits that
+// blocked broadcasts. Callers that genuinely need an exact total (rare; only
+// external paginated UIs) can pass `exactCount: true`.
+const COUNT_LOOKUP_CAP = (() => {
+  const raw = Number(process.env.OVERLAY_COUNT_LOOKUP_CAP)
+  if (!Number.isFinite(raw) || raw < 1) return 1000
+  return Math.floor(raw)
+})()
+
+export async function countLookupOutputs(
+  queryInput: OverlayLookupQuery,
+  options: { exact?: boolean } = {},
+): Promise<number> {
   const { whereSql, params } = buildLookupWhere(queryInput)
+  if (options.exact === true) {
+    const res = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+         FROM overlay_admitted_utxos u
+        WHERE ${whereSql}`,
+      params,
+    )
+    return Number(res.rows[0]?.count || '0')
+  }
+  // Bounded count: short-circuits as soon as the cap is reached. Returns the
+  // true count when below the cap, or the cap value when at/above it.
   const res = await query<{ count: string }>(
     `SELECT COUNT(*)::text AS count
-       FROM overlay_admitted_utxos u
-      WHERE ${whereSql}`,
+       FROM (
+         SELECT 1
+           FROM overlay_admitted_utxos u
+          WHERE ${whereSql}
+          LIMIT ${COUNT_LOOKUP_CAP}
+       ) bounded`,
     params,
   )
   return Number(res.rows[0]?.count || '0')
