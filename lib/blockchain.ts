@@ -1385,7 +1385,15 @@ export class BlockchainService {
         acceptedTxid = txid
       } catch (innerErr) {
         if (inventoryBacked) {
-          await releaseUtxo(acquiredUtxo.topic, acquiredUtxo.txid, acquiredUtxo.vout)
+          // Cooldown so a UTXO whose broadcast just failed (commonly ARC 460
+          // "parent transaction not found" in chain-of-unconfirmed conditions)
+          // is not instantly re-acquired by the next worker and rejected for
+          // the same reason. Reuses the propagation-grace window by default.
+          const cooldownMs = (() => {
+            const raw = Number(process.env.BSV_PROPAGATION_GRACE_MS)
+            return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 2500
+          })()
+          await releaseUtxo(acquiredUtxo.topic, acquiredUtxo.txid, acquiredUtxo.vout, { cooldownMs })
         } else {
           this.releaseUtxos([acquiredUtxoKey])
         }

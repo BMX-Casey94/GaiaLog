@@ -17,6 +17,18 @@ export interface InventoryUtxo extends OverlayAdmittedUtxoRow {
   locked_at: string | null
 }
 
+// Propagation grace: a freshly admitted change/split output stays invisible to
+// acquireInventoryUtxo for this many milliseconds, giving the parent transaction
+// time to reach every ARC relay before a child tx can spend its change. Default
+// 2500ms comfortably exceeds typical ARC response latency (~5s in observed
+// production) minus the in-process work that follows admission. Set to 0 to
+// disable (debug only — re-enables the historical 460 race).
+function getPropagationGraceMs(): number {
+  const raw = Number(process.env.BSV_PROPAGATION_GRACE_MS)
+  if (!Number.isFinite(raw) || raw < 0) return 2500
+  return Math.floor(raw)
+}
+
 export interface AcquireInventoryUtxoInput {
   walletIndex: number
   role: UtxoRole
@@ -93,6 +105,7 @@ async function acquireInventoryUtxo(client: PoolClient, input: AcquireInventoryU
           AND locked = false
           AND satoshis >= $3
           AND ($4::boolean = false OR confirmed = true)
+          AND acquirable_at <= now()
         ORDER BY satoshis ${preferLargest ? 'DESC' : 'ASC'}, admitted_at ASC, txid ASC, vout ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
@@ -132,21 +145,57 @@ export async function acquireReserveUtxo(input: Omit<AcquireInventoryUtxoInput, 
   })
 }
 
-export async function releaseUtxo(topic: string, txid: string, vout: number, lockedBy?: string): Promise<void> {
-  const owner = lockedBy || getLockOwnerId()
+export interface ReleaseUtxoOptions {
+  lockedBy?: string
+  // When set, push acquirable_at forward by this many milliseconds so the
+  // UTXO is not immediately re-grabbed. Use after a broadcast failure where
+  // the failure mode (e.g. ARC 460 parent-not-found) is likely to recur if
+  // the same input is retried straight away.
+  cooldownMs?: number
+}
+
+export async function releaseUtxo(
+  topic: string,
+  txid: string,
+  vout: number,
+  optionsOrLockedBy?: ReleaseUtxoOptions | string,
+): Promise<void> {
+  const opts: ReleaseUtxoOptions = typeof optionsOrLockedBy === 'string'
+    ? { lockedBy: optionsOrLockedBy }
+    : (optionsOrLockedBy || {})
+  const owner = opts.lockedBy || getLockOwnerId()
+  const cooldownMs = Number.isFinite(opts.cooldownMs as number) && (opts.cooldownMs as number) > 0
+    ? Math.floor(opts.cooldownMs as number)
+    : 0
   await withOverlayTransaction(async (client) => {
-    await client.query(
-      `UPDATE overlay_admitted_utxos
-          SET locked = false,
-              locked_by = NULL,
-              locked_at = NULL
-        WHERE topic = $1
-          AND txid = $2
-          AND vout = $3
-          AND locked = true
-          AND ($4::text = '' OR locked_by = $4)`,
-      [topic, txid, vout, owner],
-    )
+    if (cooldownMs > 0) {
+      await client.query(
+        `UPDATE overlay_admitted_utxos
+            SET locked = false,
+                locked_by = NULL,
+                locked_at = NULL,
+                acquirable_at = GREATEST(acquirable_at, now() + ($5::bigint * interval '1 millisecond'))
+          WHERE topic = $1
+            AND txid = $2
+            AND vout = $3
+            AND locked = true
+            AND ($4::text = '' OR locked_by = $4)`,
+        [topic, txid, vout, owner, cooldownMs],
+      )
+    } else {
+      await client.query(
+        `UPDATE overlay_admitted_utxos
+            SET locked = false,
+                locked_by = NULL,
+                locked_at = NULL
+          WHERE topic = $1
+            AND txid = $2
+            AND vout = $3
+            AND locked = true
+            AND ($4::text = '' OR locked_by = $4)`,
+        [topic, txid, vout, owner],
+      )
+    }
   })
 }
 
@@ -175,12 +224,31 @@ export async function consumeAndAdmitChange(input: ConsumeAndAdmitChangeInput): 
 
     if (input.change && input.change.satoshis >= 0) {
       const admittedRole = input.change.utxoRole === 'reserve' ? 'reserve' : 'pool'
+      const graceMs = getPropagationGraceMs()
+      // Confirmed change (rare here — most change starts unconfirmed) bypasses
+      // the grace window: its parent is already in a block and propagated.
+      const acquirableAtSql = (input.change.confirmed === true || graceMs === 0)
+        ? 'now()'
+        : `now() + ($10::bigint * interval '1 millisecond')`
+      const params: any[] = [
+        input.topic,
+        input.spendingTxid,
+        input.change.vout,
+        input.change.satoshis,
+        input.change.outputScript,
+        input.rawTx,
+        input.change.confirmed === true,
+        input.walletIndex,
+        admittedRole,
+      ]
+      if (input.change.confirmed !== true && graceMs > 0) params.push(graceMs)
       await client.query(
         `INSERT INTO overlay_admitted_utxos (
            topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed,
-           wallet_index, utxo_role, locked, locked_by, locked_at, removed, removed_at, spending_txid
+           wallet_index, utxo_role, locked, locked_by, locked_at, removed, removed_at, spending_txid,
+           acquirable_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, false, NULL, NULL, false, NULL, NULL)
+         VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, false, NULL, NULL, false, NULL, NULL, ${acquirableAtSql})
          ON CONFLICT (topic, txid, vout) DO UPDATE SET
            satoshis = EXCLUDED.satoshis,
            output_script = EXCLUDED.output_script,
@@ -193,18 +261,9 @@ export async function consumeAndAdmitChange(input: ConsumeAndAdmitChangeInput): 
            spending_txid = NULL,
            locked = false,
            locked_by = NULL,
-           locked_at = NULL`,
-        [
-          input.topic,
-          input.spendingTxid,
-          input.change.vout,
-          input.change.satoshis,
-          input.change.outputScript,
-          input.rawTx,
-          input.change.confirmed === true,
-          input.walletIndex,
-          admittedRole,
-        ],
+           locked_at = NULL,
+           acquirable_at = EXCLUDED.acquirable_at`,
+        params,
       )
       delta += 1
     }
@@ -234,14 +293,31 @@ export async function admitSplitOutputs(input: AdmitSplitOutputsInput): Promise<
       throw new Error(`Inventory UTXO ${input.spentTxid}:${input.spentVout} was not available for split admission`)
     }
 
+    const graceMs = getPropagationGraceMs()
     for (const output of input.outputs.filter(candidate => candidate.satoshis >= 0)) {
       const admittedRole = output.utxoRole === 'reserve' ? 'reserve' : 'pool'
+      const acquirableAtSql = (output.confirmed === true || graceMs === 0)
+        ? 'now()'
+        : `now() + ($10::bigint * interval '1 millisecond')`
+      const params: any[] = [
+        input.topic,
+        input.spendingTxid,
+        output.vout,
+        output.satoshis,
+        output.outputScript,
+        input.rawTx,
+        output.confirmed === true,
+        input.walletIndex,
+        admittedRole,
+      ]
+      if (output.confirmed !== true && graceMs > 0) params.push(graceMs)
       await client.query(
         `INSERT INTO overlay_admitted_utxos (
            topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed,
-           wallet_index, utxo_role, locked, locked_by, locked_at, removed, removed_at, spending_txid
+           wallet_index, utxo_role, locked, locked_by, locked_at, removed, removed_at, spending_txid,
+           acquirable_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, false, NULL, NULL, false, NULL, NULL)
+         VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, false, NULL, NULL, false, NULL, NULL, ${acquirableAtSql})
          ON CONFLICT (topic, txid, vout) DO UPDATE SET
            satoshis = EXCLUDED.satoshis,
            output_script = EXCLUDED.output_script,
@@ -254,18 +330,9 @@ export async function admitSplitOutputs(input: AdmitSplitOutputsInput): Promise<
            spending_txid = NULL,
            locked = false,
            locked_by = NULL,
-           locked_at = NULL`,
-        [
-          input.topic,
-          input.spendingTxid,
-          output.vout,
-          output.satoshis,
-          output.outputScript,
-          input.rawTx,
-          output.confirmed === true,
-          input.walletIndex,
-          admittedRole,
-        ],
+           locked_at = NULL,
+           acquirable_at = EXCLUDED.acquirable_at`,
+        params,
       )
     }
   })

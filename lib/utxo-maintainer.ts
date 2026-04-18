@@ -290,7 +290,14 @@ async function doSplit(
     return { txid, address, outputs: outputCount }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout)
+    // Cooldown matches the propagation-grace default so a split that just failed
+    // its broadcast is not re-acquired by the next maintainer pass before its
+    // parent (or its rejection) has settled across relays.
+    const cooldownMs = (() => {
+      const raw = Number(process.env.BSV_PROPAGATION_GRACE_MS)
+      return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 2500
+    })()
+    await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout, { cooldownMs })
     if (msg.includes('MEMPOOL_CHAIN_LIMIT')) {
       // Backoff this wallet for 10 minutes (wait for block)
       maintState.mempoolBackoffUntil.set(address, Date.now() + 10 * 60 * 1000)
