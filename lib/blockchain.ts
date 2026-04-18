@@ -86,10 +86,13 @@ const WOC_NETWORK = (process.env.BSV_NETWORK === 'mainnet') ? 'main' : 'test'
 // Broadcasting endpoints: GorillaPool ARC (primary) → TAAL ARC (fallback)
 const GORILLAPOOL_ARC_ENDPOINT = (process.env.BSV_GORILLAPOOL_ARC_ENDPOINT || 'https://arc.gorillapool.io').replace(/\/$/, '')
 const TAAL_ARC_ENDPOINT = (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com').replace(/\/$/, '')
-// GorillaPool/TAAL ARC minimum: 100 sat/kB (0.1 sat/byte)
-// Default to 0.105 sat/byte (105 sat/kB) — 5% margin above ARC floor
-const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.105)
-// BSV has no dust limit — 1 sat is the minimum viable output
+// GorillaPool/TAAL ARC policy floor: ~100 sat/kB.
+// Operator standard: 0.1025 sat/byte (102.5 sat/kB) — 2.5% margin above ARC floor.
+// This thin margin is only safe in combination with:
+//   (a) deterministic explicit-fee build (no dust-burn fallback) — see buildSignedTransaction
+//   (b) INPUT_SIGNED = 149 conservative size estimate (absorbs ECDSA signature variance)
+const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.1025)
+// BSV has no protocol-enforced dust limit (unlike BTC's 546). 1 sat is the minimum viable output.
 const DUST_LIMIT = 1
 // UTXO spend policy: default allows all UTXOs (including unconfirmed).
 // Protection against long unconfirmed chains is handled architecturally:
@@ -1243,8 +1246,10 @@ export class BlockchainService {
       const opReturnScript = (bsv as any).Script.fromHex(scriptHex)
       const opReturnBytes = scriptHex.length / 2
       const opReturnOutputSats = useTrueReturn ? 1 : 0
-      const BASE_WITH_CHANGE = 44 // version + locktime + varints + P2PKH change output
-      const INPUT_SIGNED = 148 // signed P2PKH input with scriptSig
+      // Deterministic size constants. We always emit a P2PKH change output (BSV has no
+      // dust limit), so the change-output bytes are always present.
+      const BASE_WITH_CHANGE = 44 // version (4) + locktime (4) + in-count varint (1) + out-count varint (1) + P2PKH change output (34)
+      const INPUT_SIGNED = 149 // worst-case signed P2PKH input (32 txid + 4 vout + 1 scriptLen + ~108 sig+pubkey + 4 sequence). 149 absorbs high-S signature variance.
 
       const estimateExplicitFee = (inputCount: number, feeMultiplier: number): { estimatedSize: number; explicitFee: number } => {
         const opReturnOutputEnvelope = 8 + (opReturnBytes < 253 ? 1 : 3)
@@ -1253,9 +1258,11 @@ export class BlockchainService {
         return { estimatedSize, explicitFee }
       }
       const { explicitFee: singleInputExplicitFee } = estimateExplicitFee(1, 1)
+      // 1.2x safety multiplier on the per-tx minimum stops the acquire layer from handing us
+      // a UTXO so close to threshold that signature variance pushes us under ARC's floor.
       const minInputSatoshis = Math.max(
         UTXO_POOL_MIN_SATS,
-        opReturnOutputSats + singleInputExplicitFee + DUST_LIMIT,
+        Math.ceil((opReturnOutputSats + singleInputExplicitFee + DUST_LIMIT) * 1.2),
       )
 
       const walletLookupStartedAt = Date.now()
@@ -1287,9 +1294,12 @@ export class BlockchainService {
       }]
 
       // Create transaction using explicit fee. bsv's feePerKb uses _estimateSize()
-      // which runs BEFORE signing — input scriptSigs grow from ~40 to ~148 bytes,
-      // so the library underestimates size and we end up with ~22 sat/kB instead of 105.
-      // We estimate size ourselves: signed P2PKH input=148 bytes, op_return known.
+      // which runs BEFORE signing — input scriptSigs grow from ~40 to ~149 bytes,
+      // so the library underestimates size and we end up with ~22 sat/kB instead of 102.5.
+      // We estimate size ourselves: signed P2PKH input=149 bytes, op_return known.
+      // BSV has no dust limit (unlike BTC's 546), so we ALWAYS emit a change output
+      // and pay exactly explicitFee — fee becomes deterministic and clears ARC's policy
+      // floor (~100 sat/kB) every time at our 102.5 sat/kB rate.
       const buildSignedTransaction = (feeMultiplier: number): {
         serialized: string
         changeOutput: { vout: number; satoshis: number; outputScript: string } | null
@@ -1298,23 +1308,18 @@ export class BlockchainService {
         const { explicitFee } = estimateExplicitFee(numInputs, feeMultiplier)
         const inputSats = bitcoreUtxos.reduce((s: number, u: any) => s + (u.satoshis || 0), 0)
         const availableForFee = inputSats - opReturnOutputSats
-        if (availableForFee < explicitFee) {
-          throw new Error(`Selected inputs do not cover explicit fee: available=${availableForFee} explicitFee=${explicitFee}`)
+        if (availableForFee < explicitFee + DUST_LIMIT) {
+          throw new Error(`Selected inputs do not cover explicit fee + 1 sat change: input=${inputSats} explicitFee=${explicitFee} (need at least ${explicitFee + opReturnOutputSats + DUST_LIMIT})`)
         }
-        const dustAmount = Number((bsv as any).Transaction?.DUST_AMOUNT ?? 546)
-        const changeSats = availableForFee - explicitFee
-        const useChangeOutput = changeSats >= dustAmount
-        const feeToUse = useChangeOutput ? explicitFee : availableForFee
-        let tx = new (bsv as any).Transaction()
+        // BSV has no dust limit; always emit a change output so fee = explicitFee deterministically.
+        const tx = new (bsv as any).Transaction()
           .from(bitcoreUtxos)
           .addOutput(new bsv.Transaction.Output({
             script: opReturnScript,
             satoshis: opReturnOutputSats,
           }))
-          .fee(feeToUse)
-        if (useChangeOutput) {
-          tx = tx.change(address)
-        }
+          .fee(explicitFee)
+          .change(address)
         const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
         tx.sign(signingKey)
         const serialized = tx.serialize()
@@ -2460,12 +2465,16 @@ export class BlockchainService {
         ? (bsv.Script as any).fromAddress(fromAddress).toHex()
         : this.p2pkhLockingScriptHexFromWif((this.wallet as any)['wif'])
 
+      // Explicit-fee build (avoids bsv's pre-sign _estimateSize underestimate which would
+      // produce ~22 sat/kB actual rate vs our 102.5 sat/kB target).
+      // Size formula: BASE 12 + N inputs × 149 + 2 P2PKH outputs (recipient + change) × 34 = 88 + 149N
+      const SEND_BASE_BYTES = 12 // version + locktime + in-count + out-count varints
+      const SEND_INPUT_BYTES = 149 // signed P2PKH input
+      const SEND_P2PKH_OUTPUT_BYTES = 34 // value (8) + scriptLen (1) + P2PKH script (25)
+      const estimateSendBytes = (inputCount: number) => SEND_BASE_BYTES + inputCount * SEND_INPUT_BYTES + 2 * SEND_P2PKH_OUTPUT_BYTES
       const selected: any[] = []
       let totalInput = 0
-      const feePerKb = FEE_RATE_SAT_PER_BYTE * 1000
-      const baseOverhead = 200 // bytes rough baseline
-      const estimatedFee = Math.ceil(baseOverhead * FEE_RATE_SAT_PER_BYTE)
-      const target = amountSats + estimatedFee + DUST_LIMIT
+      // Iteratively grow input set until inputs cover amount + the explicit fee for that input count.
       for (const u of sorted) {
         selected.push({
           txId: u.tx_hash,
@@ -2475,16 +2484,18 @@ export class BlockchainService {
           satoshis: u.value,
         })
         totalInput += u.value
-        if (totalInput >= target) break
+        const explicitFeeForCount = Math.ceil(estimateSendBytes(selected.length) * FEE_RATE_SAT_PER_BYTE)
+        if (totalInput >= amountSats + explicitFeeForCount + DUST_LIMIT) break
       }
-      if (totalInput < target) {
-        throw new Error('Insufficient UTXO value for requested amount + fee')
+      const explicitFee = Math.ceil(estimateSendBytes(selected.length) * FEE_RATE_SAT_PER_BYTE)
+      if (totalInput < amountSats + explicitFee + DUST_LIMIT) {
+        throw new Error(`Insufficient UTXO value for requested amount + fee: input=${totalInput} need>=${amountSats + explicitFee + DUST_LIMIT}`)
       }
 
       const tx = new (bsv as any).Transaction()
         .from(selected)
         .to(toAddress, amountSats)
-        .feePerKb(Math.ceil(feePerKb))
+        .fee(explicitFee)
         .change(fromAddress)
 
       const signingKey = (bsv as any).PrivateKey.fromWIF((this.wallet as any)['wif'])

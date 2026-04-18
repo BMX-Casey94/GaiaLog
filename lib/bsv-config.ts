@@ -46,7 +46,8 @@ export const bsvConfig: BSVConfig = {
     alertThreshold: parseInt(process.env.BSV_ALERT_BALANCE_THRESHOLD || '5000000'),
   },
   transaction: {
-    feeRate: parseFloat(process.env.BSV_TX_FEE_RATE || '0.15'),
+    // Operator standard 0.1025 sat/byte (102.5 sat/kB) — 2.5% above ARC ~100 sat/kB floor.
+    feeRate: parseFloat(process.env.BSV_TX_FEE_RATE || '0.1025'),
     maxRetries: parseInt(process.env.BSV_MAX_TX_RETRIES || '3'),
     retryDelayMs: parseInt(process.env.BSV_RETRY_DELAY_MS || '1000'),
   },

@@ -1,7 +1,7 @@
 // Safe UTXO splitter (dry-run by default)
 // Usage examples:
-//   pnpm split:utxos -- --wallet 0 --outputs 200 --amount 2000 --dry-run
-//   pnpm split:utxos -- --wallet 0 --outputs 200 --amount 2000
+//   npm run split:utxos -- --wallet 0 --outputs 200 --amount 2000 --dry-run
+//   npm run split:utxos -- --wallet 0 --outputs 200 --amount 2000
 //
 // Env: loads `.env` then `.env.local` (local overrides). Set BSV_* keys on the VPS `.env`.
 // UTXO source: shared `getUnspentForAddress` (overlay when BSV_SPEND_SOURCE_MODE=overlay, else WoC).
@@ -16,12 +16,19 @@ import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
 import { getUnspentForAddress } from '../lib/utxo-provider'
 import { broadcastSplitTransactionRaw } from '../lib/broadcast-raw-tx'
 
-/** Default aligns with ARC-style floor + small margin (~0.105 sat/byte); override via BSV_TX_FEE_RATE_SAT_PER_BYTE or BSV_TX_FEE_RATE */
+/** Operator standard 0.1025 sat/byte (102.5 sat/kB). Override via BSV_TX_FEE_RATE_SAT_PER_BYTE or BSV_TX_FEE_RATE. */
 const FEE_RATE_SAT_PER_BYTE = Number(
-  process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE ?? '0.105',
+  process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE ?? '0.1025',
 )
-// BSV has no protocol-enforced dust limit — 1 sat is the minimum viable output
+// BSV has no protocol-enforced dust limit (unlike BTC's 546). 1 sat is the minimum viable output.
 const DUST_LIMIT = 1
+// Conservative size constants — must match lib/blockchain.ts and lib/utxo-maintainer.ts.
+const SPLIT_INPUT_BYTES = 149
+const SPLIT_P2PKH_OUTPUT_BYTES = 34
+const SPLIT_BASE_BYTES = 12
+function estimateSplitBytes(outputCount: number): number {
+  return SPLIT_BASE_BYTES + SPLIT_INPUT_BYTES + (outputCount + 1) * SPLIT_P2PKH_OUTPUT_BYTES
+}
 
 type Args = {
   wallet: number
@@ -85,7 +92,7 @@ async function main() {
   const largest = utxos.slice().sort((a: any, b: any) => (b.value || 0) - (a.value || 0))[0]
 
   const targetTotal = outputs * amount
-  const estimatedBytes = 300 + outputs * 40
+  const estimatedBytes = estimateSplitBytes(outputs)
   const estimatedFee = Math.ceil(estimatedBytes * FEE_RATE_SAT_PER_BYTE)
   const required = targetTotal + estimatedFee + DUST_LIMIT
   if (largest.value < required) {
@@ -114,7 +121,8 @@ async function main() {
   for (let i = 0; i < outputs; i++) {
     tx.to(address, amount)
   }
-  tx.change(address).feePerKb(FEE_RATE_SAT_PER_BYTE * 1000)
+  // Explicit fee — never tx.feePerKb(), which under-estimates pre-sign size by ~5x.
+  tx.fee(estimatedFee).change(address)
   const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
   tx.sign(signingKey)
 

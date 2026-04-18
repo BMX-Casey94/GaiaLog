@@ -27,11 +27,26 @@ const SPLIT_BATCH = Number(process.env.BSV_UTXO_SPLIT_BATCH || Math.min(SPLIT_BA
 const SPLIT_OUTPUT_SATS = Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 2000)
 const MIN_CONF = getMaintainerMinConfirmations()
 const INTERVAL_MS = Number(process.env.BSV_UTXO_MAINTAINER_INTERVAL_MS || 30000) // 30s for high-throughput
-// GorillaPool/TAAL ARC minimum: 100 sat/kB. Default 0.105 sat/byte (105 sat/kB) for 5% margin.
-const FEE_RATE = Number((process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE) || 0.105)
+// GorillaPool/TAAL ARC policy floor: ~100 sat/kB. Operator standard 0.1025 sat/byte (102.5 sat/kB).
+// Margin is thin (2.5%); reliability requires deterministic explicit-fee builds — never tx.feePerKb().
+const FEE_RATE = Number((process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE) || 0.1025)
 const SPLIT_FEE_RATE = Number(process.env.BSV_UTXO_SPLIT_FEE_RATE_SAT_PER_BYTE || FEE_RATE)
-// BSV has no protocol-enforced dust limit (unlike BTC). 1 sat is the minimum viable output.
+// BSV has no protocol-enforced dust limit (unlike BTC's 546). 1 sat is the minimum viable output.
 const DUST_LIMIT = 1
+// Conservative size constants (must match data-write path in lib/blockchain.ts):
+//   signed P2PKH input = 149 bytes (worst-case; absorbs high-S signature variance)
+//   P2PKH output       = 34 bytes (8 value + 1 scriptLen + 25 script)
+//   tx envelope        = 12 bytes (4 version + 4 locktime + ≤3 in-count varint + ≤3 out-count varint)
+const SPLIT_INPUT_BYTES = 149
+const SPLIT_P2PKH_OUTPUT_BYTES = 34
+const SPLIT_BASE_BYTES = 12
+function estimateSplitBytes(outputCount: number): number {
+  // outputs (split) + 1 change output = (outputCount + 1) × 34
+  return SPLIT_BASE_BYTES + SPLIT_INPUT_BYTES + (outputCount + 1) * SPLIT_P2PKH_OUTPUT_BYTES
+}
+function estimateSplitFee(outputCount: number): number {
+  return Math.ceil(estimateSplitBytes(outputCount) * SPLIT_FEE_RATE)
+}
 // Dynamic split cooldown:
 // ensure split production can keep pace with expected per-wallet TX throughput.
 const PER_WALLET_EXPECTED_TPS = EXPECTED_TX_PER_DAY / WALLET_COUNT / 86400
@@ -124,13 +139,16 @@ async function submitSplitToSpendSource(
 function estimateSplitRequirement(outputCount: number): number {
   const safeOutputs = Math.max(2, outputCount)
   const totalOut = safeOutputs * SPLIT_OUTPUT_SATS
-  const estBytes = 300 + safeOutputs * 40
-  const fee = Math.ceil(estBytes * SPLIT_FEE_RATE)
+  const fee = estimateSplitFee(safeOutputs)
   return totalOut + fee + DUST_LIMIT
 }
 
 function maxSplitOutputsForInput(inputSatoshis: number): number {
-  return Math.floor((inputSatoshis - 300 * SPLIT_FEE_RATE - DUST_LIMIT) / (SPLIT_OUTPUT_SATS + 40 * SPLIT_FEE_RATE))
+  // Solve: input ≥ N × SPLIT_OUTPUT_SATS + ceil((SPLIT_BASE + INPUT + (N+1) × OUTPUT) × FEE_RATE) + DUST_LIMIT
+  // Without ceiling: input ≥ N × (SPLIT_OUTPUT_SATS + OUTPUT × FEE_RATE) + (BASE + INPUT + OUTPUT) × FEE_RATE + DUST_LIMIT
+  const fixedOverhead = (SPLIT_BASE_BYTES + SPLIT_INPUT_BYTES + SPLIT_P2PKH_OUTPUT_BYTES) * SPLIT_FEE_RATE
+  const perOutputCost = SPLIT_OUTPUT_SATS + SPLIT_P2PKH_OUTPUT_BYTES * SPLIT_FEE_RATE
+  return Math.floor((inputSatoshis - fixedOverhead - DUST_LIMIT) / perOutputCost)
 }
 
 // ─── Core split logic ───────────────────────────────────────────────────────
@@ -210,9 +228,20 @@ async function doSplit(
     script: scriptHex,
     satoshis: Number(inputSource.satoshis),
   }
+  const inputSats = Number(inputSource.satoshis)
+  const explicitFee = estimateSplitFee(outputCount)
+  // Sanity: maxSplitOutputsForInput should already guarantee this; double-check defensively.
+  const minRequired = outputCount * SPLIT_OUTPUT_SATS + explicitFee + DUST_LIMIT
+  if (inputSats < minRequired) {
+    await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout)
+    console.warn(`⚠️ UTXO-Split: input ${inputSats} sats < required ${minRequired} (outputs=${outputCount}, fee=${explicitFee}); releasing`)
+    return null
+  }
   const tx = new (bsv as any).Transaction().from([input])
   for (let i = 0; i < outputCount; i++) tx.to(address, SPLIT_OUTPUT_SATS)
-  tx.feePerKb(Math.ceil(SPLIT_FEE_RATE * 1000)).change(address)
+  // Explicit fee — never tx.feePerKb(), which under-estimates pre-sign size by ~5x
+  // and produces ~22 sat/kB actual rate (cause of historical splitter ARC rejections).
+  tx.fee(explicitFee).change(address)
   const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
   tx.sign(signingKey)
   const raw = tx.serialize()
