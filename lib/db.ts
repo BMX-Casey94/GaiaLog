@@ -27,17 +27,21 @@ const resolvedPort =
     ? 6543
     : Number(process.env.PGPORT || 5432)
 
-// Build connection config explicitly to override environment variables
+// Build connection config explicitly to override environment variables.
+// All limits are tunable via env so we can adjust without redeploys.
 const connectionConfig = {
   host: pgHost,
   port: resolvedPort,
   user: process.env.PGUSER || 'postgres',
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE || 'gaialog',
-  max: Number(process.env.PGPOOL_MAX || 3),
+  max: Math.max(1, Number(process.env.PGPOOL_MAX || 10)),
   ssl: sslConfig,
-  connectionTimeoutMillis: 10000,
-  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: Math.max(1000, Number(process.env.PG_CONNECT_TIMEOUT_MS || 15000)),
+  idleTimeoutMillis: Math.max(1000, Number(process.env.PG_IDLE_TIMEOUT_MS || 30000)),
+  // Keep pooler-side sessions short and predictable; clients are short-lived in
+  // transaction mode so a tight statement timeout protects against runaway queries.
+  statement_timeout: Math.max(0, Number(process.env.PG_STATEMENT_TIMEOUT_MS || 0)) || undefined,
 }
 
 const shouldUseSSL = !!isSupabase
@@ -47,10 +51,45 @@ let poolInfoLogged = false
 
 const MAX_QUERY_RETRIES = Math.max(0, Number(process.env.PGQUERY_RETRIES || 2))
 const POOL_RETRY_BASE_MS = Math.max(100, Number(process.env.PGQUERY_RETRY_BASE_MS || 250))
-const POOL_EXHAUSTION_RE = /MaxClientsInSessionMode|too many clients|too many connections|remaining connection slots/i
+// Errors that are safe to retry: transient pool/connection issues that usually
+// resolve on the next attempt (idle client kicked by pooler, brief connection
+// timeout under load, TLS reset, etc.). Application-level errors (constraint
+// violations, syntax errors, etc.) are NOT included here.
+const POOL_EXHAUSTION_RE =
+  /MaxClientsInSessionMode|too many clients|too many connections|remaining connection slots|timeout exceeded when trying to connect|Connection terminated|ECONNRESET|ETIMEDOUT|EPIPE|DbHandler exited|server closed the connection unexpectedly/i
 
 // Keep the pool initialized so we can re-enable later without code churn.
 export const dbPool = new Pool(connectionConfig)
+
+// CRITICAL: Without this listener, an idle-client error (e.g. Supavisor
+// terminating an idle connection, "DbHandler exited", a transient TLS reset)
+// emits an 'error' event on the Pool that has no handler, causing Node to
+// crash the entire worker process with "Unhandled 'error' event". With the
+// listener attached, the bad client is dropped silently and the pool keeps
+// serving traffic through its other connections.
+let lastPoolErrorLogAt = 0
+let suppressedPoolErrorCount = 0
+const POOL_ERROR_LOG_INTERVAL_MS = Math.max(
+  1000,
+  Number(process.env.PG_POOL_ERROR_LOG_INTERVAL_MS || 30_000),
+)
+
+dbPool.on('error', (err) => {
+  const now = Date.now()
+  if (now - lastPoolErrorLogAt >= POOL_ERROR_LOG_INTERVAL_MS) {
+    const suppressedNote =
+      suppressedPoolErrorCount > 0
+        ? ` (+${suppressedPoolErrorCount} suppressed in last ${Math.round(POOL_ERROR_LOG_INTERVAL_MS / 1000)}s)`
+        : ''
+    console.error(
+      `🗄️  DB pool idle-client error (non-fatal, client dropped): ${err.message}${suppressedNote}`,
+    )
+    lastPoolErrorLogAt = now
+    suppressedPoolErrorCount = 0
+  } else {
+    suppressedPoolErrorCount += 1
+  }
+})
 
 // Drain pool on process exit so session-mode pooler connections are freed promptly
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
