@@ -322,17 +322,45 @@ export async function runRetention(opts?: { dryRun?: boolean }): Promise<Retenti
   }
 
   // ─ Spent-UTXO blob compaction ──────────────────────────────────────────────
+  // Batched: an unbounded UPDATE here exceeds Supabase's per-statement
+  // timeout once the spent-row backlog grows past a few hundred thousand
+  // rows.  Issuing N small UPDATEs of LIMIT batchSize keeps each statement
+  // well under the timeout and lets the job make incremental progress
+  // across multiple runs even if a single run is interrupted.  The
+  // RETENTION_MAX_UTXO_COMPACTIONS_PER_RUN cap (default 200_000 rows)
+  // bounds the total work per cron pass so a daily run finishes promptly
+  // even after the first big backlog has been chewed through manually
+  // via scripts/sql/compact-spent-utxos.sql.
   const utxoStarted = Date.now()
   let utxoCompacted = 0
   if (!dryRun) {
-    const utxoResult = await query(
-      `UPDATE overlay_admitted_utxos
-          SET raw_tx = NULL,
-              beef   = NULL
-        WHERE removed = true
-          AND (raw_tx IS NOT NULL OR beef IS NOT NULL)`,
-    )
-    utxoCompacted = utxoResult.rowCount ?? 0
+    const utxoBatchCap = envInt('RETENTION_MAX_UTXO_COMPACTIONS_PER_RUN', 200_000)
+    while (utxoCompacted < utxoBatchCap) {
+      const remaining = utxoBatchCap - utxoCompacted
+      const limit = Math.min(batchSize, remaining)
+
+      const utxoResult = await query(
+        `WITH batch AS (
+           SELECT topic, txid, vout
+             FROM overlay_admitted_utxos
+            WHERE removed = true
+              AND (raw_tx IS NOT NULL OR beef IS NOT NULL)
+            LIMIT $1
+         )
+         UPDATE overlay_admitted_utxos u
+            SET raw_tx = NULL,
+                beef   = NULL
+           FROM batch b
+          WHERE u.topic = b.topic
+            AND u.txid  = b.txid
+            AND u.vout  = b.vout`,
+        [limit],
+      )
+
+      const rowsThisBatch = utxoResult.rowCount ?? 0
+      utxoCompacted += rowsThisBatch
+      if (rowsThisBatch < limit) break
+    }
   }
 
   return {

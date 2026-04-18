@@ -198,27 +198,25 @@ CREATE INDEX IF NOT EXISTS oer_family_reading_ts_asc_idx
 -- dead weight (frequently 200-2000 bytes per row, dominating table size).
 -- The runtime path in lib/utxo-inventory.ts already guards against acquiring
 -- removed rows (WHERE removed = false), so allowing NULL on spent rows is
--- provably safe.  We relax the NOT NULL constraint *before* the bulk update
--- below — the original CREATE TABLE in 0010 made raw_tx NOT NULL.
+-- provably safe.
 
 ALTER TABLE overlay_admitted_utxos
   ALTER COLUMN raw_tx DROP NOT NULL;
 -- beef is already nullable in 0010, no change needed there.
 
--- ─── One-shot UTXO compaction ────────────────────────────────────────────────
--- Reclaims the bulk of the table's bytes for already-spent rows.  Future
--- spends will continue to write raw_tx into the new change row at admission
--- time; only rows that have transitioned to removed=true become eligible
--- for nulling, which the cron-driven retention job (lib/retention.ts) does
--- on every pass.
-
-UPDATE overlay_admitted_utxos
-   SET raw_tx = NULL,
-       beef   = NULL
- WHERE removed = true
-   AND (raw_tx IS NOT NULL OR beef IS NOT NULL);
-
--- Refresh planner stats after the bulk update so subsequent queries plan well.
-ANALYZE overlay_admitted_utxos;
+-- NOTE on one-shot compaction:
+-- An earlier draft of this migration ran a single UPDATE here to NULL out
+-- raw_tx / beef across every removed row.  On Supabase that update exceeds
+-- the per-statement timeout once the table grows past a few hundred thousand
+-- spent rows, which rolls back the entire migration.
+--
+-- Compaction is therefore handled out-of-band by:
+--   1. scripts/sql/compact-spent-utxos.sql  (one-shot, batched, run manually
+--      against Supabase to reclaim historical bytes after this migration is
+--      applied; uses a PROCEDURE with COMMIT between batches so each batch
+--      gets a fresh statement-timeout window).
+--   2. lib/retention.ts                     (per-cycle, batched LIMIT-N
+--      compaction inside the daily cron — keeps the table small forever
+--      without ever issuing an unbounded UPDATE).
 
 COMMIT;
