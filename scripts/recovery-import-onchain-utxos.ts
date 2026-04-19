@@ -396,23 +396,41 @@ async function main(): Promise<void> {
   const allStats: WalletRecoveryStats[] = []
 
   if (APPLY) {
-    // Use ONE dedicated client for the whole run so we can disable the
-    // per-row trigger that would otherwise full-scan the topic on every
-    // single inserted row (~85+ minutes on 169k inserts).
+    // Use ONE dedicated client for the whole run.
     //
-    // ALTER TABLE ... DISABLE TRIGGER takes an ACCESS EXCLUSIVE lock and
-    // affects all sessions. That is safe here because we have already
-    // verified the workers are stopped. The try/finally guarantees the
-    // trigger is re-enabled even if the script crashes mid-load.
+    // Migration 0013 dropped the per-row `trg_overlay_topic_counts_apply`
+    // trigger because it ran a full COUNT(*) on every mutation. We probe
+    // for it here so this script is correct on databases at any migration
+    // level: if it exists, we DISABLE it for the bulk load and re-enable
+    // in a try/finally; if it does not, we skip silently. Either way we
+    // call refresh_overlay_topic_counts(topic) explicitly at the end so
+    // the rollup remains accurate.
     const client = await dbPool.connect()
     let triggerDisabled = false
+    let triggerExists = false
     try {
-      console.log('')
-      console.log('Disabling overlay_topic_counts_apply trigger for bulk load…')
-      await client.query(
-        `ALTER TABLE overlay_admitted_utxos DISABLE TRIGGER trg_overlay_topic_counts_apply`,
+      const triggerProbe = await client.query<{ exists: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM pg_trigger
+            WHERE tgname = 'trg_overlay_topic_counts_apply'
+              AND tgrelid = 'overlay_admitted_utxos'::regclass
+              AND NOT tgisinternal
+         ) AS exists`,
       )
-      triggerDisabled = true
+      triggerExists = triggerProbe.rows[0]?.exists === true
+
+      console.log('')
+      if (triggerExists) {
+        console.log('Disabling overlay_topic_counts_apply trigger for bulk load…')
+        await client.query(
+          `ALTER TABLE overlay_admitted_utxos DISABLE TRIGGER trg_overlay_topic_counts_apply`,
+        )
+        triggerDisabled = true
+      } else {
+        console.log(
+          'Trigger trg_overlay_topic_counts_apply not present (dropped by migration 0013). Skipping disable step.',
+        )
+      }
 
       for (const wallet of WALLETS) {
         const stats = await recoverWallet(wallet, client)
