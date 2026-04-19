@@ -80,6 +80,7 @@ async function planResponse() {
     ),
     txLogEligible: plan.txLog.eligibleForDeletion,
     utxoBlobsEligible: plan.utxoCompaction.removedRowsWithBlobs,
+    utxoRowsEligibleForPrune: plan.utxoPrune.eligibleForDeletion,
   }
   return NextResponse.json({ success: true, mode: 'dry-run', totals, plan })
 }
@@ -90,6 +91,7 @@ async function runResponse() {
     readingsDeleted: result.families.reduce((acc, f) => acc + f.deleted, 0),
     txLogDeleted: result.txLog.deleted,
     utxoRowsCompacted: result.utxoCompaction.rowsCompacted,
+    utxoRowsPruned: result.utxoPrune.rowsDeleted,
   }
   return NextResponse.json({ success: true, mode: 'executed', totals, result })
 }

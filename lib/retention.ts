@@ -48,6 +48,15 @@ const DEFAULT_TX_LOG_RETENTION_DAYS = 30
 const DEFAULT_BATCH_SIZE = 5_000
 const DEFAULT_MAX_DELETES_PER_FAMILY = 250_000
 const DEFAULT_STATEMENT_TIMEOUT_MS = 60_000
+// Physically delete spent (removed=true) UTXO rows older than this window.
+// Compaction earlier in the run nulls out their raw_tx/beef blobs, but the
+// row tuples themselves remain and bloat the heap until VACUUM, eventually
+// causing seq scans + statement timeouts on the acquire query (we hit a
+// 5.4 GB heap with 2 M dead rows protecting just 194 k live ones in
+// 2026-04). A short retention window (default 3 days) keeps the table
+// compact while preserving recent rows for any forensic lookups.
+const DEFAULT_UTXO_PRUNE_DAYS = 3
+const DEFAULT_MAX_UTXO_PRUNES_PER_RUN = 500_000
 
 // ─── Configuration helpers ───────────────────────────────────────────────────
 
@@ -108,6 +117,11 @@ export interface RetentionPlan {
   }
   utxoCompaction: {
     removedRowsWithBlobs: number
+  }
+  utxoPrune: {
+    retentionDays: number
+    cutoffIso: string
+    eligibleForDeletion: number
   }
 }
 
@@ -179,6 +193,17 @@ export async function planRetention(): Promise<RetentionPlan> {
         AND (raw_tx IS NOT NULL OR beef IS NOT NULL)`,
   )
 
+  const utxoPruneDays = envInt('RETENTION_UTXO_PRUNE_DAYS', DEFAULT_UTXO_PRUNE_DAYS)
+  const utxoPruneCutoff = new Date(Date.now() - utxoPruneDays * 86_400_000)
+  const utxoPruneResult = await query<{ eligible: string }>(
+    `SELECT COUNT(*)::text AS eligible
+       FROM overlay_admitted_utxos
+      WHERE removed = true
+        AND removed_at IS NOT NULL
+        AND removed_at < $1`,
+    [utxoPruneCutoff],
+  )
+
   return {
     generatedAt: new Date().toISOString(),
     families: familyPlans,
@@ -189,6 +214,11 @@ export async function planRetention(): Promise<RetentionPlan> {
     },
     utxoCompaction: {
       removedRowsWithBlobs: Number(utxoResult.rows[0]?.blobs ?? 0),
+    },
+    utxoPrune: {
+      retentionDays: utxoPruneDays,
+      cutoffIso: utxoPruneCutoff.toISOString(),
+      eligibleForDeletion: Number(utxoPruneResult.rows[0]?.eligible ?? 0),
     },
   }
 }
@@ -218,6 +248,12 @@ export interface RetentionRunResult {
   utxoCompaction: {
     rowsCompacted: number
     durationMs: number
+  }
+  utxoPrune: {
+    retentionDays: number
+    rowsDeleted: number
+    durationMs: number
+    capped: boolean
   }
 }
 
@@ -363,6 +399,50 @@ export async function runRetention(opts?: { dryRun?: boolean }): Promise<Retenti
     }
   }
 
+  // ─ Spent-UTXO physical prune ───────────────────────────────────────────────
+  // After compaction has nulled the heavy blobs, physically delete spent
+  // rows older than the configured window so the heap stays small. Without
+  // this step PostgreSQL retains the (now-tiny) tuples indefinitely, which
+  // slowly bloats the table heap, defeats the partial indexes (every scan
+  // has to skip past dead rows), and eventually pushes the acquire query
+  // into seq-scan territory + statement timeouts. Batched + per-run capped
+  // so a single pass can never run away with the connection.
+  const utxoPruneDays = envInt('RETENTION_UTXO_PRUNE_DAYS', DEFAULT_UTXO_PRUNE_DAYS)
+  const utxoPruneCap = envInt('RETENTION_MAX_UTXO_PRUNES_PER_RUN', DEFAULT_MAX_UTXO_PRUNES_PER_RUN)
+  const utxoPruneCutoff = new Date(Date.now() - utxoPruneDays * 86_400_000)
+  const utxoPruneStarted = Date.now()
+  let utxoPruned = 0
+  let utxoPruneCapped = false
+
+  if (!dryRun && utxoPruneDays > 0) {
+    while (utxoPruned < utxoPruneCap) {
+      const remaining = utxoPruneCap - utxoPruned
+      const limit = Math.min(batchSize, remaining)
+
+      const pruneResult = await query(
+        `WITH eligible AS (
+           SELECT topic, txid, vout
+             FROM overlay_admitted_utxos
+            WHERE removed = true
+              AND removed_at IS NOT NULL
+              AND removed_at < $1
+            LIMIT $2
+         )
+         DELETE FROM overlay_admitted_utxos u
+           USING eligible e
+          WHERE u.topic = e.topic
+            AND u.txid  = e.txid
+            AND u.vout  = e.vout`,
+        [utxoPruneCutoff, limit],
+      )
+
+      const rowsThisBatch = pruneResult.rowCount ?? 0
+      utxoPruned += rowsThisBatch
+      if (rowsThisBatch < limit) break
+    }
+    utxoPruneCapped = utxoPruned >= utxoPruneCap
+  }
+
   return {
     startedAt: startedAt.toISOString(),
     finishedAt: new Date().toISOString(),
@@ -376,6 +456,12 @@ export async function runRetention(opts?: { dryRun?: boolean }): Promise<Retenti
     utxoCompaction: {
       rowsCompacted: utxoCompacted,
       durationMs: Date.now() - utxoStarted,
+    },
+    utxoPrune: {
+      retentionDays: utxoPruneDays,
+      rowsDeleted: utxoPruned,
+      durationMs: Date.now() - utxoPruneStarted,
+      capped: utxoPruneCapped,
     },
   }
 }

@@ -85,6 +85,26 @@ EXPLORER_READ_SOURCE=overlay
 EXPLORER_WRITE_MODE=overlay
 ```
 
+### `overlay_admitted_utxos` table bloat
+
+The nightly retention job at `/api/maintenance/retention` (Vercel Cron, 03:17 UTC) automatically:
+
+1. Compacts spent UTXO rows by nulling out their `raw_tx` and `beef` blobs.
+2. Physically deletes spent rows older than `RETENTION_UTXO_PRUNE_DAYS` (default `3`).
+
+Without step 2 the table heap grows unbounded even after compaction, and the acquire query eventually falls back to a sequential scan and times out. If you suspect bloat, check:
+
+```bash
+psql "$DATABASE_URL" -c "
+SELECT pg_size_pretty(pg_total_relation_size('overlay_admitted_utxos')) AS size,
+       COUNT(*) FILTER (WHERE removed = false) AS live_rows,
+       COUNT(*) FILTER (WHERE removed = true)  AS removed_rows
+  FROM overlay_admitted_utxos;
+"
+```
+
+A healthy table is < 500 MB with `removed_rows` only a few days' worth of activity. If `removed_rows` is in the millions, force a manual run with `curl -H 'x-gaialog-internal-secret: <secret>' https://<host>/api/maintenance/retention` and consider lowering `RETENTION_UTXO_PRUNE_DAYS`.
+
 ### Stale environment in PM2
 
 If `.env` is correct but runtime behaviour still looks old:
