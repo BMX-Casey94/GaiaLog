@@ -155,11 +155,11 @@ export function NavBar({ items, className }: NavBarProps) {
               key={item.name}
               href={item.url}
               onClick={(e) => {
-                setActiveTab(item.name)
                 // Smooth-scroll for in-page hash links on the home page,
                 // and route correctly back to home when clicked from other pages.
                 if (hash) {
                   e.preventDefault()
+                  setActiveTab(item.name)
                   suppressScrollSpyUntilRef.current = Date.now() + 900
 
                   if (pathname !== "/") {
@@ -176,7 +176,19 @@ export function NavBar({ items, className }: NavBarProps) {
                     // If the element isn't mounted yet, still update the URL.
                     history.replaceState(null, "", hash)
                   }
+                  return
                 }
+
+                // Real route (no `#`) — drive navigation explicitly via the
+                // router so it cannot race with React state updates or the
+                // framer-motion `layoutId="lamp"` shared-layout animation.
+                // Relying on <Link>'s default action here was observed to
+                // silently no-op in production builds when setActiveTab
+                // triggered a same-tick re-render.
+                e.preventDefault()
+                setActiveTab(item.name)
+                if (pathname === item.url) return
+                router.push(item.url)
               }}
               className={cn(
                 "relative cursor-pointer text-sm font-semibold px-4 sm:px-6 py-2 rounded-full transition-colors",
