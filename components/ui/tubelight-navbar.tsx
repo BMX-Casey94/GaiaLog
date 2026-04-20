@@ -179,16 +179,29 @@ export function NavBar({ items, className }: NavBarProps) {
                   return
                 }
 
-                // Real route (no `#`) — drive navigation explicitly via the
-                // router so it cannot race with React state updates or the
-                // framer-motion `layoutId="lamp"` shared-layout animation.
-                // Relying on <Link>'s default action here was observed to
-                // silently no-op in production builds when setActiveTab
-                // triggered a same-tick re-render.
-                e.preventDefault()
-                setActiveTab(item.name)
-                if (pathname === item.url) return
-                router.push(item.url)
+                // Real route (no `#`).
+                //
+                // We deliberately do NOT call `setActiveTab` here. The
+                // route-change effect (above) already updates the active tab
+                // when `pathname` changes, and calling it synchronously in
+                // the click handler caused two problems in production:
+                //   1) It re-rendered the navbar in the same tick that
+                //      `router.push` (a React transition) was kicked off,
+                //      and the resulting framer-motion `layoutId="lamp"`
+                //      layout measurement collided with the App Router
+                //      transition. The RSC payload was fetched but the URL
+                //      never committed — the tab "highlighted but stuck".
+                //   2) Even with the explicit `e.preventDefault()` +
+                //      `router.push(item.url)` workaround, the same
+                //      same-tick state update killed the transition.
+                //
+                // Letting `<Link>`'s native handler run (without preventing
+                // default and without our own state mutation) is the most
+                // reliable path: Next.js owns the transition end-to-end and
+                // the active-tab state catches up via the pathname effect.
+                if (pathname === item.url) {
+                  e.preventDefault()
+                }
               }}
               className={cn(
                 "relative cursor-pointer text-sm font-semibold px-4 sm:px-6 py-2 rounded-full transition-colors",
