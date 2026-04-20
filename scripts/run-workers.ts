@@ -13,6 +13,22 @@ if (process.env.NODE_ENV !== 'production') {
 
 applyPrimaryMutatorRole()
 
+// Belt-and-braces process-level safety nets. The fix for the actual root
+// cause (per-client pg error listeners) lives in lib/db.ts and
+// lib/overlay-repository.ts. These handlers are an additional guarantee that
+// any *future* missing-listener regression in this codebase or a third-party
+// dependency cannot trigger a silent PM2 crash loop. They DELIBERATELY do
+// not call process.exit — fail loud, keep running, let the existing graceful
+// shutdown path own termination.
+process.on('uncaughtException', (err) => {
+  const stack = err instanceof Error ? err.stack || err.message : String(err)
+  console.error(`🛡️  [uncaughtException] suppressed (worker continues): ${stack}`)
+})
+process.on('unhandledRejection', (reason) => {
+  const detail = reason instanceof Error ? reason.stack || reason.message : String(reason)
+  console.error(`🛡️  [unhandledRejection] suppressed (worker continues): ${detail}`)
+})
+
 console.log('🚀 Starting GaiaLog worker service...')
 // Log heap limit for debugging OOM (expect 8192 MB on workers)
 try {

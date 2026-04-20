@@ -42,6 +42,13 @@ const connectionConfig = {
   // Keep pooler-side sessions short and predictable; clients are short-lived in
   // transaction mode so a tight statement timeout protects against runaway queries.
   statement_timeout: Math.max(0, Number(process.env.PG_STATEMENT_TIMEOUT_MS || 0)) || undefined,
+  // TCP-level keepalives reduce the chance Supavisor silently reaps us as
+  // "idle". Enabled by default; tunable via env without a redeploy.
+  keepAlive: process.env.PG_TCP_KEEPALIVE !== 'false',
+  keepAliveInitialDelayMillis: Math.max(
+    1000,
+    Number(process.env.PG_TCP_KEEPALIVE_DELAY_MS || 10_000),
+  ),
 }
 
 const shouldUseSSL = !!isSupabase
@@ -91,6 +98,37 @@ dbPool.on('error', (err) => {
   }
 })
 
+// CRITICAL: pool.on('error') only catches errors on *idle* clients. Any
+// client checked out via dbPool.connect() is the caller's responsibility:
+// if Supavisor severs the TCP socket mid-query (common on transaction-mode
+// pooling, port 6543), the in-flight client.query() promise rejects AND the
+// underlying Connection emits an 'error' event on the Client object. Without
+// a per-client listener, Node's EventEmitter throws "Unhandled 'error' event"
+// and terminates the process, which manifests as a silent PM2 crash loop
+// (no app-level stack trace, no OOM signal). Use this helper for every
+// dbPool.connect() site so a stray disconnect becomes a logged warning
+// instead of a process crash.
+let lastClientErrorLogAt = 0
+let suppressedClientErrorCount = 0
+export function attachClientErrorHandler(client: PoolClient): void {
+  client.on('error', (err) => {
+    const now = Date.now()
+    if (now - lastClientErrorLogAt >= POOL_ERROR_LOG_INTERVAL_MS) {
+      const suppressedNote =
+        suppressedClientErrorCount > 0
+          ? ` (+${suppressedClientErrorCount} suppressed in last ${Math.round(POOL_ERROR_LOG_INTERVAL_MS / 1000)}s)`
+          : ''
+      console.error(
+        `🗄️  DB checked-out client error (non-fatal, client will be discarded): ${err.message}${suppressedNote}`,
+      )
+      lastClientErrorLogAt = now
+      suppressedClientErrorCount = 0
+    } else {
+      suppressedClientErrorCount += 1
+    }
+  })
+}
+
 // Drain pool on process exit so session-mode pooler connections are freed promptly
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
@@ -131,8 +169,10 @@ export async function query<T extends PgQueryResultRow = any>(text: string, para
   let lastError: unknown = null
   for (let attempt = 0; attempt <= MAX_QUERY_RETRIES; attempt++) {
     let client: PoolClient | null = null
+    let clientError: Error | null = null
     try {
       client = await dbPool.connect()
+      attachClientErrorHandler(client)
       const res = await client.query<T>(text, params)
       return {
         rows: res.rows,
@@ -141,13 +181,21 @@ export async function query<T extends PgQueryResultRow = any>(text: string, para
       }
     } catch (error) {
       lastError = error
+      // Tag the client for destruction on release if this was a connection-level
+      // failure. Returning a half-broken client to the pool causes the next
+      // caller to inherit the same crash.
+      if (error instanceof Error && shouldRetryDbError(error)) {
+        clientError = error
+      }
       if (attempt < MAX_QUERY_RETRIES && shouldRetryDbError(error)) {
         await sleep(POOL_RETRY_BASE_MS * (attempt + 1))
         continue
       }
       throw error
     } finally {
-      client?.release()
+      // pg accepts an Error to release(); the pool then destroys the client
+      // instead of returning it. Safe even when clientError is null.
+      client?.release(clientError ?? undefined)
     }
   }
 

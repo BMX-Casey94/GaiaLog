@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg'
 
-import { dbPool, query } from './db'
+import { attachClientErrorHandler, dbPool, query } from './db'
 
 export interface OverlayAdmittedUtxoRow {
   topic: string
@@ -55,16 +55,35 @@ export async function assertOverlaySchemaReady(): Promise<void> {
 
 export async function withOverlayTransaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await dbPool.connect()
+  attachClientErrorHandler(client)
+  let connectionError: Error | null = null
   try {
     await client.query('BEGIN')
     const result = await work(client)
     await client.query('COMMIT')
     return result
   } catch (error) {
-    await client.query('ROLLBACK')
+    // If the connection itself died (Supavisor reaped, TLS reset, etc.) the
+    // ROLLBACK below will fail too — and rethrowing that secondary error
+    // would mask the original. Detect connection-level failures and skip the
+    // rollback; the server-side transaction is already gone with the socket.
+    const message = error instanceof Error ? error.message : String(error)
+    const connectionDied =
+      /Connection terminated|server closed the connection|ECONNRESET|EPIPE|ETIMEDOUT|DbHandler exited/i.test(
+        message,
+      )
+    if (connectionDied) {
+      connectionError = error instanceof Error ? error : new Error(message)
+    } else {
+      try {
+        await client.query('ROLLBACK')
+      } catch {
+        // best-effort; original error wins
+      }
+    }
     throw error
   } finally {
-    client.release()
+    client.release(connectionError ?? undefined)
   }
 }
 

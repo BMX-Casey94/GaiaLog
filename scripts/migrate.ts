@@ -27,7 +27,7 @@ function isConcurrentIndexMigration(file: string): boolean {
 }
 
 async function run() {
-  const { dbPool } = await import('@/lib/db')
+  const { dbPool, attachClientErrorHandler } = await import('@/lib/db')
   const migrationsDir = path.resolve(process.cwd(), 'db', 'migrations')
   const files = fs
     .readdirSync(migrationsDir)
@@ -35,6 +35,7 @@ async function run() {
     .sort()
 
   const client = await dbPool.connect()
+  attachClientErrorHandler(client)
   try {
     await client.query('SET statement_timeout = 0')
     await client.query('SET lock_timeout = 0')

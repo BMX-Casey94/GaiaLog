@@ -66,7 +66,7 @@ import { execSync } from 'node:child_process'
 dotenv.config({ path: path.join(process.cwd(), '.env'), override: true })
 
 import { P2PKH } from '@bsv/sdk'
-import { query, dbPool } from '../lib/db'
+import { attachClientErrorHandler, dbPool, query } from '../lib/db'
 import { getTreasuryTopicForWallet } from '../lib/treasury-topics'
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -406,6 +406,7 @@ async function main(): Promise<void> {
     // call refresh_overlay_topic_counts(topic) explicitly at the end so
     // the rollup remains accurate.
     const client = await dbPool.connect()
+    attachClientErrorHandler(client)
     let triggerDisabled = false
     let triggerExists = false
     try {
