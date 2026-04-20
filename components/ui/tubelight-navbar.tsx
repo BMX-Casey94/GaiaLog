@@ -150,65 +150,8 @@ export function NavBar({ items, className }: NavBarProps) {
           const hashIdx = item.url.indexOf("#")
           const hash = hashIdx >= 0 ? item.url.slice(hashIdx) : null
 
-          return (
-            <Link
-              key={item.name}
-              href={item.url}
-              onClick={(e) => {
-                // Smooth-scroll for in-page hash links on the home page,
-                // and route correctly back to home when clicked from other pages.
-                if (hash) {
-                  e.preventDefault()
-                  setActiveTab(item.name)
-                  suppressScrollSpyUntilRef.current = Date.now() + 900
-
-                  if (pathname !== "/") {
-                    router.push(`/${hash}`)
-                    return
-                  }
-
-                  const id = hash.replace(/^#/, "")
-                  const target = document.getElementById(id)
-                  if (target) {
-                    target.scrollIntoView({ behavior: "smooth", block: "start" })
-                    history.replaceState(null, "", hash)
-                  } else {
-                    // If the element isn't mounted yet, still update the URL.
-                    history.replaceState(null, "", hash)
-                  }
-                  return
-                }
-
-                // Real route (no `#`).
-                //
-                // We deliberately do NOT call `setActiveTab` here. The
-                // route-change effect (above) already updates the active tab
-                // when `pathname` changes, and calling it synchronously in
-                // the click handler caused two problems in production:
-                //   1) It re-rendered the navbar in the same tick that
-                //      `router.push` (a React transition) was kicked off,
-                //      and the resulting framer-motion `layoutId="lamp"`
-                //      layout measurement collided with the App Router
-                //      transition. The RSC payload was fetched but the URL
-                //      never committed — the tab "highlighted but stuck".
-                //   2) Even with the explicit `e.preventDefault()` +
-                //      `router.push(item.url)` workaround, the same
-                //      same-tick state update killed the transition.
-                //
-                // Letting `<Link>`'s native handler run (without preventing
-                // default and without our own state mutation) is the most
-                // reliable path: Next.js owns the transition end-to-end and
-                // the active-tab state catches up via the pathname effect.
-                if (pathname === item.url) {
-                  e.preventDefault()
-                }
-              }}
-              className={cn(
-                "relative cursor-pointer text-sm font-semibold px-4 sm:px-6 py-2 rounded-full transition-colors",
-                "text-slate-300 hover:text-primary",
-                isActive && "bg-muted text-primary",
-              )}
-            >
+          const lampAndLabel = (
+            <>
               <span className="hidden md:inline">{item.name}</span>
               <span className="md:hidden">
                 <Icon size={18} strokeWidth={2.5} />
@@ -231,7 +174,63 @@ export function NavBar({ items, className }: NavBarProps) {
                   </div>
                 </motion.div>
               )}
-            </Link>
+            </>
+          )
+
+          const linkClassName = cn(
+            "relative cursor-pointer text-sm font-semibold px-4 sm:px-6 py-2 rounded-full transition-colors",
+            "text-slate-300 hover:text-primary",
+            isActive && "bg-muted text-primary",
+          )
+
+          // Hash links (e.g. `/#monitoring`) keep the SPA <Link> path so
+          // we can intercept and smooth-scroll on the home page.
+          if (hash) {
+            return (
+              <Link
+                key={item.name}
+                href={item.url}
+                onClick={(e) => {
+                  e.preventDefault()
+                  setActiveTab(item.name)
+                  suppressScrollSpyUntilRef.current = Date.now() + 900
+
+                  if (pathname !== "/") {
+                    router.push(`/${hash}`)
+                    return
+                  }
+
+                  const id = hash.replace(/^#/, "")
+                  const target = document.getElementById(id)
+                  if (target) {
+                    target.scrollIntoView({ behavior: "smooth", block: "start" })
+                    history.replaceState(null, "", hash)
+                  } else {
+                    history.replaceState(null, "", hash)
+                  }
+                }}
+                className={linkClassName}
+              >
+                {lampAndLabel}
+              </Link>
+            )
+          }
+
+          // Cross-route links (e.g. `/`, `/explorer`) use a plain anchor.
+          // Next.js's `<Link>` SPA transition was racing with the navbar's
+          // own state/framer-motion render and silently dropping the URL
+          // commit (RSC fetched, page chunk loaded, URL never updated —
+          // the "Data Explorer highlights but doesn't navigate" bug). A
+          // native anchor lets the browser do a normal full-page load,
+          // which is fine for top-level navigation and 100% reliable.
+          return (
+            <a
+              key={item.name}
+              href={item.url}
+              className={linkClassName}
+            >
+              {lampAndLabel}
+            </a>
           )
         })}
       </div>
