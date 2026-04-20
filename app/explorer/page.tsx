@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useCallback, useRef, useLayoutEffect } from "react"
 import { createPortal } from "react-dom"
-import { Navigation } from "@/components/navigation"
 import { NodeExplorerPromoBar } from "@/components/explorer/node-explorer-promo-bar"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
@@ -396,8 +395,6 @@ export default function ExplorerPage() {
   
   return (
     <div className="min-h-screen bg-gradient-to-b from-black via-slate-950 to-black pt-0 pb-44 sm:pb-28">
-      <Navigation />
-      
       {/* ─── Hero Section (matches home page style) ─── */}
       <section className="relative overflow-hidden pt-32 pb-16 px-4 sm:px-6 lg:px-8">
         {/* Background radial gradient + sparkles */}

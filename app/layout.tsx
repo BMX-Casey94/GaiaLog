@@ -3,6 +3,7 @@ import type { Metadata } from "next"
 import { Space_Grotesk, DM_Sans } from "next/font/google"
 import "./globals.css"
 import { ThemeProvider } from "@/components/theme-provider"
+import { Navigation } from "@/components/navigation"
 import "@/lib/worker-bootstrap" // Auto-initialize workers on app startup
 
 const spaceGrotesk = Space_Grotesk({
@@ -36,6 +37,17 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning className={`${spaceGrotesk.variable} ${dmSans.variable}`}>
       <body className="font-sans antialiased">
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+          {/*
+            Navigation is hoisted into the root layout so the navbar element
+            (and its framer-motion `layoutId="lamp"` shared-layout anchor)
+            stays mounted across route transitions. When it lived inside each
+            page, navigating from `/` to `/explorer` unmounted the source
+            navbar and remounted a new one, which caused framer-motion's
+            shared-layout reconciliation to silently abort the App Router
+            transition (the RSC payload was fetched but the URL never
+            committed, leaving Data Explorer "highlighted but stuck").
+          */}
+          <Navigation />
           {children}
           <footer className="border-t mt-8 text-[10px] text-muted-foreground">
             <div className="max-w-6xl mx-auto px-4 py-3 text-center">
