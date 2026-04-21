@@ -59,6 +59,16 @@
  *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --wallet W2 # one wallet only
  *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --batch-size 3000
  *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --include-unconfirmed
+ *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --min-input-sats 50
+ *
+ * Economically-spendable floor (--min-input-sats)
+ * -----------------------------------------------
+ * Each input costs ~SIGNED_P2PKH_INPUT_BYTES × feeRate sats to spend (~15.3
+ * sats at 0.1025 sat/byte). UTXOs below ~2× this value are net-loss to
+ * consolidate (you pay more in fees than the input is worth). The script
+ * therefore filters them out of every batch by default. Override with
+ * `--min-input-sats 0` to consolidate everything regardless of economics
+ * (useful for cleaning up the inventory table even at a small BSV cost).
  */
 
 import 'dotenv/config'
@@ -88,6 +98,11 @@ interface CliOptions {
   includeUnconfirmed: boolean
   feeRate: number
   rebalanceTolerancePct: number
+  // Floor at which UTXOs are economically worth spending. Per-input cost is
+  // SIGNED_P2PKH_INPUT_BYTES × feeRate sats; below ~2× that, batches go
+  // negative (fee > inputs) and the operator burns money cleaning up dust.
+  // A null sentinel means "auto" — derived from feeRate at runtime.
+  minInputSats: number | null
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -122,6 +137,16 @@ function parseArgs(argv: string[]): CliOptions {
     throw new Error(`--rebalance-tolerance-pct must be between 0.1 and 50 (got ${tolPctRaw})`)
   }
 
+  const minInputSatsArg = takeValue(argv, '--min-input-sats')
+  let minInputSats: number | null = null
+  if (minInputSatsArg !== null) {
+    const parsed = Number(minInputSatsArg)
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new Error(`--min-input-sats must be ≥ 0 (got ${minInputSatsArg})`)
+    }
+    minInputSats = Math.floor(parsed)
+  }
+
   return {
     apply,
     rebalance,
@@ -130,7 +155,19 @@ function parseArgs(argv: string[]): CliOptions {
     includeUnconfirmed,
     feeRate: feeRateRaw,
     rebalanceTolerancePct: tolPctRaw,
+    minInputSats,
   }
+}
+
+// Per-input cost in sats given the current fee rate. Inputs below this value
+// always lose money to spend. We default --min-input-sats to ~2× this so the
+// batch as a whole nets at least ~1 sat per input above its share of the fee.
+function autoMinInputSats(feeRate: number): number {
+  return Math.max(1, Math.ceil(SIGNED_P2PKH_INPUT_BYTES * feeRate * 2))
+}
+
+function effectiveMinInputSats(options: CliOptions): number {
+  return options.minInputSats !== null ? options.minInputSats : autoMinInputSats(options.feeRate)
 }
 
 function takeValue(argv: string[], flag: string): string | null {
@@ -220,6 +257,7 @@ interface WalletSnapshot {
 async function snapshotWallet(
   binding: WalletBinding,
   includeUnconfirmed: boolean,
+  minInputSats: number,
 ): Promise<WalletSnapshot> {
   const res = await withOverlayTransaction(async (client) => {
     return client.query<{
@@ -239,11 +277,11 @@ async function snapshotWallet(
          COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text               AS largest_confirmed_sats,
          COALESCE(SUM(satoshis) FILTER (WHERE removed = false), 0)::text                                    AS total_live_sats,
          COALESCE(SUM(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text               AS total_confirmed_sats,
-         COALESCE(SUM(satoshis) FILTER (WHERE removed = false AND locked = false AND ($2::boolean = true OR confirmed = true)), 0)::text AS eligible_sats,
-         COUNT(*) FILTER (WHERE removed = false AND locked = false AND ($2::boolean = true OR confirmed = true))::text AS eligible_utxos
+         COALESCE(SUM(satoshis) FILTER (WHERE removed = false AND locked = false AND satoshis >= $3 AND ($2::boolean = true OR confirmed = true)), 0)::text AS eligible_sats,
+         COUNT(*) FILTER (WHERE removed = false AND locked = false AND satoshis >= $3 AND ($2::boolean = true OR confirmed = true))::text AS eligible_utxos
        FROM overlay_admitted_utxos
        WHERE wallet_index = $1`,
-      [binding.walletIndex, includeUnconfirmed],
+      [binding.walletIndex, includeUnconfirmed, Math.max(0, Math.floor(minInputSats))],
     )
   })
   const row = res.rows[0]
@@ -274,6 +312,7 @@ async function lockBatch(
   binding: WalletBinding,
   batchSize: number,
   includeUnconfirmed: boolean,
+  minInputSats: number,
   lockedBy: string,
 ): Promise<LockedInput[]> {
   return withOverlayTransaction(async (client) => {
@@ -294,6 +333,7 @@ async function lockBatch(
           WHERE wallet_index = $1
             AND removed = false
             AND locked = false
+            AND satoshis >= $5
             AND ($2::boolean = true OR confirmed = true)
             AND acquirable_at <= now()
           ORDER BY satoshis ASC, admitted_at ASC, txid ASC, vout ASC
@@ -307,7 +347,7 @@ async function lockBatch(
          FROM candidates c
         WHERE u.topic = c.topic AND u.txid = c.txid AND u.vout = c.vout
        RETURNING u.topic, u.txid, u.vout, u.satoshis, u.output_script`,
-      [binding.walletIndex, includeUnconfirmed, batchSize, lockedBy],
+      [binding.walletIndex, includeUnconfirmed, batchSize, lockedBy, Math.max(0, Math.floor(minInputSats))],
     )
     return res.rows.map((row) => ({
       topic: row.topic,
@@ -545,10 +585,17 @@ async function consolidateWallet(
   console.log(`  Consolidating ${binding.label}  (${binding.address})`)
   console.log('═══════════════════════════════════════════════════════════════════')
 
+  const minInputSats = effectiveMinInputSats(options)
   let batchNo = 0
   while (true) {
     batchNo += 1
-    const inputs = await lockBatch(binding, options.batchSize, options.includeUnconfirmed, lockedBy)
+    const inputs = await lockBatch(
+      binding,
+      options.batchSize,
+      options.includeUnconfirmed,
+      minInputSats,
+      lockedBy,
+    )
     if (inputs.length === 0) {
       console.log(`  Batch #${batchNo}: no more eligible UTXOs — wallet ${binding.label} done.`)
       break
@@ -570,7 +617,9 @@ async function consolidateWallet(
     if (outputSats <= 1) {
       console.warn(
         `  ⚠️  Batch #${batchNo}: outputSats=${outputSats} — releasing locks and skipping. ` +
-          `Increase --batch-size so the consolidated output exceeds the per-batch fee.`,
+          `Inputs are economically unspendable (per-input fee ≈ ${Math.ceil(SIGNED_P2PKH_INPUT_BYTES * options.feeRate)} sats > average input value). ` +
+          `Try \`--min-input-sats ${Math.ceil(SIGNED_P2PKH_INPUT_BYTES * options.feeRate * 3)}\` and/or ` +
+          `\`--include-unconfirmed\` if larger UTXOs exist in the unconfirmed set.`,
       )
       await releaseBatch(inputs, lockedBy, 60_000)
       break
@@ -835,10 +884,11 @@ async function rebalanceWallets(
   console.log('  Phase 2: cross-wallet rebalance')
   console.log('═══════════════════════════════════════════════════════════════════')
 
+  const minInputSats = effectiveMinInputSats(options)
   const MAX_PASSES = 12
   for (let pass = 1; pass <= MAX_PASSES; pass++) {
     const snapshots = await Promise.all(
-      bindings.map((b) => snapshotWallet(b, options.includeUnconfirmed)),
+      bindings.map((b) => snapshotWallet(b, options.includeUnconfirmed, minInputSats)),
     )
     const totalSats = snapshots.reduce((acc, s) => acc + s.totalLiveSats, 0)
     const target = Math.floor(totalSats / snapshots.length)
@@ -975,11 +1025,19 @@ async function main(): Promise<void> {
     : allBindings
   if (bindings.length === 0) throw new Error('No matching wallet bindings.')
 
+  const effectiveMin = effectiveMinInputSats(options)
+
   // Pre-flight snapshot.
   console.log('')
+  console.log(
+    `Effective --min-input-sats: ${effectiveMin}` +
+      (options.minInputSats === null
+        ? `  (auto: 2× per-input fee at ${options.feeRate} sat/byte)`
+        : '  (operator override)'),
+  )
   console.log('Pre-flight snapshot:')
   const preSnapshots = await Promise.all(
-    bindings.map((b) => snapshotWallet(b, options.includeUnconfirmed)),
+    bindings.map((b) => snapshotWallet(b, options.includeUnconfirmed, effectiveMin)),
   )
   for (const s of preSnapshots) {
     const eligibleBatches = Math.ceil(s.eligibleUtxos / options.batchSize)
@@ -1070,7 +1128,7 @@ async function main(): Promise<void> {
     console.log('')
     console.log('Post-flight snapshot:')
     const postSnapshots = await Promise.all(
-      allBindings.map((b) => snapshotWallet(b, options.includeUnconfirmed)),
+      allBindings.map((b) => snapshotWallet(b, options.includeUnconfirmed, effectiveMin)),
     )
     for (const s of postSnapshots) {
       console.log(
