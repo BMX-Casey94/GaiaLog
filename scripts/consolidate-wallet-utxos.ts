@@ -103,6 +103,16 @@ interface CliOptions {
   // negative (fee > inputs) and the operator burns money cleaning up dust.
   // A null sentinel means "auto" — derived from feeRate at runtime.
   minInputSats: number | null
+  // Minimum age (in seconds) an UNCONFIRMED UTXO must have spent in the
+  // inventory before this script will spend it. Stops us picking up
+  // splitter-produced outputs while their parent transaction is still
+  // propagating across ARC relays — production saw "Missing inputs" 400s
+  // from WoC when consolidating fresh maintainer outputs at 0s grace.
+  unconfirmedMinAgeSeconds: number
+  // Maximum CONSECUTIVE batch broadcast failures before we give up on a
+  // wallet. A single failure (often transient — ARC 504, fetch failed) used
+  // to abort the entire wallet. We now treat each batch independently.
+  maxConsecutiveFailures: number
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -147,6 +157,22 @@ function parseArgs(argv: string[]): CliOptions {
     minInputSats = Math.floor(parsed)
   }
 
+  const unconfirmedMinAgeArg = takeValue(argv, '--unconfirmed-min-age-seconds')
+  const unconfirmedMinAge = unconfirmedMinAgeArg === null ? 60 : Number(unconfirmedMinAgeArg)
+  if (!Number.isFinite(unconfirmedMinAge) || unconfirmedMinAge < 0 || unconfirmedMinAge > 3600) {
+    throw new Error(
+      `--unconfirmed-min-age-seconds must be between 0 and 3600 (got ${unconfirmedMinAgeArg})`,
+    )
+  }
+
+  const maxFailuresArg = takeValue(argv, '--max-consecutive-failures')
+  const maxFailures = maxFailuresArg === null ? 3 : Number(maxFailuresArg)
+  if (!Number.isFinite(maxFailures) || maxFailures < 1 || maxFailures > 50) {
+    throw new Error(
+      `--max-consecutive-failures must be between 1 and 50 (got ${maxFailuresArg})`,
+    )
+  }
+
   return {
     apply,
     rebalance,
@@ -156,6 +182,8 @@ function parseArgs(argv: string[]): CliOptions {
     feeRate: feeRateRaw,
     rebalanceTolerancePct: tolPctRaw,
     minInputSats,
+    unconfirmedMinAgeSeconds: Math.floor(unconfirmedMinAge),
+    maxConsecutiveFailures: Math.floor(maxFailures),
   }
 }
 
@@ -258,6 +286,7 @@ async function snapshotWallet(
   binding: WalletBinding,
   includeUnconfirmed: boolean,
   minInputSats: number,
+  unconfirmedMinAgeSeconds: number,
 ): Promise<WalletSnapshot> {
   const res = await withOverlayTransaction(async (client) => {
     return client.query<{
@@ -277,11 +306,26 @@ async function snapshotWallet(
          COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text               AS largest_confirmed_sats,
          COALESCE(SUM(satoshis) FILTER (WHERE removed = false), 0)::text                                    AS total_live_sats,
          COALESCE(SUM(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text               AS total_confirmed_sats,
-         COALESCE(SUM(satoshis) FILTER (WHERE removed = false AND locked = false AND satoshis >= $3 AND ($2::boolean = true OR confirmed = true)), 0)::text AS eligible_sats,
-         COUNT(*) FILTER (WHERE removed = false AND locked = false AND satoshis >= $3 AND ($2::boolean = true OR confirmed = true))::text AS eligible_utxos
+         COALESCE(SUM(satoshis) FILTER (WHERE removed = false
+                                           AND locked = false
+                                           AND satoshis >= $3
+                                           AND ($2::boolean = true OR confirmed = true)
+                                           AND (confirmed = true OR admitted_at <= now() - ($4::bigint * interval '1 second'))
+                                          ), 0)::text AS eligible_sats,
+         COUNT(*) FILTER (WHERE removed = false
+                            AND locked = false
+                            AND satoshis >= $3
+                            AND ($2::boolean = true OR confirmed = true)
+                            AND (confirmed = true OR admitted_at <= now() - ($4::bigint * interval '1 second'))
+                         )::text AS eligible_utxos
        FROM overlay_admitted_utxos
        WHERE wallet_index = $1`,
-      [binding.walletIndex, includeUnconfirmed, Math.max(0, Math.floor(minInputSats))],
+      [
+        binding.walletIndex,
+        includeUnconfirmed,
+        Math.max(0, Math.floor(minInputSats)),
+        Math.max(0, Math.floor(unconfirmedMinAgeSeconds)),
+      ],
     )
   })
   const row = res.rows[0]
@@ -313,6 +357,7 @@ async function lockBatch(
   batchSize: number,
   includeUnconfirmed: boolean,
   minInputSats: number,
+  unconfirmedMinAgeSeconds: number,
   lockedBy: string,
 ): Promise<LockedInput[]> {
   return withOverlayTransaction(async (client) => {
@@ -336,6 +381,13 @@ async function lockBatch(
             AND satoshis >= $5
             AND ($2::boolean = true OR confirmed = true)
             AND acquirable_at <= now()
+            -- Unconfirmed inputs must have aged at least N seconds in the
+            -- inventory before we spend them. This prevents us picking up
+            -- splitter-produced outputs whose parents have not yet
+            -- propagated to all ARC relays (production saw WoC reject
+            -- with "Missing inputs" 400 at 0s grace). Confirmed rows
+            -- are exempt — their parent is already in a block.
+            AND (confirmed = true OR admitted_at <= now() - ($6::bigint * interval '1 second'))
           ORDER BY satoshis ASC, admitted_at ASC, txid ASC, vout ASC
           FOR UPDATE SKIP LOCKED
           LIMIT $3
@@ -347,7 +399,14 @@ async function lockBatch(
          FROM candidates c
         WHERE u.topic = c.topic AND u.txid = c.txid AND u.vout = c.vout
        RETURNING u.topic, u.txid, u.vout, u.satoshis, u.output_script`,
-      [binding.walletIndex, includeUnconfirmed, batchSize, lockedBy, Math.max(0, Math.floor(minInputSats))],
+      [
+        binding.walletIndex,
+        includeUnconfirmed,
+        batchSize,
+        lockedBy,
+        Math.max(0, Math.floor(minInputSats)),
+        Math.max(0, Math.floor(unconfirmedMinAgeSeconds)),
+      ],
     )
     return res.rows.map((row) => ({
       topic: row.topic,
@@ -524,28 +583,30 @@ function buildConsolidationTx(
 function buildTransferTx(
   donor: WalletBinding,
   recipientAddress: string,
-  input: LockedInput,
+  inputs: LockedInput[],
   donateSats: number,
   feeRate: number,
 ): { rawHex: string; fee: number; donateSats: number; changeSats: number; txSizeBytes: number } {
-  const txSizeBytes = estimateTxSize(1, 2)
+  if (inputs.length === 0) throw new Error('buildTransferTx: no inputs')
+  const txSizeBytes = estimateTxSize(inputs.length, 2)
   const fee = Math.ceil(txSizeBytes * feeRate)
-  const changeSats = input.satoshis - donateSats - fee
+  const inputSum = inputs.reduce((acc, i) => acc + i.satoshis, 0)
+  const changeSats = inputSum - donateSats - fee
   if (changeSats <= 1) {
     throw new Error(
-      `Refusing to build transfer TX with changeSats=${changeSats} (input=${input.satoshis} donate=${donateSats} fee=${fee}).`,
+      `Refusing to build transfer TX with changeSats=${changeSats} (inputSum=${inputSum} donate=${donateSats} fee=${fee}).`,
     )
   }
   const tx = new (bsvLib as any).Transaction()
-  tx.from([
-    {
-      txId: input.txid,
-      outputIndex: input.vout,
+  tx.from(
+    inputs.map((i) => ({
+      txId: i.txid,
+      outputIndex: i.vout,
       address: donor.address,
-      script: input.output_script,
-      satoshis: input.satoshis,
-    },
-  ])
+      script: i.output_script,
+      satoshis: i.satoshis,
+    })),
+  )
   tx.to(recipientAddress, donateSats)
   tx.to(donor.address, changeSats)
   tx.fee(fee)
@@ -587,6 +648,7 @@ async function consolidateWallet(
 
   const minInputSats = effectiveMinInputSats(options)
   let batchNo = 0
+  let consecutiveFailures = 0
   while (true) {
     batchNo += 1
     const inputs = await lockBatch(
@@ -594,6 +656,7 @@ async function consolidateWallet(
       options.batchSize,
       options.includeUnconfirmed,
       minInputSats,
+      options.unconfirmedMinAgeSeconds,
       lockedBy,
     )
     if (inputs.length === 0) {
@@ -649,6 +712,7 @@ async function consolidateWallet(
       const message = err instanceof Error ? err.message : String(err)
       console.error(`  ❌ Batch #${batchNo}: build failed — ${message}. Releasing locks.`)
       await releaseBatch(inputs, lockedBy, 60_000)
+      // Build failures are deterministic on the same inputs; abort the wallet.
       throw err
     }
 
@@ -657,11 +721,26 @@ async function consolidateWallet(
       txid = await broadcastSplitTransactionRaw(built.rawHex)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      const transient = classifyBroadcastError(message)
+      consecutiveFailures += 1
       console.error(
-        `  ❌ Batch #${batchNo}: broadcast failed — ${message}. Releasing locks (1 min cooldown).`,
+        `  ❌ Batch #${batchNo}: broadcast failed (${transient.label}) — ${message.split('\n')[0].substring(0, 200)}. ` +
+          `Releasing locks (${Math.round(transient.cooldownMs / 1000)}s cooldown). ` +
+          `Consecutive failures: ${consecutiveFailures}/${options.maxConsecutiveFailures}.`,
       )
-      await releaseBatch(inputs, lockedBy, 60_000)
-      throw err
+      if (transient.hint) console.error(`     hint: ${transient.hint}`)
+      await releaseBatch(inputs, lockedBy, transient.cooldownMs)
+      if (consecutiveFailures >= options.maxConsecutiveFailures) {
+        console.error(
+          `  ⛔ Wallet ${binding.label}: ${consecutiveFailures} consecutive broadcast failures — ` +
+            `giving up on this wallet. ${stats.batches} batch(es) succeeded before this. ` +
+            `Re-run with the same flags to retry the remainder.`,
+        )
+        break
+      }
+      // Wait briefly before next batch attempt to let upstream issues clear.
+      await new Promise((r) => setTimeout(r, transient.preBatchSleepMs))
+      continue
     }
 
     try {
@@ -690,9 +769,12 @@ async function consolidateWallet(
           `\`scripts/recovery-import-onchain-utxos.ts --apply\` to reconcile.`,
       )
       await releaseBatch(inputs, lockedBy, 60_000)
+      // Hard abort: an on-chain TX with stale DB state must be reconciled
+      // before continuing, otherwise the next batch may double-spend.
       throw err
     }
 
+    consecutiveFailures = 0
     stats.batches += 1
     stats.inputsSpent += inputs.length
     stats.satsConsolidated += built.outputSats
@@ -712,15 +794,76 @@ async function consolidateWallet(
   return stats
 }
 
+interface BroadcastErrorClassification {
+  label: 'transient' | 'missing-inputs' | 'mempool-chain' | 'unknown'
+  cooldownMs: number
+  preBatchSleepMs: number
+  hint: string | null
+}
+
+function classifyBroadcastError(message: string): BroadcastErrorClassification {
+  const lower = message.toLowerCase()
+  if (lower.includes('missing inputs') || lower.includes('missing-inputs')) {
+    return {
+      label: 'missing-inputs',
+      cooldownMs: 5 * 60_000,
+      preBatchSleepMs: 5_000,
+      hint:
+        'WoC reports an input does not exist on-chain — likely an unconfirmed parent that has not yet propagated. ' +
+        'Increase --unconfirmed-min-age-seconds (default 60) so we wait longer before consolidating fresh splitter outputs.',
+    }
+  }
+  if (lower.includes('mempool_chain_limit') || lower.includes('too-long-mempool-chain')) {
+    return {
+      label: 'mempool-chain',
+      cooldownMs: 10 * 60_000,
+      preBatchSleepMs: 30_000,
+      hint:
+        'Mempool chain depth limit hit — wait for a block to confirm the chain. ' +
+        'Re-running in ~10 minutes should clear this.',
+    }
+  }
+  if (lower.includes('504') || lower.includes('fetch failed') || lower.includes('etimedout') || lower.includes('econnreset')) {
+    return {
+      label: 'transient',
+      cooldownMs: 60_000,
+      preBatchSleepMs: 5_000,
+      hint: 'Likely upstream/network transient — next batch should succeed.',
+    }
+  }
+  return {
+    label: 'unknown',
+    cooldownMs: 2 * 60_000,
+    preBatchSleepMs: 10_000,
+    hint: null,
+  }
+}
+
 // ─── Phase 2: cross-wallet rebalancing ───────────────────────────────────────
 
-async function lockSingleLargestReserveUtxo(
-  binding: WalletBinding,
-  minSatoshis: number,
-  lockedBy: string,
-): Promise<LockedInput | null> {
+/**
+ * Locks the largest spendable UTXOs in `binding` until the cumulative sum
+ * reaches `targetSats`, OR until `maxInputs` UTXOs have been picked.
+ *
+ * Returns the picked inputs (already locked in the DB). If the wallet has no
+ * single + accumulated combination capable of reaching `targetSats`, the
+ * partial set is still returned so the caller can release locks and report
+ * the actual largest sum available.
+ *
+ * Skips dust below `minPerInputSats` so small inputs never drag the batch
+ * into a net-loss fee position.
+ */
+async function lockLargestUtxosForAmount(input: {
+  binding: WalletBinding
+  targetSats: number
+  maxInputs: number
+  minPerInputSats: number
+  unconfirmedMinAgeSeconds: number
+  includeUnconfirmed: boolean
+  lockedBy: string
+}): Promise<LockedInput[]> {
   return withOverlayTransaction(async (client) => {
-    await client.query(`SET LOCAL statement_timeout = 5000`)
+    await client.query(`SET LOCAL statement_timeout = 30000`)
     const res = await client.query<{
       topic: string
       txid: string
@@ -728,63 +871,89 @@ async function lockSingleLargestReserveUtxo(
       satoshis: string
       output_script: string
     }>(
-      `WITH candidate AS (
-         SELECT topic, txid, vout
+      `WITH ranked AS (
+         SELECT topic, txid, vout, satoshis, output_script,
+                SUM(satoshis) OVER (ORDER BY satoshis DESC, admitted_at ASC, txid ASC, vout ASC ROWS UNBOUNDED PRECEDING) AS running_sum,
+                ROW_NUMBER() OVER (ORDER BY satoshis DESC, admitted_at ASC, txid ASC, vout ASC) AS rn
            FROM overlay_admitted_utxos
           WHERE wallet_index = $1
             AND removed = false
             AND locked = false
             AND satoshis >= $2
+            AND ($5::boolean = true OR confirmed = true)
+            AND (confirmed = true OR admitted_at <= now() - ($6::bigint * interval '1 second'))
             AND acquirable_at <= now()
-          ORDER BY satoshis DESC, admitted_at ASC, txid ASC, vout ASC
-          FOR UPDATE SKIP LOCKED
-          LIMIT 1
+       ),
+       candidates AS (
+         SELECT topic, txid, vout
+           FROM ranked
+          WHERE rn <= $3
+            AND (running_sum - satoshis) < $4   -- keep adding until cumulative covers target
        )
        UPDATE overlay_admitted_utxos u
           SET locked = true,
-              locked_by = $3,
+              locked_by = $7,
               locked_at = now()
-         FROM candidate c
+         FROM candidates c
         WHERE u.topic = c.topic AND u.txid = c.txid AND u.vout = c.vout
+          AND u.locked = false
        RETURNING u.topic, u.txid, u.vout, u.satoshis, u.output_script`,
-      [binding.walletIndex, Math.max(0, Math.floor(minSatoshis)), lockedBy],
+      [
+        input.binding.walletIndex,
+        Math.max(0, Math.floor(input.minPerInputSats)),
+        Math.max(1, Math.floor(input.maxInputs)),
+        Math.max(1, Math.floor(input.targetSats)),
+        input.includeUnconfirmed,
+        Math.max(0, Math.floor(input.unconfirmedMinAgeSeconds)),
+        input.lockedBy,
+      ],
     )
-    if (res.rows.length === 0) return null
-    const row = res.rows[0]
-    return {
-      topic: row.topic,
-      txid: row.txid,
-      vout: row.vout,
-      satoshis: Number(row.satoshis),
-      output_script: row.output_script,
-    }
+    return res.rows
+      .map((row) => ({
+        topic: row.topic,
+        txid: row.txid,
+        vout: row.vout,
+        satoshis: Number(row.satoshis),
+        output_script: row.output_script,
+      }))
+      .sort((a, b) => b.satoshis - a.satoshis)
   })
 }
 
 async function commitTransfer(input: {
   donorBinding: WalletBinding
   recipientBinding: WalletBinding
-  donorInput: LockedInput
+  donorInputs: LockedInput[]
   spendingTxid: string
   rawTx: string
   donateSats: number
   changeSats: number
 }): Promise<void> {
   await withOverlayTransaction(async (client) => {
-    // 1) Mark donor's input as spent.
+    // 1) Mark all donor inputs as spent (single bulk UPDATE).
+    const topics = input.donorInputs.map((i) => i.topic)
+    const txids = input.donorInputs.map((i) => i.txid)
+    const vouts = input.donorInputs.map((i) => i.vout)
     const removed = await client.query(
-      `UPDATE overlay_admitted_utxos
+      `UPDATE overlay_admitted_utxos u
           SET removed = true,
               removed_at = now(),
               spending_txid = $4,
               locked = false,
               locked_by = NULL,
               locked_at = NULL
-        WHERE topic = $1 AND txid = $2 AND vout = $3 AND removed = false`,
-      [input.donorInput.topic, input.donorInput.txid, input.donorInput.vout, input.spendingTxid],
+         FROM unnest($1::text[], $2::text[], $3::int[]) AS t(topic, txid, vout)
+        WHERE u.topic = t.topic
+          AND u.txid = t.txid
+          AND u.vout = t.vout
+          AND u.removed = false
+        RETURNING u.topic`,
+      [topics, txids, vouts, input.spendingTxid],
     )
-    if ((removed.rowCount || 0) === 0) {
-      throw new Error('Donor input was not available to consume')
+    if ((removed.rowCount || 0) !== input.donorInputs.length) {
+      throw new Error(
+        `commitTransfer: expected ${input.donorInputs.length} inputs spent, marked ${removed.rowCount || 0}`,
+      )
     }
 
     // 2) Insert recipient output (vout 0) into recipient's topic.
@@ -855,9 +1024,9 @@ async function commitTransfer(input: {
       ],
     )
 
-    // Topic-count effect: donor lost 1 input (-1) + change output (+1) = 0
-    //                     recipient gained 1 output (+1)
-    await refreshTopicCounts(client, input.donorBinding.topic, 0)
+    // Topic-count effect: donor lost N inputs + 1 change output → delta = 1 - N
+    //                     recipient gained 1 output → delta = +1
+    await refreshTopicCounts(client, input.donorBinding.topic, 1 - input.donorInputs.length)
     await refreshTopicCounts(client, input.recipientBinding.topic, 1)
   })
 }
@@ -888,7 +1057,9 @@ async function rebalanceWallets(
   const MAX_PASSES = 12
   for (let pass = 1; pass <= MAX_PASSES; pass++) {
     const snapshots = await Promise.all(
-      bindings.map((b) => snapshotWallet(b, options.includeUnconfirmed, minInputSats)),
+      bindings.map((b) =>
+        snapshotWallet(b, options.includeUnconfirmed, minInputSats, options.unconfirmedMinAgeSeconds),
+      ),
     )
     const totalSats = snapshots.reduce((acc, s) => acc + s.totalLiveSats, 0)
     const target = Math.floor(totalSats / snapshots.length)
@@ -924,36 +1095,58 @@ async function rebalanceWallets(
       break
     }
 
-    const transferFee = estimateFee(1, 2, options.feeRate)
-    const minInput = donateSats + transferFee + 1
-    const donorInput = await lockSingleLargestReserveUtxo(richest.binding, minInput, lockedBy)
-    if (!donorInput) {
+    // Multi-input transfer: pick largest reserves until cumulative sum
+    // covers donateSats + fee + 1. Cap at MAX_TRANSFER_INPUTS so the TX
+    // stays under typical ARC body limits (~5,000 inputs ≈ 745 KB).
+    const MAX_TRANSFER_INPUTS = 5000
+    // Rough fee for a multi-input estimate; we'll re-derive once we know
+    // exactly how many inputs we got back.
+    const provisionalFee = estimateFee(MAX_TRANSFER_INPUTS, 2, options.feeRate)
+    const targetSum = donateSats + provisionalFee + 1
+    const donorInputs = await lockLargestUtxosForAmount({
+      binding: richest.binding,
+      targetSats: targetSum,
+      maxInputs: MAX_TRANSFER_INPUTS,
+      minPerInputSats: minInputSats,
+      unconfirmedMinAgeSeconds: options.unconfirmedMinAgeSeconds,
+      includeUnconfirmed: options.includeUnconfirmed,
+      lockedBy,
+    })
+
+    const lockedSum = donorInputs.reduce((acc, i) => acc + i.satoshis, 0)
+    const exactFee = estimateFee(donorInputs.length, 2, options.feeRate)
+    const minViableSum = donateSats + exactFee + 1
+
+    if (donorInputs.length === 0 || lockedSum < minViableSum) {
       console.warn(
-        `  ⚠️  Pass ${pass}: ${richest.binding.label} has no single UTXO ≥ ${minInput.toLocaleString()} sats — ` +
-          `cannot rebalance with one transfer this pass. Consider re-running consolidation with a larger ` +
-          `--batch-size, or run rebalance again later once the maintainer has produced bigger reserves.`,
+        `  ⚠️  Pass ${pass}: ${richest.binding.label} can only marshal ${lockedSum.toLocaleString()} sats ` +
+          `from ${donorInputs.length} input(s) (need ≥ ${minViableSum.toLocaleString()} sats: ` +
+          `${donateSats.toLocaleString()} donation + ${exactFee.toLocaleString()} fee). ` +
+          `Run another consolidation pass to produce larger reserves, then re-run --rebalance.`,
       )
+      if (donorInputs.length > 0) await releaseBatch(donorInputs, lockedBy, 0)
       break
     }
 
     if (!options.apply) {
       console.log(
         `  (dry-run) Would transfer ${donateSats.toLocaleString()} sats: ` +
-          `${richest.binding.label} (input=${donorInput.satoshis.toLocaleString()}) → ${poorest.binding.label}  ` +
-          `fee=${transferFee} sats`,
+          `${richest.binding.label} (${donorInputs.length} input(s) totalling ${lockedSum.toLocaleString()}) → ` +
+          `${poorest.binding.label}  fee=${exactFee.toLocaleString()} sats  ` +
+          `change=${(lockedSum - donateSats - exactFee).toLocaleString()} sats`,
       )
-      await releaseBatch([donorInput], lockedBy, 0)
+      await releaseBatch(donorInputs, lockedBy, 0)
       break
     }
 
     let built
     try {
-      built = buildTransferTx(richest.binding, poorest.binding.address, donorInput, donateSats, options.feeRate)
+      built = buildTransferTx(richest.binding, poorest.binding.address, donorInputs, donateSats, options.feeRate)
     } catch (err) {
       console.error(
-        `  ❌ Pass ${pass}: transfer build failed — ${err instanceof Error ? err.message : String(err)}. Releasing lock.`,
+        `  ❌ Pass ${pass}: transfer build failed — ${err instanceof Error ? err.message : String(err)}. Releasing locks.`,
       )
-      await releaseBatch([donorInput], lockedBy, 60_000)
+      await releaseBatch(donorInputs, lockedBy, 60_000)
       throw err
     }
 
@@ -961,18 +1154,24 @@ async function rebalanceWallets(
     try {
       txid = await broadcastSplitTransactionRaw(built.rawHex)
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const transient = classifyBroadcastError(message)
       console.error(
-        `  ❌ Pass ${pass}: transfer broadcast failed — ${err instanceof Error ? err.message : String(err)}. Releasing lock.`,
+        `  ❌ Pass ${pass}: transfer broadcast failed (${transient.label}) — ${message.split('\n')[0].substring(0, 200)}. ` +
+          `Releasing locks (${Math.round(transient.cooldownMs / 1000)}s cooldown).`,
       )
-      await releaseBatch([donorInput], lockedBy, 60_000)
-      throw err
+      if (transient.hint) console.error(`     hint: ${transient.hint}`)
+      await releaseBatch(donorInputs, lockedBy, transient.cooldownMs)
+      // Stop the rebalance loop — same-pass retry against the same surplus
+      // would lock the same UTXOs and likely hit the same upstream issue.
+      break
     }
 
     try {
       await commitTransfer({
         donorBinding: richest.binding,
         recipientBinding: poorest.binding,
-        donorInput,
+        donorInputs,
         spendingTxid: txid,
         rawTx: built.rawHex,
         donateSats: built.donateSats,
@@ -995,7 +1194,8 @@ async function rebalanceWallets(
     })
     console.log(
       `  ✅ Pass ${pass}: txid=${txid}  ${richest.binding.label} → ${poorest.binding.label}  ` +
-        `donated=${built.donateSats.toLocaleString()} sats  change=${built.changeSats.toLocaleString()} sats  fee=${built.fee} sats`,
+        `inputs=${donorInputs.length}  donated=${built.donateSats.toLocaleString()} sats  ` +
+        `change=${built.changeSats.toLocaleString()} sats  fee=${built.fee} sats`,
     )
 
     // Wait briefly so the new outputs become acquirable_at-ready before the
@@ -1037,7 +1237,9 @@ async function main(): Promise<void> {
   )
   console.log('Pre-flight snapshot:')
   const preSnapshots = await Promise.all(
-    bindings.map((b) => snapshotWallet(b, options.includeUnconfirmed, effectiveMin)),
+    bindings.map((b) =>
+      snapshotWallet(b, options.includeUnconfirmed, effectiveMin, options.unconfirmedMinAgeSeconds),
+    ),
   )
   for (const s of preSnapshots) {
     const eligibleBatches = Math.ceil(s.eligibleUtxos / options.batchSize)
@@ -1128,7 +1330,9 @@ async function main(): Promise<void> {
     console.log('')
     console.log('Post-flight snapshot:')
     const postSnapshots = await Promise.all(
-      allBindings.map((b) => snapshotWallet(b, options.includeUnconfirmed, effectiveMin)),
+      allBindings.map((b) =>
+        snapshotWallet(b, options.includeUnconfirmed, effectiveMin, options.unconfirmedMinAgeSeconds),
+      ),
     )
     for (const s of postSnapshots) {
       console.log(
