@@ -64,6 +64,7 @@ async function main() {
     const { workerQueue } = await import('../lib/worker-queue')
     const { startUtxoMaintainer } = await import('../lib/utxo-maintainer')
     const { startConfirmationWorker } = await import('../lib/confirmation-worker')
+    const { startWalletFundingMonitor, stopWalletFundingMonitor } = await import('../lib/wallet-funding-monitor')
     const { initializeProviderBudgets, recomputeProviderConfigs } = await import('../lib/provider-registry')
     const { blockchainService } = await import('../lib/blockchain')
     const fs = await import('fs')
@@ -122,6 +123,11 @@ async function main() {
     // requiring confirmations stalls.  Self-throttled, opt-out via
     // BSV_CONFIRMATION_WORKER_DISABLED=true.
     startConfirmationWorker()
+    // Wallet funding monitor: low-frequency (5 min) per-wallet runway/days
+    // alerting so the operator gets ≥7 days of warning before any wallet
+    // exhausts its BSV. Self-throttled CRITICAL alerts; opt-out via
+    // BSV_WALLET_FUNDING_DISABLED=true.
+    startWalletFundingMonitor()
     // Slight delay to let maintainer kick off before queue
     setTimeout(() => {
       workerQueue.startProcessing()
@@ -201,6 +207,9 @@ async function main() {
       try {
         const { stopConfirmationWorker } = await import('../lib/confirmation-worker')
         stopConfirmationWorker()
+      } catch {}
+      try {
+        stopWalletFundingMonitor()
       } catch {}
       console.log('✅ Worker service shut down cleanly.')
       process.exit(0)

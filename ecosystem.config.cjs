@@ -1,12 +1,24 @@
 /**
  * PM2 Ecosystem Configuration for GaiaLog VPS Deployment
  *
- * Runs five processes:
- *   1. gaialog-web  — Next.js production server (port 3000)
- *   2. gaialog-overlay — Private loopback overlay lookup/submit service
- *   3. gaialog-workers — Background workers (data collection, queue, UTXO maintainer)
- *   4. gaialog-utxo-manager — Emergency file-backed UTXO provider (port 8787)
- *   5. gaialog-utxo-replenish — Auto-splits large UTXOs when spendable pool runs low
+ * Runs three processes:
+ *   1. gaialog-web      — Next.js production server (port 3000)
+ *   2. gaialog-overlay  — Private loopback overlay lookup/submit service
+ *   3. gaialog-workers  — Background workers
+ *                         (data collection, queue, in-process UTXO maintainer,
+ *                          confirmation worker, wallet funding monitor)
+ *
+ * UTXO inventory (important):
+ *   The DB-backed UTXO splitter (`lib/utxo-maintainer.ts`) runs INSIDE
+ *   `gaialog-workers` and is the *only* component that can refill the
+ *   `overlay_admitted_utxos` pool the broadcast path actually consumes from.
+ *   The legacy file-backed `gaialog-utxo-manager` (Python) and
+ *   `gaialog-utxo-replenish` (TypeScript) processes were removed because
+ *   they monitored a parallel inventory that the workers never read from,
+ *   so they could not prevent inventory starvation. They remain available
+ *   as scripts (`scripts/emergency-utxo-manager.py`,
+ *   `scripts/utxo-auto-replenish.ts`) for break-glass emergency-legacy mode
+ *   only — gated by `GAIALOG_EMERGENCY_LEGACY_UTXO=true`.
  *
  * Usage:
  *   pm2 start ecosystem.config.cjs
@@ -134,67 +146,6 @@ module.exports = {
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       error_file: 'logs/workers-error.log',
       out_file: 'logs/workers-out.log',
-      merge_logs: true,
-      log_type: 'json',
-    },
-
-    {
-      name: 'gaialog-utxo-manager',
-      script: 'scripts/emergency-utxo-manager.py',
-      interpreter: 'python3',
-      cwd: __dirname,
-      instances: 1,
-      exec_mode: 'fork',
-      env: {
-        UTXO_MANAGER_PORT: '8787',
-        UTXO_MANAGER_SECRET: process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_SECRET || '',
-      },
-      max_memory_restart: '2G',
-      kill_timeout: 15000,
-      restart_delay: 3000,
-      max_restarts: 50,
-      min_uptime: '10s',
-      watch: false,
-      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
-      error_file: 'logs/utxo-manager-error.log',
-      out_file: 'logs/utxo-manager-out.log',
-      merge_logs: true,
-      log_type: 'json',
-    },
-
-    {
-      name: 'gaialog-utxo-replenish',
-      script: 'node',
-      args: ['--import', 'tsx', 'scripts/utxo-auto-replenish.ts'],
-      cwd: __dirname,
-      instances: 1,
-      exec_mode: 'fork',
-      env: {
-        NODE_ENV: 'production',
-        BSV_UTXO_SPLIT_OUTPUT_SATS: process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || '130',
-        BSV_TX_FEE_RATE_SAT_PER_BYTE: process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE || '0.105',
-        BSV_UTXO_REPLENISH_THRESHOLD: process.env.BSV_UTXO_REPLENISH_THRESHOLD || '500',
-        BSV_UTXO_REPLENISH_INTERVAL_MS: process.env.BSV_UTXO_REPLENISH_INTERVAL_MS || '60000',
-        GAIALOG_EMERGENCY_UTXO_MANAGER_URL: process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_URL || 'http://127.0.0.1:8787',
-        GAIALOG_EMERGENCY_UTXO_MANAGER_SECRET: process.env.GAIALOG_EMERGENCY_UTXO_MANAGER_SECRET || '',
-        BSV_WALLET_1_PRIVATE_KEY: process.env.BSV_WALLET_1_PRIVATE_KEY,
-        BSV_WALLET_1_ADDRESS: process.env.BSV_WALLET_1_ADDRESS,
-        BSV_WALLET_2_PRIVATE_KEY: process.env.BSV_WALLET_2_PRIVATE_KEY,
-        BSV_WALLET_2_ADDRESS: process.env.BSV_WALLET_2_ADDRESS,
-        BSV_WALLET_3_PRIVATE_KEY: process.env.BSV_WALLET_3_PRIVATE_KEY,
-        BSV_WALLET_3_ADDRESS: process.env.BSV_WALLET_3_ADDRESS,
-        BSV_GORILLAPOOL_API_KEY: process.env.BSV_GORILLAPOOL_API_KEY,
-      },
-      max_memory_restart: '512M',
-      kill_timeout: 10000,
-      restart_delay: 10000,
-      max_restarts: 100,
-      min_uptime: '30s',
-      exp_backoff_restart_delay: 2000,
-      watch: false,
-      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
-      error_file: 'logs/utxo-replenish-error.log',
-      out_file: 'logs/utxo-replenish-out.log',
       merge_logs: true,
       log_type: 'json',
     },

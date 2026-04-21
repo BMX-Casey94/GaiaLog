@@ -5,7 +5,13 @@ import * as bsv from 'bsv'
 import { bsvConfig } from './bsv-config'
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress } from './spend-source'
-import { acquireReserveUtxo, admitSplitOutputs, releaseUtxo, type InventoryUtxo } from './utxo-inventory'
+import {
+  acquireSplittableInput,
+  admitSplitOutputs,
+  getInventoryDiagnostic,
+  releaseUtxo,
+  type InventoryUtxo,
+} from './utxo-inventory'
 import { getMaintainerMinConfirmations } from './utxo-spend-policy'
 import { fetchTreasuryOverlayInventorySnapshot, logTreasuryOverlayInventorySummary } from './utxo-overlay-monitor'
 import { broadcastSplitTransactionRaw } from './broadcast-raw-tx'
@@ -73,12 +79,72 @@ if (!_g.__GAIALOG_UTXO_MAINT_STATE__) {
   _g.__GAIALOG_UTXO_MAINT_STATE__ = {
     pendingSplitUntilByAddress: new Map<string, number>(),
     mempoolBackoffUntil: new Map<string, number>(), // wallet → timestamp until which to skip
+    starvedAlertedAt: new Map<string, number>(),    // wallet → last starvation alert ts
   }
 }
 const maintState: {
   pendingSplitUntilByAddress: Map<string, number>
   mempoolBackoffUntil: Map<string, number>
+  starvedAlertedAt: Map<string, number>
 } = _g.__GAIALOG_UTXO_MAINT_STATE__
+
+// Throttle CRITICAL starvation alerts so we do not flood logs every 30s while
+// the operator is responding. Default 10 minutes.
+const STARVATION_ALERT_INTERVAL_MS = Math.max(
+  60_000,
+  Number(process.env.BSV_UTXO_STARVATION_ALERT_INTERVAL_MS || 600_000),
+)
+
+// Auto-bootstrap from unconfirmed UTXOs when the wallet has no confirmed
+// splittable input. Default ON because the failure mode otherwise is silent
+// permanent starvation after a recovery import or after the splitter
+// inevitably consumes the last large confirmed input. The unconfirmed input
+// path uses the same propagation grace as any other split.
+function autoBootstrapFromUnconfirmedEnabled(): boolean {
+  const raw = process.env.BSV_UTXO_AUTO_BOOTSTRAP_FROM_UNCONFIRMED
+  if (raw === undefined || raw === '') return true
+  return raw === 'true' || raw === '1'
+}
+
+async function emitStarvationAlert(
+  address: string,
+  walletIndex: number,
+  minRequired: number,
+  reason: 'no_confirmed_splittable' | 'no_splittable_at_all',
+): Promise<void> {
+  const lastAt = maintState.starvedAlertedAt.get(address) || 0
+  if (Date.now() - lastAt < STARVATION_ALERT_INTERVAL_MS) return
+  maintState.starvedAlertedAt.set(address, Date.now())
+
+  let diag: Awaited<ReturnType<typeof getInventoryDiagnostic>> | null = null
+  try {
+    diag = await getInventoryDiagnostic(walletIndex)
+  } catch {}
+
+  if (reason === 'no_splittable_at_all') {
+    console.error(
+      `🚨 [CRITICAL] UTXO splitter STARVED for W${walletIndex + 1} (${address.substring(0, 10)}...): ` +
+        `no UTXO ≥ ${minRequired} sats exists in overlay_admitted_utxos. ` +
+        `Largest available: ${diag?.largestSats ?? 'unknown'} sats ` +
+        `(largest confirmed: ${diag?.largestConfirmedSats ?? 'unknown'} sats). ` +
+        `Total live inventory: ${diag?.totalLiveUtxos ?? '?'} UTXOs / ${diag?.totalLiveSats ?? '?'} sats. ` +
+        `ACTION: send fresh BSV to ${address} from your funding wallet, then re-run ` +
+        `\`npx tsx scripts/recovery-import-onchain-utxos.ts --apply\` to admit it. ` +
+        `Until then this wallet cannot self-replenish and broadcasts will fail with ` +
+        `"No inventory UTXOs available across wallets".`,
+    )
+  } else {
+    console.warn(
+      `⚠️  [WARN] UTXO splitter has no CONFIRMED splittable input for W${walletIndex + 1} ` +
+        `(${address.substring(0, 10)}...): largest confirmed ${diag?.largestConfirmedSats ?? '?'} sats < ` +
+        `required ${minRequired} sats. ` +
+        `Largest UTXO of any confirmation: ${diag?.largestSats ?? '?'} sats ` +
+        `(unconfirmed reserves: ${(diag?.reserveLiveUtxos ?? 0) - (diag?.confirmedReserveUtxos ?? 0)}). ` +
+        `Auto-bootstrap from unconfirmed: ${autoBootstrapFromUnconfirmedEnabled() ? 'enabled' : 'disabled'}. ` +
+        `If the splitter cannot recover within ~30 minutes, send fresh BSV to ${address}.`,
+    )
+  }
+}
 
 // ─── UTXO fetch ─────────────────────────────────────────────────────────────
 async function getUnspent(address: string): Promise<any[]> {
@@ -182,21 +248,40 @@ async function topUpWallet(wif: string): Promise<{ txid: string; address: string
   }
 
   const minUsefulInput = estimateSplitRequirement(2)
-  let inputSource = await acquireReserveUtxo({
+
+  // Acquire ladder (atomic, in-place reserve promotion):
+  //   1. confirmed reserve  →  2. confirmed pool (promoted)  →
+  //   3. unconfirmed reserve  →  4. unconfirmed pool (promoted)
+  //
+  // Steps 3-4 are gated on EITHER the new auto-bootstrap default OR the
+  // legacy BSV_UTXO_BOOTSTRAP_FROM_UNCONFIRMED=true override. Auto-bootstrap
+  // is on by default to prevent silent permanent starvation after a recovery
+  // import. Set BSV_UTXO_AUTO_BOOTSTRAP_FROM_UNCONFIRMED=false to opt out.
+  const allowUnconfirmed =
+    autoBootstrapFromUnconfirmedEnabled() ||
+    process.env.BSV_UTXO_BOOTSTRAP_FROM_UNCONFIRMED === 'true'
+
+  let inputSource = await acquireSplittableInput({
     walletIndex,
     minSatoshis: minUsefulInput,
-    confirmedOnly: MIN_CONF > 0,
+    allowUnconfirmed,
   })
 
-  if (!inputSource && process.env.BSV_UTXO_BOOTSTRAP_FROM_UNCONFIRMED === 'true') {
-    inputSource = await acquireReserveUtxo({
-      walletIndex,
-      minSatoshis: minUsefulInput,
-      confirmedOnly: false,
-    })
+  if (!inputSource) {
+    // Distinguish the two failure modes so the operator gets actionable
+    // signal: either "wallet is wholly empty / under-funded" (needs
+    // external BSV transfer) vs "wallet has only too-small change outputs"
+    // (still under-funded for the configured SPLIT_OUTPUT_SATS).
+    let largestAvailable = 0
+    try {
+      const diag = await getInventoryDiagnostic(walletIndex)
+      largestAvailable = diag.largestSats
+    } catch {}
+    const reason: 'no_confirmed_splittable' | 'no_splittable_at_all' =
+      largestAvailable >= minUsefulInput ? 'no_confirmed_splittable' : 'no_splittable_at_all'
+    void emitStarvationAlert(address, walletIndex, minUsefulInput, reason)
+    return null
   }
-
-  if (!inputSource) return null
 
   const maxOutputs = maxSplitOutputsForInput(Number(inputSource.satoshis))
   if (maxOutputs < 2) {

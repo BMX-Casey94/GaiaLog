@@ -362,6 +362,143 @@ export async function admitSplitOutputs(input: AdmitSplitOutputsInput): Promise<
   })
 }
 
+export interface InventoryDiagnostic {
+  walletIndex: number
+  totalLiveUtxos: number
+  confirmedLiveUtxos: number
+  reserveLiveUtxos: number
+  confirmedReserveUtxos: number
+  largestSats: number
+  largestConfirmedSats: number
+  largestConfirmedReserveSats: number
+  totalLiveSats: number
+  confirmedLiveSats: number
+}
+
+/**
+ * Cheap forensic snapshot of a single wallet's UTXO inventory in
+ * `overlay_admitted_utxos`. Used by the UTXO maintainer to emit precise
+ * CRITICAL alerts when no splittable input exists, and by the wallet
+ * funding monitor to compute days-of-runway.
+ *
+ * All counters exclude removed=true rows.  "Live" means the row is
+ * still considered spendable bookkeeping.
+ */
+export async function getInventoryDiagnostic(walletIndex: number): Promise<InventoryDiagnostic> {
+  return withOverlayTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = ${getAcquireStatementTimeoutMs()}`)
+    const res = await client.query<{
+      total_live: string
+      confirmed_live: string
+      reserve_live: string
+      confirmed_reserve: string
+      largest_sats: string
+      largest_confirmed_sats: string
+      largest_confirmed_reserve_sats: string
+      total_live_sats: string
+      confirmed_live_sats: string
+    }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE removed = false)::text AS total_live,
+         COUNT(*) FILTER (WHERE removed = false AND confirmed = true)::text AS confirmed_live,
+         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'reserve')::text AS reserve_live,
+         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'reserve' AND confirmed = true)::text AS confirmed_reserve,
+         COALESCE(MAX(satoshis) FILTER (WHERE removed = false), 0)::text AS largest_sats,
+         COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text AS largest_confirmed_sats,
+         COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true AND utxo_role = 'reserve'), 0)::text AS largest_confirmed_reserve_sats,
+         COALESCE(SUM(satoshis) FILTER (WHERE removed = false), 0)::text AS total_live_sats,
+         COALESCE(SUM(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text AS confirmed_live_sats
+       FROM overlay_admitted_utxos
+       WHERE wallet_index = $1`,
+      [walletIndex],
+    )
+    const row = res.rows[0]
+    return {
+      walletIndex,
+      totalLiveUtxos: Number(row?.total_live || '0'),
+      confirmedLiveUtxos: Number(row?.confirmed_live || '0'),
+      reserveLiveUtxos: Number(row?.reserve_live || '0'),
+      confirmedReserveUtxos: Number(row?.confirmed_reserve || '0'),
+      largestSats: Number(row?.largest_sats || '0'),
+      largestConfirmedSats: Number(row?.largest_confirmed_sats || '0'),
+      largestConfirmedReserveSats: Number(row?.largest_confirmed_reserve_sats || '0'),
+      totalLiveSats: Number(row?.total_live_sats || '0'),
+      confirmedLiveSats: Number(row?.confirmed_live_sats || '0'),
+    }
+  })
+}
+
+/**
+ * Atomically locate and lock the largest splittable input for a wallet,
+ * promoting it to `utxo_role='reserve'` if it was a pool row.
+ *
+ * Acquisition order (each step inside a single transaction):
+ *   1. Confirmed reserve UTXO (the natural happy path).
+ *   2. Confirmed pool UTXO ≥ minSatoshis — promoted to reserve in-place.
+ *   3. (Only when allowUnconfirmed=true) unconfirmed reserve, then
+ *      unconfirmed pool with the same in-place promotion.
+ *
+ * Promotion is critical: without it the maintainer can spend the largest
+ * available pool UTXO once and then have no large input left to split
+ * again — the change classification logic in admitSplitOutputs only
+ * promotes change ≥ SPLIT_RESERVE_MIN_SATS, which can fail to refill the
+ * reserve role under "death by a thousand cuts" splitting.
+ *
+ * Returns null if no UTXO ≥ minSatoshis exists (with the requested
+ * confirmation policy). Callers should consult getInventoryDiagnostic
+ * to log a precise CRITICAL alert in that case.
+ */
+export async function acquireSplittableInput(input: {
+  walletIndex: number
+  minSatoshis: number
+  allowUnconfirmed?: boolean
+  lockedBy?: string
+}): Promise<InventoryUtxo | null> {
+  return withOverlayTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = ${getAcquireStatementTimeoutMs()}`)
+
+    const ladder: Array<{ role: UtxoRole; confirmedOnly: boolean }> = [
+      { role: 'reserve', confirmedOnly: true },
+      { role: 'pool', confirmedOnly: true },
+    ]
+    if (input.allowUnconfirmed === true) {
+      ladder.push({ role: 'reserve', confirmedOnly: false })
+      ladder.push({ role: 'pool', confirmedOnly: false })
+    }
+
+    for (const step of ladder) {
+      const acquired = await acquireInventoryUtxo(client, {
+        walletIndex: input.walletIndex,
+        role: step.role,
+        minSatoshis: input.minSatoshis,
+        confirmedOnly: step.confirmedOnly,
+        lockedBy: input.lockedBy,
+        preferLargest: true,
+      })
+      if (!acquired) continue
+
+      // Promote pool → reserve in-place so the splitter has a deterministic
+      // home for it next cycle (and so subsequent change classification can
+      // always find at least one reserve row in the wallet).
+      if (acquired.utxo_role !== 'reserve') {
+        await client.query(
+          `UPDATE overlay_admitted_utxos
+              SET utxo_role = 'reserve'
+            WHERE topic = $1
+              AND txid = $2
+              AND vout = $3
+              AND utxo_role <> 'reserve'`,
+          [acquired.topic, acquired.txid, acquired.vout],
+        )
+        acquired.utxo_role = 'reserve'
+      }
+      return acquired
+    }
+
+    return null
+  })
+}
+
 export async function getWalletInventorySummary(walletIndex: number): Promise<WalletInventorySummary> {
   const result = await withOverlayTransaction(async (client) => {
     const res = await client.query<{
