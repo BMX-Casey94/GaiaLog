@@ -19,8 +19,8 @@
  *      first, and atomically marks them locked.
  *   2. Builds one `N inputs → 1 output` P2PKH transaction signed by that
  *      wallet's private key, with the explicit fee at `BSV_TX_FEE_RATE`.
- *   3. Broadcasts via the same ARC path used by the splitter (GorillaPool →
- *      TAAL → WoC fallback chain in `lib/broadcast-raw-tx.ts`).
+ *   3. Broadcasts via the same ARC path used by the splitter (TAAL →
+ *      GorillaPool → WoC fallback chain in `lib/broadcast-raw-tx.ts`).
  *   4. On `ok`: marks all N inputs `removed=true, spending_txid=<txid>` and
  *      admits the new big output as a `reserve` UTXO so the maintainer picks
  *      it up on its next cycle.

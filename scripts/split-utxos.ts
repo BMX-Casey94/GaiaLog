@@ -5,7 +5,7 @@
 //
 // Env: loads `.env` then `.env.local` (local overrides). Set BSV_* keys on the VPS `.env`.
 // UTXO source: shared `getUnspentForAddress` (overlay when BSV_SPEND_SOURCE_MODE=overlay, else WoC).
-// Broadcast: GorillaPool ARC → TAAL ARC → WoC (`lib/broadcast-raw-tx.ts`).
+// Broadcast: TAAL ARC → GorillaPool ARC → WoC (`lib/broadcast-raw-tx.ts`).
 
 import './load-env-for-tools'
 

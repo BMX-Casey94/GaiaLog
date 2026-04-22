@@ -1,5 +1,8 @@
 /**
- * GorillaPool ARC → TAAL ARC → WhatsOnChain raw-tx broadcast (shared by UTXO maintainer and split-utxos script).
+ * TAAL ARC → GorillaPool ARC → WhatsOnChain raw-tx broadcast (shared by UTXO maintainer and split-utxos script).
+ * TAAL is primary because GorillaPool's outbound peer relay was observed to silently fail to propagate
+ * TXs past their own mempool (TXs sit at ANNOUNCED_TO_NETWORK indefinitely while WoC/Bitails 404).
+ * Requires BSV_ARC_API_KEY in .env (TAAL platform.taal.com free tier).
  * Split / maintainer path accepts SEEN_IN_ORPHAN_MEMPOOL as OK (same as legacy maintainer behaviour).
  */
 
@@ -54,10 +57,34 @@ function parseArcResponse(responseText: string, providerLabel: string): string |
 }
 
 /**
- * Broadcast a signed raw hex transaction (split TXs, tooling). Tries GorillaPool, then TAAL, then WoC.
+ * Broadcast a signed raw hex transaction (split TXs, tooling). Tries TAAL, then GorillaPool, then WoC.
+ *
+ * Order rationale: TAAL is primary because GorillaPool's outbound peer relay was observed to
+ * silently drop TXs (TXs sit at ANNOUNCED_TO_NETWORK on GorillaPool while WoC/Bitails 404 forever).
+ * GorillaPool remains as a no-API-key fallback for environments without BSV_ARC_API_KEY configured.
  */
 export async function broadcastSplitTransactionRaw(rawHex: string): Promise<string> {
   const errors: string[] = []
+
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (ARC_KEY) headers.Authorization = `Bearer ${ARC_KEY}`
+    const res = await fetch(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ rawTx: rawHex }),
+    })
+    const text = await res.text().catch(() => '')
+    if (res.ok) {
+      const txid = parseArcResponse(text, 'TAAL')
+      if (txid) return txid
+      errors.push(`TAAL ARC: rejected — ${text.substring(0, 200)}`)
+    } else {
+      errors.push(`TAAL ARC ${res.status}: ${text.substring(0, 200)}`)
+    }
+  } catch (e) {
+    errors.push(`TAAL ARC error: ${e instanceof Error ? e.message : String(e)}`)
+  }
 
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -78,26 +105,6 @@ export async function broadcastSplitTransactionRaw(rawHex: string): Promise<stri
     }
   } catch (e) {
     errors.push(`GorillaPool ARC error: ${e instanceof Error ? e.message : String(e)}`)
-  }
-
-  try {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-    if (ARC_KEY) headers.Authorization = `Bearer ${ARC_KEY}`
-    const res = await fetch(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ rawTx: rawHex }),
-    })
-    const text = await res.text().catch(() => '')
-    if (res.ok) {
-      const txid = parseArcResponse(text, 'TAAL')
-      if (txid) return txid
-      errors.push(`TAAL ARC: rejected — ${text.substring(0, 200)}`)
-    } else {
-      errors.push(`TAAL ARC ${res.status}: ${text.substring(0, 200)}`)
-    }
-  } catch (e) {
-    errors.push(`TAAL ARC error: ${e instanceof Error ? e.message : String(e)}`)
   }
 
   try {

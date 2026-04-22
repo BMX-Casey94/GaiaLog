@@ -2168,101 +2168,11 @@ export class BlockchainService {
       } catch {}
     }
 
-    // Method 1: GorillaPool ARC (primary) — public access, no API key required
-    try {
-      if (this.isBroadcastChannelBackedOff('gorillapool_arc')) {
-        errors.push('GorillaPool ARC skipped (ENDPOINT_BACKOFF)')
-        this.logBroadcastStep(traceId, 'gorillapool_arc', 'skipped', 0, 'ENDPOINT_BACKOFF')
-      } else {
-      const gpStartedAt = Date.now()
-      this.logBroadcastStep(traceId, 'gorillapool_arc', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
-      const gpHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
-      const gpApiKey = process.env.BSV_GORILLAPOOL_API_KEY
-      if (gpApiKey) gpHeaders['Authorization'] = `Bearer ${gpApiKey}`
-
-      const gpRes = await this.fetchWithTimeout(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
-        method: 'POST',
-        headers: gpHeaders,
-        body: JSON.stringify(useExtended ? arcBodyExtended : arcBodyRaw)
-      })
-      const gpText = await gpRes.text().catch(() => '')
-      if (gpRes.ok) {
-        const txid = this.parseArcResponse(gpText, 'GorillaPool')
-        if (txid) {
-          this.logBroadcastStep(traceId, 'gorillapool_arc', 'accepted', Date.now() - gpStartedAt, `txid=${this.shortenToken(txid, 12)}`)
-          this.clearBroadcastChannelBackoff('gorillapool_arc')
-          return { txid, acceptedVia: 'gorillapool_arc' }
-        }
-        this.logBroadcastStep(traceId, 'gorillapool_arc', 'rejected', Date.now() - gpStartedAt, 'ok-without-accepted-txid')
-        errors.push(`GorillaPool ARC: rejected or unexpected response: ${gpText.substring(0, 200)}`)
-      } else {
-        if (bsvConfig.logging.level !== 'error') {
-          console.warn(`⚠️  ARC (GorillaPool) ${gpRes.status}: ${gpText.substring(0, 150)}`)
-        }
-        if (gpRes.status === 429) {
-          this.noteBroadcastChannelBackoff('gorillapool_arc', 60000, 'HTTP 429')
-        } else if (gpRes.status >= 500) {
-          this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, `HTTP ${gpRes.status}`)
-        }
-        // GorillaPool sometimes rejects extended-format metadata with 461, or returns 460 when parents
-        // are not visible to ARC. Retry once with rawTx-only before failing over to TAAL/WoC.
-        const gp461 = gpRes.status === 461 || /malformed|false\/empty top stack/i.test(gpText)
-        const gp460 =
-          gpRes.status === 460 ||
-          /parent transaction not found|fee requires|Not extended format|Missing input scripts|Failed validity with parents/i.test(gpText)
-        const gpCompatRetry = useExtended && (gp461 || gp460)
-        this.logBroadcastStep(traceId, 'gorillapool_arc', `http_${gpRes.status}`, Date.now() - gpStartedAt, gpCompatRetry ? 'compat-retry' : undefined)
-        if (gpCompatRetry) {
-          try {
-            const gpCompatStartedAt = Date.now()
-            this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
-            const gpCompatRes = await this.fetchWithTimeout(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
-              method: 'POST',
-              headers: gpHeaders,
-              body: JSON.stringify(arcBodyRaw)
-            })
-            const gpCompatText = await gpCompatRes.text().catch(() => '')
-            if (gpCompatRes.ok) {
-              const txid = this.parseArcResponse(gpCompatText, 'GorillaPool')
-              if (txid) {
-                this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'accepted', Date.now() - gpCompatStartedAt, `txid=${this.shortenToken(txid, 12)}`)
-                if (bsvConfig.logging.level !== 'error') {
-                  console.warn('⚠️  ARC (GorillaPool): accepted after rawTx compatibility retry (460/461 / extended mismatch)')
-                }
-                this.clearBroadcastChannelBackoff('gorillapool_arc')
-                return { txid, acceptedVia: 'gorillapool_arc' }
-              }
-              this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'rejected', Date.now() - gpCompatStartedAt, 'ok-without-accepted-txid')
-              errors.push(`GorillaPool ARC compatibility retry: unexpected response: ${gpCompatText.substring(0, 200)}`)
-            } else {
-              this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', `http_${gpCompatRes.status}`, Date.now() - gpCompatStartedAt)
-              if (bsvConfig.logging.level !== 'error') {
-                console.warn(`⚠️  ARC (GorillaPool compat) ${gpCompatRes.status}: ${gpCompatText.substring(0, 150)}`)
-              }
-              if (gpCompatRes.status === 429) {
-                this.noteBroadcastChannelBackoff('gorillapool_arc', 60000, 'HTTP 429')
-              } else if (gpCompatRes.status >= 500) {
-                this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, `HTTP ${gpCompatRes.status}`)
-              }
-              errors.push(`GorillaPool ARC compatibility retry failed (${gpCompatRes.status}): ${gpCompatText.substring(0, 300)}`)
-            }
-          } catch (compatErr) {
-            this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'error', undefined, compatErr instanceof Error ? compatErr.message : String(compatErr))
-            this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, compatErr instanceof Error ? compatErr.message : String(compatErr))
-            errors.push(`GorillaPool ARC compatibility retry error: ${compatErr instanceof Error ? compatErr.message : String(compatErr)}`)
-          }
-        } else {
-          errors.push(`GorillaPool ARC failed (${gpRes.status}): ${gpText.substring(0, 300)}`)
-        }
-      }
-      }
-    } catch (e) {
-      this.logBroadcastStep(traceId, 'gorillapool_arc', 'error', undefined, e instanceof Error ? e.message : String(e))
-      this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, e instanceof Error ? e.message : String(e))
-      errors.push(`GorillaPool ARC error: ${e instanceof Error ? e.message : String(e)}`)
-    }
-
-    // Method 2: TAAL ARC (fallback)
+    // Method 1: TAAL ARC (primary) — requires BSV_ARC_API_KEY (TAAL platform.taal.com).
+    // Promoted ahead of GorillaPool because GorillaPool's outbound peer relay was observed to
+    // silently fail to propagate TXs past its own mempool (TXs sit at ANNOUNCED_TO_NETWORK
+    // indefinitely while WoC/Bitails/TAAL all 404 the txid). TAAL is a miner-operated node and
+    // both relays to peers and submits to its own pool, giving us actual on-chain confirmations.
     try {
       if (this.isBroadcastChannelBackedOff('taal_arc')) {
         errors.push('TAAL ARC skipped (ENDPOINT_BACKOFF)')
@@ -2352,6 +2262,104 @@ export class BlockchainService {
       this.logBroadcastStep(traceId, 'taal_arc', 'error', undefined, e instanceof Error ? e.message : String(e))
       this.noteBroadcastChannelBackoff('taal_arc', 30000, e instanceof Error ? e.message : String(e))
       errors.push(`TAAL ARC error: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    // Method 2: GorillaPool ARC (fallback) — public access, no API key required.
+    // Kept in the chain as a safety net for environments without BSV_ARC_API_KEY and to absorb
+    // bursts when TAAL is rate-limiting (HTTP 429). Note: GorillaPool may report
+    // ANNOUNCED_TO_NETWORK without actually relaying to peers — confirmation polling will
+    // detect the staleness and trigger a re-broadcast through TAAL on the next pass.
+    try {
+      if (this.isBroadcastChannelBackedOff('gorillapool_arc')) {
+        errors.push('GorillaPool ARC skipped (ENDPOINT_BACKOFF)')
+        this.logBroadcastStep(traceId, 'gorillapool_arc', 'skipped', 0, 'ENDPOINT_BACKOFF')
+      } else {
+      const gpStartedAt = Date.now()
+      this.logBroadcastStep(traceId, 'gorillapool_arc', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
+      const gpHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+      const gpApiKey = process.env.BSV_GORILLAPOOL_API_KEY
+      if (gpApiKey) gpHeaders['Authorization'] = `Bearer ${gpApiKey}`
+
+      const gpRes = await this.fetchWithTimeout(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
+        method: 'POST',
+        headers: gpHeaders,
+        body: JSON.stringify(useExtended ? arcBodyExtended : arcBodyRaw)
+      })
+      const gpText = await gpRes.text().catch(() => '')
+      if (gpRes.ok) {
+        const txid = this.parseArcResponse(gpText, 'GorillaPool')
+        if (txid) {
+          this.logBroadcastStep(traceId, 'gorillapool_arc', 'accepted', Date.now() - gpStartedAt, `txid=${this.shortenToken(txid, 12)}`)
+          this.clearBroadcastChannelBackoff('gorillapool_arc')
+          return { txid, acceptedVia: 'gorillapool_arc' }
+        }
+        this.logBroadcastStep(traceId, 'gorillapool_arc', 'rejected', Date.now() - gpStartedAt, 'ok-without-accepted-txid')
+        errors.push(`GorillaPool ARC: rejected or unexpected response: ${gpText.substring(0, 200)}`)
+      } else {
+        if (bsvConfig.logging.level !== 'error') {
+          console.warn(`⚠️  ARC (GorillaPool) ${gpRes.status}: ${gpText.substring(0, 150)}`)
+        }
+        if (gpRes.status === 429) {
+          this.noteBroadcastChannelBackoff('gorillapool_arc', 60000, 'HTTP 429')
+        } else if (gpRes.status >= 500) {
+          this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, `HTTP ${gpRes.status}`)
+        }
+        // GorillaPool sometimes rejects extended-format metadata with 461, or returns 460 when parents
+        // are not visible to ARC. Retry once with rawTx-only before failing over to WoC.
+        const gp461 = gpRes.status === 461 || /malformed|false\/empty top stack/i.test(gpText)
+        const gp460 =
+          gpRes.status === 460 ||
+          /parent transaction not found|fee requires|Not extended format|Missing input scripts|Failed validity with parents/i.test(gpText)
+        const gpCompatRetry = useExtended && (gp461 || gp460)
+        this.logBroadcastStep(traceId, 'gorillapool_arc', `http_${gpRes.status}`, Date.now() - gpStartedAt, gpCompatRetry ? 'compat-retry' : undefined)
+        if (gpCompatRetry) {
+          try {
+            const gpCompatStartedAt = Date.now()
+            this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
+            const gpCompatRes = await this.fetchWithTimeout(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
+              method: 'POST',
+              headers: gpHeaders,
+              body: JSON.stringify(arcBodyRaw)
+            })
+            const gpCompatText = await gpCompatRes.text().catch(() => '')
+            if (gpCompatRes.ok) {
+              const txid = this.parseArcResponse(gpCompatText, 'GorillaPool')
+              if (txid) {
+                this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'accepted', Date.now() - gpCompatStartedAt, `txid=${this.shortenToken(txid, 12)}`)
+                if (bsvConfig.logging.level !== 'error') {
+                  console.warn('⚠️  ARC (GorillaPool): accepted after rawTx compatibility retry (460/461 / extended mismatch)')
+                }
+                this.clearBroadcastChannelBackoff('gorillapool_arc')
+                return { txid, acceptedVia: 'gorillapool_arc' }
+              }
+              this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'rejected', Date.now() - gpCompatStartedAt, 'ok-without-accepted-txid')
+              errors.push(`GorillaPool ARC compatibility retry: unexpected response: ${gpCompatText.substring(0, 200)}`)
+            } else {
+              this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', `http_${gpCompatRes.status}`, Date.now() - gpCompatStartedAt)
+              if (bsvConfig.logging.level !== 'error') {
+                console.warn(`⚠️  ARC (GorillaPool compat) ${gpCompatRes.status}: ${gpCompatText.substring(0, 150)}`)
+              }
+              if (gpCompatRes.status === 429) {
+                this.noteBroadcastChannelBackoff('gorillapool_arc', 60000, 'HTTP 429')
+              } else if (gpCompatRes.status >= 500) {
+                this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, `HTTP ${gpCompatRes.status}`)
+              }
+              errors.push(`GorillaPool ARC compatibility retry failed (${gpCompatRes.status}): ${gpCompatText.substring(0, 300)}`)
+            }
+          } catch (compatErr) {
+            this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'error', undefined, compatErr instanceof Error ? compatErr.message : String(compatErr))
+            this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, compatErr instanceof Error ? compatErr.message : String(compatErr))
+            errors.push(`GorillaPool ARC compatibility retry error: ${compatErr instanceof Error ? compatErr.message : String(compatErr)}`)
+          }
+        } else {
+          errors.push(`GorillaPool ARC failed (${gpRes.status}): ${gpText.substring(0, 300)}`)
+        }
+      }
+      }
+    } catch (e) {
+      this.logBroadcastStep(traceId, 'gorillapool_arc', 'error', undefined, e instanceof Error ? e.message : String(e))
+      this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, e instanceof Error ? e.message : String(e))
+      errors.push(`GorillaPool ARC error: ${e instanceof Error ? e.message : String(e)}`)
     }
 
     // Method 3: WhatsOnChain broadcast (final fallback)
