@@ -10,6 +10,7 @@ import {
   admitSplitOutputs,
   archivePhantomUtxo,
   getInventoryDiagnostic,
+  reapStaleLocks,
   releaseUtxo,
   type InventoryUtxo,
 } from './utxo-inventory'
@@ -620,6 +621,14 @@ export function startUtxoMaintainer(): void {
     if (now - getLastInventoryLogAt() >= invInterval) {
       setLastInventoryLogAt(now)
       logTreasuryOverlayInventorySummary().catch(() => {})
+      // Stale-lock reaper: PM2's 30-minute cron_restart can kill the process
+      // between acquire and release, leaving rows locked=true forever. Reap
+      // anything locked > 15 min on the same cadence as the inventory log.
+      reapStaleLocks()
+        .then((released) => {
+          if (released > 0) console.warn(`🔓 UTXO inventory: released ${released} stale lock(s) (owner crashed/restarted)`)
+        })
+        .catch(() => {})
     }
   }
 

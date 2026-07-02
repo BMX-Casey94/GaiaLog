@@ -19,6 +19,7 @@
  */
 
 import { query } from './db'
+import { readCursor, writeCursor } from './repositories'
 import { DATA_FAMILY_DESCRIPTORS } from './stream-registry'
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
@@ -57,6 +58,12 @@ const DEFAULT_STATEMENT_TIMEOUT_MS = 60_000
 // compact while preserving recent rows for any forensic lookups.
 const DEFAULT_UTXO_PRUNE_DAYS = 3
 const DEFAULT_MAX_UTXO_PRUNES_PER_RUN = 500_000
+// overlay_submissions is a broadcast audit log whose raw_tx/beef blobs made it
+// the single largest object in the database (15 GB / 4.5M rows observed in
+// production, 2026-07). Every accepted transaction is permanently on-chain, so
+// rows older than this window carry no recovery value. 0 disables pruning.
+const DEFAULT_SUBMISSIONS_RETENTION_DAYS = 14
+const DEFAULT_MAX_SUBMISSION_PRUNES_PER_RUN = 500_000
 
 // ─── Configuration helpers ───────────────────────────────────────────────────
 
@@ -255,6 +262,12 @@ export interface RetentionRunResult {
     durationMs: number
     capped: boolean
   }
+  submissionsPrune: {
+    retentionDays: number
+    rowsDeleted: number
+    durationMs: number
+    capped: boolean
+  }
 }
 
 export async function runRetention(opts?: { dryRun?: boolean }): Promise<RetentionRunResult> {
@@ -443,6 +456,43 @@ export async function runRetention(opts?: { dryRun?: boolean }): Promise<Retenti
     utxoPruneCapped = utxoPruned >= utxoPruneCap
   }
 
+  // ─ Overlay submissions prune ───────────────────────────────────────────────
+  // Audit rows for already-accepted broadcasts. The chain is the permanent
+  // record; these blobs (raw_tx + beef per row) grow ~GB/week at production
+  // throughput and were observed at 15 GB — pure dead weight for CPU-heavy
+  // autovacuum and backups.
+  const submissionsDays = envInt('RETENTION_SUBMISSIONS_DAYS', DEFAULT_SUBMISSIONS_RETENTION_DAYS)
+  const submissionsCap = envInt('RETENTION_MAX_SUBMISSION_PRUNES_PER_RUN', DEFAULT_MAX_SUBMISSION_PRUNES_PER_RUN)
+  const submissionsCutoff = new Date(Date.now() - submissionsDays * 86_400_000)
+  const submissionsStarted = Date.now()
+  let submissionsPruned = 0
+  let submissionsCapped = false
+
+  if (!dryRun && submissionsDays > 0) {
+    while (submissionsPruned < submissionsCap) {
+      const remaining = submissionsCap - submissionsPruned
+      const limit = Math.min(batchSize, remaining)
+
+      const result = await query(
+        `WITH eligible AS (
+           SELECT txid, topic
+             FROM overlay_submissions
+            WHERE created_at < $1
+            LIMIT $2
+         )
+         DELETE FROM overlay_submissions s
+           USING eligible e
+          WHERE s.txid = e.txid
+            AND s.topic = e.topic`,
+        [submissionsCutoff, limit],
+      )
+      const rowsThisBatch = result.rowCount ?? 0
+      submissionsPruned += rowsThisBatch
+      if (rowsThisBatch < limit) break
+    }
+    submissionsCapped = submissionsPruned >= submissionsCap
+  }
+
   return {
     startedAt: startedAt.toISOString(),
     finishedAt: new Date().toISOString(),
@@ -463,5 +513,85 @@ export async function runRetention(opts?: { dryRun?: boolean }): Promise<Retenti
       durationMs: Date.now() - utxoPruneStarted,
       capped: utxoPruneCapped,
     },
+    submissionsPrune: {
+      retentionDays: submissionsDays,
+      rowsDeleted: submissionsPruned,
+      durationMs: Date.now() - submissionsStarted,
+      capped: submissionsCapped,
+    },
   }
+}
+
+// ─── In-process scheduler (VPS/PM2 deployments) ──────────────────────────────
+// The /api/maintenance/retention route is wired to a Vercel Cron in
+// vercel.json, but the production deployment runs on a VPS under PM2 where
+// that cron NEVER fires. Without retention, tx_log and the spent-UTXO heap
+// grow unbounded (observed: tens of millions of tx_log rows, 50s COUNT
+// scans, 449ms single-row INSERTs) and eventually saturate the database CPU.
+//
+// This scheduler runs the same retention pass once per UTC day from within
+// the worker process. The last-run marker is persisted in provider_cursors
+// (provider='__retention__') so PM2's 30-minute cron_restart cannot cause
+// duplicate runs, and a cluster-wide advisory lock guards against two
+// processes racing.
+
+const RETENTION_SCHEDULER_KEY = '__GAIALOG_RETENTION_SCHEDULER__' as const
+const RETENTION_CHECK_INTERVAL_MS = 10 * 60 * 1000
+const RETENTION_MIN_INTERVAL_MS = Math.max(
+  60 * 60 * 1000,
+  Number(process.env.RETENTION_INTERVAL_MS || 24 * 60 * 60 * 1000),
+)
+// Default window start 03:00 UTC (mirrors the intended 03:17 Vercel schedule).
+const RETENTION_HOUR_UTC = Math.min(23, Math.max(0, Number(process.env.RETENTION_HOUR_UTC ?? 3)))
+
+async function retentionSchedulerTick(): Promise<void> {
+  const now = Date.now()
+  const lastRun = Number(await readCursor('__retention__', '', 'last_run_ms')) || 0
+  if (now - lastRun < RETENTION_MIN_INTERVAL_MS) return
+  // Only start a pass in (or after) the configured window hour so the heavy
+  // DELETE batches land in the quiet overnight period, not at peak.
+  if (new Date().getUTCHours() < RETENTION_HOUR_UTC) return
+
+  const lock = await query<{ locked: boolean }>(
+    `SELECT pg_try_advisory_lock(hashtext('gaialog:retention')) AS locked`,
+  )
+  if (!lock.rows[0]?.locked) return
+
+  try {
+    // Re-check under the lock in case another process just finished a pass.
+    const lastRunLocked = Number(await readCursor('__retention__', '', 'last_run_ms')) || 0
+    if (now - lastRunLocked < RETENTION_MIN_INTERVAL_MS) return
+
+    console.log('🧹 Retention: starting scheduled pass...')
+    const result = await runRetention({ dryRun: false })
+    await writeCursor('__retention__', '', 'last_run_ms', Date.now())
+    const familyDeleted = result.families.reduce((sum, f) => sum + f.deleted, 0)
+    console.log(
+      `🧹 Retention: done — explorer=${familyDeleted} tx_log=${result.txLog.deleted} ` +
+        `utxoCompacted=${result.utxoCompaction.rowsCompacted} utxoPruned=${result.utxoPrune.rowsDeleted} ` +
+        `(${result.startedAt} → ${result.finishedAt})`,
+    )
+  } finally {
+    await query(`SELECT pg_advisory_unlock(hashtext('gaialog:retention'))`).catch(() => {})
+  }
+}
+
+export function startRetentionScheduler(): void {
+  if (process.env.RETENTION_SCHEDULER_DISABLED === 'true') return
+  const globalState = globalThis as any
+  if (globalState[RETENTION_SCHEDULER_KEY]) return
+  globalState[RETENTION_SCHEDULER_KEY] = true
+
+  const tick = () => {
+    retentionSchedulerTick().catch((e) => {
+      console.warn(`🧹 Retention scheduler error: ${e instanceof Error ? e.message : String(e)}`)
+    })
+  }
+  setInterval(tick, RETENTION_CHECK_INTERVAL_MS)
+  // First check shortly after boot (delayed so startup CPU settles first).
+  setTimeout(tick, 60 * 1000)
+  console.log(
+    `🧹 Retention scheduler started (window ≥ ${String(RETENTION_HOUR_UTC).padStart(2, '0')}:00 UTC, ` +
+      `min interval ${Math.round(RETENTION_MIN_INTERVAL_MS / 3_600_000)}h)`,
+  )
 }

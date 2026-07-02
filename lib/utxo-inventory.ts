@@ -224,6 +224,50 @@ export async function releaseUtxo(
 }
 
 /**
+ * Release inventory rows whose lock has gone stale.
+ *
+ * Locks are only ever held for the few seconds between acquire and
+ * release/consume. But if the process dies in that window — and PM2
+ * cron_restarts the worker every 30 minutes — the row stays locked=true
+ * FOREVER: no code path ever cleared crashed-owner locks. Over weeks of
+ * restarts this silently locks out the pool ("No inventory UTXOs available"
+ * while the topic-count rollup still reports plenty, because the rollup
+ * ignores `locked`).
+ *
+ * Anything locked for longer than maxAgeMinutes (default 15) is provably
+ * orphaned. Batched per wallet so the partial inventory index is usable and
+ * no statement runs unbounded.
+ */
+export async function reapStaleLocks(maxAgeMinutes: number = 15): Promise<number> {
+  const safeAge = Math.max(5, Math.floor(maxAgeMinutes))
+  let total = 0
+  await withOverlayTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = 30000`)
+    const res = await client.query(
+      `UPDATE overlay_admitted_utxos u
+          SET locked = false,
+              locked_by = NULL,
+              locked_at = NULL
+         FROM (
+           SELECT topic, txid, vout
+             FROM overlay_admitted_utxos
+            WHERE removed = false
+              AND locked = true
+              AND locked_at < now() - ($1::int * interval '1 minute')
+            LIMIT 5000
+            FOR UPDATE SKIP LOCKED
+         ) stale
+        WHERE u.topic = stale.topic
+          AND u.txid = stale.txid
+          AND u.vout = stale.vout`,
+      [safeAge],
+    )
+    total = res.rowCount ?? 0
+  })
+  return total
+}
+
+/**
  * Permanently archive an inventory row whose parent transaction has been
  * verified as unknown on-chain (phantom output). Without this, the splitter
  * re-acquires the same phantom row every maintainer cycle — preferLargest
@@ -539,6 +583,15 @@ export async function acquireSplittableInput(input: {
 
 export async function getWalletInventorySummary(walletIndex: number): Promise<WalletInventorySummary> {
   const result = await withOverlayTransaction(async (client) => {
+    // Fail fast: this is telemetry — it must never occupy a backend for
+    // tens of seconds while the broadcast path is starved for CPU.
+    await client.query(`SET LOCAL statement_timeout = 15000`)
+    // `removed = false` lives in the WHERE clause (not only inside FILTERs)
+    // so the planner can use the partial inventory index
+    // (overlay_admitted_utxos_inventory_idx ... WHERE removed = false) as an
+    // index-only scan. The previous shape (WHERE wallet_index = $1 only)
+    // heap-scanned every live AND spent row for the wallet — observed at
+    // ~44s per call on the bloated production table.
     const res = await client.query<{
       total_pool: string
       confirmed_pool: string
@@ -548,14 +601,15 @@ export async function getWalletInventorySummary(walletIndex: number): Promise<Wa
       locked_reserve: string
     }>(
       `SELECT
-         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'pool')::text AS total_pool,
-         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'pool' AND confirmed = true)::text AS confirmed_pool,
-         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'pool' AND locked = true)::text AS locked_pool,
-         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'reserve')::text AS total_reserve,
-         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'reserve' AND confirmed = true)::text AS confirmed_reserve,
-         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'reserve' AND locked = true)::text AS locked_reserve
+         COUNT(*) FILTER (WHERE utxo_role = 'pool')::text AS total_pool,
+         COUNT(*) FILTER (WHERE utxo_role = 'pool' AND confirmed = true)::text AS confirmed_pool,
+         COUNT(*) FILTER (WHERE utxo_role = 'pool' AND locked = true)::text AS locked_pool,
+         COUNT(*) FILTER (WHERE utxo_role = 'reserve')::text AS total_reserve,
+         COUNT(*) FILTER (WHERE utxo_role = 'reserve' AND confirmed = true)::text AS confirmed_reserve,
+         COUNT(*) FILTER (WHERE utxo_role = 'reserve' AND locked = true)::text AS locked_reserve
        FROM overlay_admitted_utxos
-      WHERE wallet_index = $1`,
+      WHERE wallet_index = $1
+        AND removed = false`,
       [walletIndex],
     )
     return res.rows[0]

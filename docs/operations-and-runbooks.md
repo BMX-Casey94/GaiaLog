@@ -87,10 +87,26 @@ EXPLORER_WRITE_MODE=overlay
 
 ### `overlay_admitted_utxos` table bloat
 
-The nightly retention job at `/api/maintenance/retention` (Vercel Cron, 03:17 UTC) automatically:
+Retention runs from two triggers — whichever fires first wins (a DB advisory
+lock plus a persisted last-run marker in `provider_cursors` prevent double
+runs):
 
-1. Compacts spent UTXO rows by nulling out their `raw_tx` and `beef` blobs.
-2. Physically deletes spent rows older than `RETENTION_UTXO_PRUNE_DAYS` (default `3`).
+- **In-process scheduler** (VPS/PM2): `scripts/run-workers.ts` starts
+  `startRetentionScheduler()` from `lib/retention.ts`, which executes the pass
+  once per UTC day at/after `RETENTION_HOUR_UTC` (default `3`). Opt-out via
+  `RETENTION_SCHEDULER_DISABLED=true`.
+- **`/api/maintenance/retention`** (Vercel Cron, 03:17 UTC) — only fires on
+  Vercel deployments; it never runs on the VPS, which is why the in-process
+  scheduler exists.
+
+Each pass automatically:
+
+1. Prunes old `overlay_explorer_readings` per family retention windows.
+2. Deletes confirmed `tx_log` rows older than `RETENTION_TX_LOG_DAYS` (default `30`).
+3. Compacts spent UTXO rows by nulling out their `raw_tx` and `beef` blobs.
+4. Physically deletes spent rows older than `RETENTION_UTXO_PRUNE_DAYS` (default `3`).
+5. Deletes `overlay_submissions` audit rows older than `RETENTION_SUBMISSIONS_DAYS`
+   (default `14`) — this table reached 15 GB in production before pruning existed.
 
 Without step 2 the table heap grows unbounded even after compaction, and the acquire query eventually falls back to a sequential scan and times out. If you suspect bloat, check:
 
@@ -104,6 +120,26 @@ SELECT pg_size_pretty(pg_total_relation_size('overlay_admitted_utxos')) AS size,
 ```
 
 A healthy table is < 500 MB with `removed_rows` only a few days' worth of activity. If `removed_rows` is in the millions, force a manual run with `curl -H 'x-gaialog-internal-secret: <secret>' https://<host>/api/maintenance/retention` and consider lowering `RETENTION_UTXO_PRUNE_DAYS`.
+
+### Stale UTXO locks ("No inventory UTXOs available" with a non-empty pool)
+
+A lock (`locked = true`) is only meant to be held for the seconds between
+acquire and release/consume. If the process dies in that window — including
+PM2's 30-minute `cron_restart` — the row stayed locked forever (observed in
+production: a reserve UTXO locked since April starving the splitter, which
+degraded the whole pool to sub-dust outputs). The maintainer now runs
+`reapStaleLocks()` (lib/utxo-inventory.ts) every inventory-log interval
+(default 5 min), releasing anything locked for more than 15 minutes. Check
+suspects with:
+
+```bash
+psql "$DATABASE_URL" -c "
+SELECT wallet_index, utxo_role, COUNT(*), MIN(locked_at)
+  FROM overlay_admitted_utxos
+ WHERE removed = false AND locked = true
+ GROUP BY wallet_index, utxo_role;
+"
+```
 
 ### Stale environment in PM2
 

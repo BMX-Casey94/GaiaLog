@@ -128,6 +128,15 @@ async function main() {
     // exhausts its BSV. Self-throttled CRITICAL alerts; opt-out via
     // BSV_WALLET_FUNDING_DISABLED=true.
     startWalletFundingMonitor()
+    // Retention scheduler: the Vercel Cron in vercel.json never fires on the
+    // VPS/PM2 deployment, so without this the tx_log / spent-UTXO heaps grow
+    // unbounded and saturate the database CPU. Runs the daily retention pass
+    // in-process, DB-lock-guarded, once per UTC day (≥03:00 UTC by default).
+    // Opt-out via RETENTION_SCHEDULER_DISABLED=true.
+    if (process.env.GAIALOG_NO_DB !== 'true') {
+      const { startRetentionScheduler } = await import('../lib/retention')
+      startRetentionScheduler()
+    }
     // Slight delay to let maintainer kick off before queue
     setTimeout(() => {
       workerQueue.startProcessing()
