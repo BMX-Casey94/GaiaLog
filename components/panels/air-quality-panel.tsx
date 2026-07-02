@@ -10,18 +10,13 @@ import {
   Wind, 
   Activity, 
   TrendingUp, 
-  AlertTriangle, 
-  CheckCircle, 
-  Clock, 
-  XCircle,
   RefreshCw,
-  Zap,
-  Database,
   MapPin,
   Thermometer,
   Droplets,
   Gauge
 } from "lucide-react"
+import { fetchFamilyAggregates, toNumber } from "@/lib/admin-db-stats"
 
 interface AirQualityData {
   aqi: number
@@ -65,44 +60,56 @@ export function AirQualityPanel() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
 
-  // Fetch air quality data from database (kept fresh by local workers)
+  // Fetch air quality data from the database (kept fresh by local workers).
+  // The most recent row supplies the "current" reading; the last 24 hours of
+  // rows supply real aggregate statistics.
   const fetchAirQualityData = async () => {
     try {
-      const response = await fetch('/api/air-quality/latest')
-      
+      const response = await fetch('/api/db/air-quality?limit=1&sort=collected_at_desc')
+
       if (response.ok) {
         const result = await response.json()
-        
-        if (result.success && result.data) {
-          const airQualityData = result.data
+        const latest = result?.success && Array.isArray(result.items) && result.items.length > 0
+          ? result.items[0]
+          : null
+
+        if (latest) {
           const mapped: AirQualityData = {
-            aqi: airQualityData?.aqi ?? 0,
-            pm25: airQualityData?.pm25 ?? 0,
-            pm10: airQualityData?.pm10 ?? 0,
-            no2: 0, // Not provided by current API
-            o3: 0,
-            co: 0,
-            so2: 0,
-            temperature: 0,
-            humidity: 0,
-            pressure: 0,
-            windSpeed: 0,
-            windDirection: 0,
-            location: airQualityData?.location || 'Unknown',
-            timestamp: airQualityData?.timestamp ? Date.parse(airQualityData.timestamp) : Date.now(),
-            source: airQualityData?.source || 'WAQI',
+            aqi: toNumber(latest.aqi) ?? 0,
+            pm25: toNumber(latest.pm25) ?? 0,
+            pm10: toNumber(latest.pm10) ?? 0,
+            no2: toNumber(latest.no2) ?? 0,
+            o3: toNumber(latest.o3) ?? 0,
+            co: toNumber(latest.co) ?? 0,
+            so2: toNumber(latest.so2) ?? 0,
+            temperature: toNumber(latest.temperature_c) ?? 0,
+            humidity: toNumber(latest.humidity_pct) ?? 0,
+            pressure: toNumber(latest.pressure_mb) ?? 0,
+            windSpeed: toNumber(latest.wind_kph) ?? 0,
+            windDirection: toNumber(latest.wind_deg) ?? 0,
+            location: latest.city || 'Unknown',
+            timestamp: latest.collected_at ? Date.parse(latest.collected_at) : Date.now(),
+            source: latest.provider || 'WAQI',
           }
           setAirQualityData(mapped)
-          setAirQualityStats({
-            currentAQI: mapped.aqi || 0,
-            averageAQI: Math.floor(Math.random() * 50) + 30,
-            maxAQI: Math.floor(Math.random() * 100) + 150,
-            minAQI: Math.floor(Math.random() * 20) + 10,
-            totalReadings: Math.floor(Math.random() * 1000) + 500,
-            alerts: Math.floor(Math.random() * 5),
-            lastUpdate: Date.now()
-          })
           setLastUpdate(new Date())
+
+          const aggregates = await fetchFamilyAggregates({
+            endpoint: '/api/db/air-quality',
+            valueOf: (row) => toNumber(row.aqi),
+            isAlert: (row) => (toNumber(row.aqi) ?? 0) > 100 || (toNumber(row.pm25) ?? 0) > 35.4,
+          })
+          if (aggregates) {
+            setAirQualityStats({
+              currentAQI: mapped.aqi || 0,
+              averageAQI: Math.round(aggregates.average),
+              maxAQI: Math.round(aggregates.max),
+              minAQI: Math.round(aggregates.min),
+              totalReadings: aggregates.totalReadings,
+              alerts: aggregates.alerts,
+              lastUpdate: Date.now(),
+            })
+          }
         } else {
           console.warn('No air quality data available from database')
           setAirQualityData(null)

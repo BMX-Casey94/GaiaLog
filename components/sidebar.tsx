@@ -1,8 +1,9 @@
 "use client"
 
+import Image from "next/image"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
-import { Wind, Droplets, Activity, BarChart3, Home, Settings, History, Shield, Table, Mail } from "lucide-react"
+import { Wind, Droplets, Activity, BarChart3, Home, Settings, Shield, Table, Mail } from "lucide-react"
 
 interface SidebarProps {
   activeSection: string
@@ -23,22 +24,36 @@ const sidebarItems = [
 
 export function Sidebar({ activeSection, onSectionChange }: SidebarProps) {
   return (
-    <div className="w-64 bg-sidebar border-r border-sidebar-border flex flex-col">
+    <div className="w-64 h-full bg-sidebar border-r border-sidebar-border flex flex-col">
       <div className="p-6 border-b border-sidebar-border">
-        <h1 className="text-xl font-bold font-space-grotesk text-sidebar-foreground">GaiaLog</h1>
-        <p className="text-sm text-muted-foreground mt-1">Environmental Blockchain Monitor</p>
+        <div className="flex items-center gap-3">
+          <Image
+            src="/gaialog-logo-128.png"
+            alt="GaiaLog logo"
+            width={32}
+            height={32}
+            className="rounded-md"
+          />
+          <div>
+            <h1 className="font-display text-xl font-bold text-sidebar-foreground leading-tight">GaiaLog</h1>
+            <p className="text-xs text-muted-foreground">Environmental Blockchain Monitor</p>
+          </div>
+        </div>
       </div>
 
-      <nav className="flex-1 p-4 space-y-2">
+      <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
         {sidebarItems.map((item) => {
           const Icon = item.icon
+          const isActive = activeSection === item.id
           return (
             <Button
               key={item.id}
-              variant={activeSection === item.id ? "secondary" : "ghost"}
+              variant="ghost"
               className={cn(
-                "w-full justify-start gap-3 h-10",
-                activeSection === item.id && "bg-sidebar-accent text-sidebar-accent-foreground",
+                "w-full justify-start gap-3 h-10 rounded-lg transition-colors",
+                isActive
+                  ? "bg-sidebar-accent text-sidebar-accent-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+                  : "text-sidebar-foreground/80 hover:bg-sidebar-primary hover:text-sidebar-foreground",
               )}
               onClick={() => onSectionChange(item.id)}
             >
@@ -48,6 +63,12 @@ export function Sidebar({ activeSection, onSectionChange }: SidebarProps) {
           )
         })}
       </nav>
+
+      <div className="p-4 border-t border-sidebar-border">
+        <p className="text-[10px] text-muted-foreground leading-relaxed">
+          Data recorded immutably on the BSV blockchain.
+        </p>
+      </div>
     </div>
   )
 }

@@ -223,6 +223,44 @@ export async function releaseUtxo(
   })
 }
 
+/**
+ * Permanently archive an inventory row whose parent transaction has been
+ * verified as unknown on-chain (phantom output). Without this, the splitter
+ * re-acquires the same phantom row every maintainer cycle — preferLargest
+ * makes it deterministic — and every split attempt fails with ARC 460
+ * "parent transaction not found" forever.
+ *
+ * Soft-archive only (removed=true); rows stay queryable for forensics and
+ * are reaped later by retention pruning, mirroring
+ * scripts/recovery-import-onchain-utxos.ts.
+ */
+export async function archivePhantomUtxo(
+  topic: string,
+  txid: string,
+  vout: number,
+  reason: string,
+): Promise<void> {
+  await withOverlayTransaction(async (client) => {
+    const res = await client.query(
+      `UPDATE overlay_admitted_utxos
+          SET removed = true,
+              removed_at = now(),
+              spending_txid = $4,
+              locked = false,
+              locked_by = NULL,
+              locked_at = NULL
+        WHERE topic = $1
+          AND txid = $2
+          AND vout = $3
+          AND removed = false`,
+      [topic, txid, vout, reason.substring(0, 64)],
+    )
+    if ((res.rowCount || 0) > 0) {
+      await refreshTopicCounts(client, topic, -1)
+    }
+  })
+}
+
 export async function consumeAndAdmitChange(input: ConsumeAndAdmitChangeInput): Promise<void> {
   await withOverlayTransaction(async (client) => {
     const removed = await client.query(

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { query } from '@/lib/db'
+import { fastTableCount } from '@/lib/db-fast-count'
 
 export const runtime = 'nodejs'
 
@@ -12,15 +13,13 @@ export async function GET(req: NextRequest) {
     const sort = (searchParams.get('sort') || 'collected_at_desc').toLowerCase()
     const limit = Math.min(Math.max(Number(searchParams.get('limit') || '100'), 1), 500)
     const offset = (page - 1) * limit
-    let sql = `SELECT id, provider, event_id, location, magnitude, depth_km, lat, lon,
-                      collected_at AS timestamp, collected_at, txid, source_hash
-               FROM seismic_readings`
+    let whereSql = ''
     const params: any[] = []
     if (idParam && /^\d+$/.test(idParam)) {
-      sql += ' WHERE id = $1'
+      whereSql = 'WHERE id = $1'
       params.push(Number(idParam))
     } else if (q) {
-      sql += ' WHERE location ILIKE $1 OR provider ILIKE $1 OR txid ILIKE $1'
+      whereSql = 'WHERE location ILIKE $1 OR provider ILIKE $1 OR txid ILIKE $1'
       params.push(`%${q}%`)
     }
     const orderBy = (() => {
@@ -31,12 +30,14 @@ export async function GET(req: NextRequest) {
         default: return ' ORDER BY collected_at DESC'
       }
     })()
-    const countSql = `SELECT COUNT(*) AS total FROM (${sql}) AS sub`
-    const countRes = await query<any>(countSql, params)
-    sql += `${orderBy} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`
-    params.push(limit, offset)
-    const rows = await query<any>(sql, params)
-    const total = Number(countRes.rows?.[0]?.total || 0)
+    const sql = `SELECT id, provider, event_id, location, magnitude, depth_km, lat, lon,
+                        collected_at AS timestamp, collected_at, txid, source_hash
+                 FROM seismic_readings
+                 ${whereSql}${orderBy} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`
+    const [rows, total] = await Promise.all([
+      query<any>(sql, [...params, limit, offset]),
+      fastTableCount('seismic_readings', whereSql, params),
+    ])
     return NextResponse.json({ success: true, items: rows.rows, page, limit, total })
   } catch (e) {
     return NextResponse.json({ success: false, error: 'Failed to fetch seismic entries' }, { status: 500 })

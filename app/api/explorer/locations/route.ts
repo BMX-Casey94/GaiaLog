@@ -13,6 +13,7 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { getLocationSuggestions } from '@/lib/explorer-read-source'
+import { applyPublicReadCacheHeaders } from '@/lib/cache-headers'
 
 export const dynamic = 'force-dynamic'
 
@@ -25,13 +26,13 @@ export async function GET(request: NextRequest) {
     const limit = Math.min(50, Math.max(1, parseInt(searchParams.get('limit') || '20', 10)))
 
     if (q.length < 2) {
-      return NextResponse.json({
+      return applyPublicReadCacheHeaders(NextResponse.json({
         success: true,
         data: {
           suggestions: [],
           total: 0,
         },
-      })
+      }))
     }
 
     const suggestions = await getLocationSuggestions(q, dataType, limit)
@@ -43,13 +44,13 @@ export async function GET(request: NextRequest) {
       readingCount: s.readingCount,
     }))
 
-    return NextResponse.json({
+    return applyPublicReadCacheHeaders(NextResponse.json({
       success: true,
       data: {
         suggestions: items,
         total: items.length,
       },
-    })
+    }))
   } catch (error) {
     console.error('Explorer locations error:', error)
     return NextResponse.json(

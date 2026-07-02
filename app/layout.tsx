@@ -1,5 +1,5 @@
 import type React from "react"
-import type { Metadata } from "next"
+import type { Metadata, Viewport } from "next"
 import { Space_Grotesk, DM_Sans } from "next/font/google"
 import "./globals.css"
 import { ThemeProvider } from "@/components/theme-provider"
@@ -18,14 +18,69 @@ const dmSans = DM_Sans({
   variable: "--font-dm-sans",
 })
 
+const SITE_URL = "https://gaialog.world"
+const SITE_DESCRIPTION =
+  "Real-time environmental monitoring — air quality, water levels, seismic activity and more — with every measurement recorded immutably on the BSV blockchain."
+
 export const metadata: Metadata = {
-  title: "GaiaLog - Environmental Blockchain Monitoring",
-  description: "Real-time environmental data monitoring with BSV blockchain integration",
-  generator: "GaiaLog",
+  metadataBase: new URL(SITE_URL),
+  title: {
+    default: "GaiaLog — Environmental Blockchain Monitoring",
+    template: "%s | GaiaLog",
+  },
+  description: SITE_DESCRIPTION,
+  applicationName: "GaiaLog",
+  keywords: [
+    "environmental monitoring",
+    "blockchain",
+    "BSV",
+    "air quality",
+    "water levels",
+    "seismic activity",
+    "immutable data",
+    "environmental data",
+  ],
+  authors: [{ name: "GaiaLog" }],
+  creator: "GaiaLog",
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    type: "website",
+    locale: "en_GB",
+    url: SITE_URL,
+    siteName: "GaiaLog",
+    title: "GaiaLog — Environmental Blockchain Monitoring",
+    description: SITE_DESCRIPTION,
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "GaiaLog — Environmental Blockchain Monitoring",
+    description: SITE_DESCRIPTION,
+  },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: {
+      index: true,
+      follow: true,
+      "max-image-preview": "large",
+      "max-snippet": -1,
+    },
+  },
   icons: {
     icon: "/gaialog-logo-128.png",
     apple: "/gaialog-logo-128.png",
   },
+}
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#0b1120" },
+  ],
 }
 
 export default function RootLayout({
@@ -49,16 +104,6 @@ export default function RootLayout({
           */}
           <Navigation />
           {children}
-          <footer className="border-t mt-8 text-[10px] text-muted-foreground">
-            <div className="max-w-6xl mx-auto px-4 py-3 text-center">
-              Environmental data attributions: {" "}
-              <a href="https://waqi.info/" target="_blank" rel="noopener noreferrer" className="underline">World Air Quality Index (WAQI)</a>{" • "}
-              <a href="https://www.weatherapi.com/" target="_blank" rel="noopener noreferrer" className="underline">WeatherAPI</a>{" • "}
-              <a href="https://api.tidesandcurrents.noaa.gov/" target="_blank" rel="noopener noreferrer" className="underline">NOAA Tides & Currents</a>{" • "}
-              <a href="https://earthquake.usgs.gov/fdsnws/" target="_blank" rel="noopener noreferrer" className="underline">USGS Earthquake</a>.
-              {" "}Attribution required by providers; see their terms.
-            </div>
-          </footer>
         </ThemeProvider>
       </body>
     </html>

@@ -74,7 +74,7 @@ export const SparklesCore = (props: ParticlesProps) => {
                   enable: false,
                   mode: "repulse",
                 },
-                resize: true,
+                resize: { enable: true },
               },
               modes: {
                 push: {
@@ -103,17 +103,14 @@ export const SparklesCore = (props: ParticlesProps) => {
               number: {
                 density: {
                   enable: true,
-                  area: 800,
                 },
                 value: particleDensity || 80,
               },
               opacity: {
-                value: 0.5,
-                random: true,
+                value: { min: 0.1, max: 0.5 },
                 animation: {
                   enable: true,
                   speed: speed || 1,
-                  minimumValue: 0.1,
                   sync: false,
                 },
               },
@@ -122,11 +119,9 @@ export const SparklesCore = (props: ParticlesProps) => {
               },
               size: {
                 value: { min: minSize || 1, max: maxSize || 3 },
-                random: true,
                 animation: {
                   enable: true,
                   speed: 2,
-                  minimumValue: 0.1,
                   sync: false,
                 },
               },

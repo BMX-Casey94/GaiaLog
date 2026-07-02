@@ -36,16 +36,23 @@ export default function LoginPage() {
 	}
 
 	return (
-		<div className="min-h-screen flex items-center justify-center p-4">
-			<Card className="w-full max-w-sm">
+		<div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-b from-black via-slate-950 to-black">
+			<div
+				aria-hidden
+				className="pointer-events-none absolute inset-0"
+				style={{
+					background: `radial-gradient(ellipse at center, rgba(88, 28, 135, 0.25) 0%, rgba(59, 7, 100, 0.15) 40%, transparent 75%)`,
+				}}
+			/>
+			<Card className="relative w-full max-w-sm glass-card border-slate-700/50 bg-slate-900/60 text-white">
 				<CardHeader>
-					<CardTitle>Admin login</CardTitle>
-					<CardDescription>Enter the admin password to continue</CardDescription>
+					<CardTitle className="font-display text-2xl">Admin login</CardTitle>
+					<CardDescription className="text-slate-400">Enter the admin password to continue</CardDescription>
 				</CardHeader>
 				<CardContent>
 					<form onSubmit={onSubmit} className="grid gap-4">
 						<div className="grid gap-2">
-							<Label htmlFor="password">Password</Label>
+							<Label htmlFor="password" className="text-slate-300">Password</Label>
 							<Input
 								id="password"
 								type="password"
@@ -53,14 +60,15 @@ export default function LoginPage() {
 								autoComplete="current-password"
 								value={password}
 								onChange={(e) => setPassword(e.target.value)}
+								className="bg-black/40 border-slate-600/50 text-white focus:border-purple-500"
 							/>
 						</div>
 						{error && (
-							<p className="text-destructive text-sm" role="alert">
+							<p className="text-red-400 text-sm" role="alert">
 								{error}
 							</p>
 						)}
-						<Button type="submit" disabled={loading}>
+						<Button type="submit" variant="purple" disabled={loading}>
 							{loading ? "Signing in…" : "Sign in"}
 						</Button>
 					</form>

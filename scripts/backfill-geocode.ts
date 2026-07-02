@@ -65,7 +65,7 @@ async function main() {
     const remaining = LIMIT - totalUpdated
     const fetchSize = Math.min(BATCH_SIZE, remaining === Infinity ? BATCH_SIZE : remaining)
 
-    const cursorFilter = lastTxid
+    const cursorFilter: string = lastTxid
       ? `AND txid > $2`
       : ''
 
@@ -84,7 +84,8 @@ async function main() {
       lastTxid ? [fetchSize, lastTxid] : [fetchSize],
     )
 
-    const rows = result.rows || []
+    const rows: Array<{ txid: string; location: string | null; lat: number; lon: number }> =
+      result.rows || []
     if (rows.length === 0) break
 
     for (const row of rows) {

@@ -11,7 +11,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { getIndexStats, getUniqueLocationCountFast, getArchivedTotals } from '@/lib/explorer-read-source'
+import { getIndexStats, getAggregates, getArchivedTotals } from '@/lib/explorer-read-source'
 import { applyPublicReadCacheHeaders } from '@/lib/cache-headers'
 
 export const dynamic = 'force-dynamic'
@@ -58,10 +58,14 @@ let lastKnownArchive: ArchivedSnapshot | null = null
 let cachedPayload: { data: ExplorerStatsPayload; ts: number } | null = null
 let refreshInFlight: Promise<void> | null = null
 
+// Timeouts are generous because these queries are all O(1) rollup/estimate
+// reads — the only reason they run long is transient DB CPU pressure, and the
+// route already serves stale cached payloads on subsequent requests, so a
+// slower first refresh is preferable to permanently-null aggregates.
 const STATS_CACHE_TTL_MS = Math.max(5000, Number(process.env.EXPLORER_STATS_CACHE_TTL_MS || 30000))
-const INDEX_TIMEOUT_MS = Math.max(1000, Number(process.env.EXPLORER_INDEX_TIMEOUT_MS || 2500))
-const LOCATION_TIMEOUT_MS = Math.max(500, Number(process.env.EXPLORER_LOCATION_TIMEOUT_MS || 1200))
-const ARCHIVE_TIMEOUT_MS = Math.max(500, Number(process.env.EXPLORER_ARCHIVE_TIMEOUT_MS || 1500))
+const INDEX_TIMEOUT_MS = Math.max(1000, Number(process.env.EXPLORER_INDEX_TIMEOUT_MS || 8000))
+const LOCATION_TIMEOUT_MS = Math.max(500, Number(process.env.EXPLORER_LOCATION_TIMEOUT_MS || 8000))
+const ARCHIVE_TIMEOUT_MS = Math.max(500, Number(process.env.EXPLORER_ARCHIVE_TIMEOUT_MS || 8000))
 
 const ARCHIVE_NOTE =
   'Pruned from Supabase to control storage and egress; the original transactions ' +
@@ -121,9 +125,9 @@ function buildPayload(
 }
 
 async function refreshSnapshot(): Promise<void> {
-  const [indexResult, uniqueLocationsResult, archiveResult] = await Promise.allSettled([
+  const [indexResult, aggregatesResult, archiveResult] = await Promise.allSettled([
     withTimeout(getIndexStats(), INDEX_TIMEOUT_MS, 'Explorer index stats'),
-    withTimeout(getUniqueLocationCountFast(), LOCATION_TIMEOUT_MS, 'Explorer unique locations'),
+    withTimeout(getAggregates(), LOCATION_TIMEOUT_MS, 'Explorer aggregates'),
     withTimeout(getArchivedTotals(), ARCHIVE_TIMEOUT_MS, 'Explorer archived totals'),
   ])
 
@@ -135,19 +139,19 @@ async function refreshSnapshot(): Promise<void> {
     console.warn('Explorer index stats unavailable:', indexResult.reason)
   }
 
-  const previousAggregates = lastKnownAggregates ?? defaultAggregates()
   const aggregates: StatsAggregates =
-    uniqueLocationsResult.status === 'fulfilled' && typeof uniqueLocationsResult.value === 'number'
+    aggregatesResult.status === 'fulfilled'
       ? {
-          ...previousAggregates,
-          uniqueLocations: uniqueLocationsResult.value,
+          uniqueLocations: aggregatesResult.value.uniqueLocations,
+          dateRange: aggregatesResult.value.dateRange,
+          byType: aggregatesResult.value.byType,
         }
-      : previousAggregates
+      : (lastKnownAggregates ?? defaultAggregates())
 
-  if (uniqueLocationsResult.status === 'fulfilled' && typeof uniqueLocationsResult.value === 'number') {
+  if (aggregatesResult.status === 'fulfilled') {
     lastKnownAggregates = aggregates
   } else {
-    console.warn('Explorer unique locations unavailable:', uniqueLocationsResult.reason)
+    console.warn('Explorer aggregates unavailable:', aggregatesResult.reason)
   }
 
   const archive: ArchivedSnapshot =
@@ -205,8 +209,9 @@ export async function GET(_request: NextRequest) {
 
     // Cold start: do one bounded refresh so first response has best-effort values.
     await refreshSnapshot()
+    const refreshed = cachedPayload as { data: ExplorerStatsPayload; ts: number } | null
     const payload =
-      cachedPayload?.data ??
+      refreshed?.data ??
       buildPayload(
         lastKnownIndexStats ?? defaultIndexStats(),
         lastKnownAggregates ?? defaultAggregates(),

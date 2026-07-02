@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { useState } from "react"
 import { toast } from "@/hooks/use-toast"
+import { AttributionBar } from "@/components/attribution-bar"
 
 export function Footer() {
   const [name, setName] = useState("")
@@ -61,11 +62,12 @@ export function Footer() {
     return `${captchaToken}|${captchaAnswer}`
   }
   return (
-    <footer className="py-16 px-4 sm:px-6 lg:px-8">
+    <footer className="relative py-16 px-4 sm:px-6 lg:px-8">
+      <div aria-hidden className="section-divider absolute top-0 left-0 right-0" />
       <div className="max-w-7xl mx-auto">
         <div className="grid grid-cols-1 md:grid-cols-4 gap-8 mb-8">
           <div className="col-span-1 md:col-span-2">
-            <h3 className="text-xl font-bold text-white mb-4">GaiaLog</h3>
+            <h3 className="font-display text-xl font-bold text-white mb-4">GaiaLog</h3>
             <p className="text-slate-400 mb-4 max-w-md">
               Immutable environmental monitoring through blockchain technology. Every measurement matters, every record
               counts.
@@ -147,25 +149,30 @@ export function Footer() {
             <h4 className="font-semibold text-white mb-4">External Links</h4>
             <ul className="space-y-2 text-sm text-slate-400">
               <li>
-                <a href="#" className="hover:text-white transition-colors flex items-center">
+                <a
+                  href="https://whatsonchain.com/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:text-white transition-colors flex items-center"
+                >
                   BSV Blockchain Explorer
                   <ExternalLink className="h-3 w-3 ml-1" />
                 </a>
               </li>
               <li>
-                <a href="https://bsvassociation.org" className="hover:text-white transition-colors flex items-center">
+                <a href="https://bsvassociation.org" target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors flex items-center">
                   BSV Association
                   <ExternalLink className="h-3 w-3 ml-1" />
                 </a>
               </li>
               <li>
-                <a href="https://teranode.group" className="hover:text-white transition-colors flex items-center">
+                <a href="https://teranode.group" target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors flex items-center">
                   Teranode
                   <ExternalLink className="h-3 w-3 ml-1" />
                 </a>
               </li>
               <li>
-                <a href="https://gorillapool.com" className="hover:text-white transition-colors flex items-center">
+                <a href="https://gorillapool.com" target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors flex items-center">
                   GorillaPool
                   <ExternalLink className="h-3 w-3 ml-1" />
                 </a>
@@ -175,10 +182,11 @@ export function Footer() {
           </div>
         </div>
 
-        <div className="border-t border-slate-800 pt-8 text-center">
+        <div className="border-t border-slate-800 pt-8 text-center space-y-3">
           <p className="text-sm text-slate-500">
-            © 2025 GaiaLog. Environmental data powered by BSV blockchain technology.
+            © {new Date().getFullYear()} GaiaLog. Environmental data powered by BSV blockchain technology.
           </p>
+          <AttributionBar />
         </div>
       </div>
     </footer>

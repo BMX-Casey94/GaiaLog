@@ -24,6 +24,7 @@ debug-*.log
 # env files
 .env*
 *.paste
+scripts/.recovery-wifs.local
 
 # IDE / local
 .cursor/

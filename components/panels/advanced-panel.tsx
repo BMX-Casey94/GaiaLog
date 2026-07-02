@@ -26,6 +26,7 @@ import {
   Globe,
   Satellite
 } from "lucide-react"
+import { fetchFamilyAggregates, toNumber } from "@/lib/admin-db-stats"
 
 interface AdvancedMetricsData {
   // Environmental metrics
@@ -83,63 +84,77 @@ export function AdvancedPanel() {
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
   const [trends, setTrends] = useState<any>(null)
 
-  // Fetch fresh advanced metrics data using the same endpoint as Live Dashboard
+  // Read the latest recorded advanced metrics from the database (kept fresh
+  // by workers) rather than triggering a fresh collection cycle on every view.
   const fetchAdvancedData = async () => {
     try {
-      const response = await fetch('/api/data/collect', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      })
+      const response = await fetch('/api/db/advanced?limit=1&sort=collected_at_desc')
       if (response.ok) {
         const result = await response.json()
-        const advancedData = result.data?.advancedMetrics
-        
-        if (advancedData) {
+        const latest = result?.success && Array.isArray(result.items) && result.items.length > 0
+          ? result.items[0]
+          : null
+
+        if (latest) {
+          const rawScore = toNumber(latest.environmental_score) ?? 0
+          const normalisedScore = rawScore <= 1 ? rawScore * 100 : rawScore
           const mapped = {
             airQualityIndex: 0,
             waterQualityIndex: 0,
-            soilMoisture: typeof advancedData?.soil_moisture?.value === 'number'
-              ? Math.round(advancedData.soil_moisture.value)
-              : (typeof advancedData?.soil_moisture === 'number' ? Math.round(advancedData.soil_moisture) : 0),
+            soilMoisture: Math.round(toNumber(latest.soil_moisture_pct) ?? 0),
             vegetationIndex: 0,
-            temperature: typeof advancedData?.temperature_c === 'number' ? advancedData.temperature_c : 0,
-            humidity: typeof advancedData?.humidity_pct === 'number' ? advancedData.humidity_pct : 0,
-            pressure: typeof advancedData?.pressure_mb === 'number' ? advancedData.pressure_mb : 0,
-            windSpeed: typeof advancedData?.wind_kph === 'number' ? advancedData.wind_kph : 0,
-            windDirection: 0,
+            temperature: toNumber(latest.temperature_c) ?? 0,
+            humidity: toNumber(latest.humidity_pct) ?? 0,
+            pressure: toNumber(latest.pressure_mb) ?? 0,
+            windSpeed: toNumber(latest.wind_kph) ?? 0,
+            windDirection: toNumber(latest.wind_deg) ?? 0,
             precipitation: 0,
             radiationLevel: 0,
             noiseLevel: 0,
             lightIntensity: 0,
             magneticField: 0,
-            location: advancedData?.location || 'Unknown',
-            timestamp: Date.now(),
-            source: advancedData?.source || 'Derived',
-            coordinates: { latitude: advancedData?.coordinates?.lat ?? 0, longitude: advancedData?.coordinates?.lon ?? 0 },
+            location: latest.city || 'Unknown',
+            timestamp: latest.collected_at ? Date.parse(latest.collected_at) : Date.now(),
+            source: latest.provider || 'Derived',
+            coordinates: { latitude: toNumber(latest.lat) ?? 0, longitude: toNumber(latest.lon) ?? 0 },
           } as AdvancedMetricsData
           setAdvancedData(mapped)
-          setAdvancedStats({
-            currentScore: advancedData?.environmental_quality_score || 0,
-            averageScore: Math.floor(Math.random() * 50) + 30,
-            maxScore: Math.floor(Math.random() * 100) + 150,
-            minScore: Math.floor(Math.random() * 20) + 10,
-            totalReadings: Math.floor(Math.random() * 1000) + 500,
-            alerts: Math.floor(Math.random() * 5),
-            lastUpdate: Date.now()
-          })
           setLastUpdate(new Date())
+
+          const aggregates = await fetchFamilyAggregates({
+            endpoint: '/api/db/advanced',
+            valueOf: (row) => {
+              const score = toNumber(row.environmental_score)
+              if (score == null) return null
+              return score <= 1 ? score * 100 : score
+            },
+            isAlert: (row) => {
+              const score = toNumber(row.environmental_score)
+              if (score == null) return false
+              const normalised = score <= 1 ? score * 100 : score
+              return normalised < 50
+            },
+          })
+          if (aggregates) {
+            setAdvancedStats({
+              currentScore: Number(normalisedScore.toFixed(1)),
+              averageScore: Number(aggregates.average.toFixed(1)),
+              maxScore: Number(aggregates.max.toFixed(1)),
+              minScore: Number(aggregates.min.toFixed(1)),
+              totalReadings: aggregates.totalReadings,
+              alerts: aggregates.alerts,
+              lastUpdate: Date.now()
+            })
+          }
         } else {
-          console.warn('No advanced metrics data in fresh collection response')
+          console.warn('No advanced metrics data available from database')
           setAdvancedData(null)
         }
       } else {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
     } catch (error) {
-      console.error('Error fetching fresh advanced metrics data:', error)
-      // Don't fall back to simulated data - show no data instead
+      console.error('Error fetching advanced metrics data:', error)
       setAdvancedData(null)
     }
   }

@@ -294,7 +294,7 @@ export function LiveDashboard() {
       <div className="relative">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-16">
-            <h2 className="text-3xl md:text-4xl font-bold text-white mb-4">Live Environmental Alerts</h2>
+            <h2 className="font-display text-3xl md:text-4xl font-bold text-white mb-4 tracking-tight">Live Environmental Alerts</h2>
             <p className="text-base text-slate-400 max-w-2xl mx-auto">
               Real-time environmental data collection from global sensor networks. Every measurement is timestamped, geolocated, and immutably recorded on the BSV blockchain.
             </p>

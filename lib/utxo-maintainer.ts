@@ -8,6 +8,7 @@ import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAd
 import {
   acquireSplittableInput,
   admitSplitOutputs,
+  archivePhantomUtxo,
   getInventoryDiagnostic,
   releaseUtxo,
   type InventoryUtxo,
@@ -158,6 +159,74 @@ function p2pkhScriptHexFromWif(wif: string): string {
   const key = SDKPrivateKey.fromWif(wif)
   const pubKeyHash = Buffer.from(key.toPublicKey().toHash()).toString('hex')
   return '76a914' + pubKeyHash + '88ac'
+}
+
+// ─── Phantom-input detection (ARC 460 "parent transaction not found") ────────
+// When every broadcaster rejects a split because the INPUT's parent tx is
+// unknown, the inventory row is very likely a phantom: an output of a tx that
+// was "accepted" (e.g. ANNOUNCED_TO_NETWORK / orphan mempool) but never
+// actually propagated or mined. Left alone, preferLargest re-acquires the
+// same row every cycle and the splitter livelocks. We confirm against a
+// single-tx lookup (allowed — only bulk address lookups are banned) and
+// archive the row if the parent genuinely does not exist.
+function isParentNotFoundError(message: string): boolean {
+  return /\b460\b|parent transaction not found|missing inputs|not extended/i.test(message)
+}
+
+/**
+ * Returns true if the txid is known to WhatsOnChain (mempool or mined),
+ * false if definitively unknown (404), and null when the check itself failed
+ * (network error / rate limit) — in which case the caller must NOT archive.
+ */
+async function isTxKnownOnChain(txid: string): Promise<boolean | null> {
+  const net = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
+  const headers: Record<string, string> = {}
+  const wocKey = process.env.WHATSONCHAIN_API_KEY || ''
+  if (wocKey) headers['woc-api-key'] = wocKey
+  try {
+    const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${net}/tx/${txid}/propagation`, { headers })
+    // The /propagation endpoint is cheap, but fall back to tx hash lookup when unavailable.
+    if (res.status === 404) return false
+    if (res.ok) return true
+  } catch {}
+  try {
+    const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${net}/tx/hash/${txid}`, { headers })
+    if (res.status === 404) return false
+    if (res.ok) return true
+    return null
+  } catch {
+    return null
+  }
+}
+
+async function handleParentNotFound(inputSource: InventoryUtxo): Promise<void> {
+  const parentKnown = await isTxKnownOnChain(inputSource.txid)
+  if (parentKnown === false) {
+    console.error(
+      `🚨 UTXO-Split: input ${inputSource.txid.substring(0, 12)}...:${inputSource.vout} ` +
+        `(${inputSource.satoshis} sats) references a parent tx UNKNOWN on-chain — archiving as phantom. ` +
+        `If this drains the wallet's splittable inventory, re-run ` +
+        `\`npx tsx scripts/recovery-import-onchain-utxos.ts --apply\` to re-sync from on-chain reality.`,
+    )
+    await archivePhantomUtxo(
+      inputSource.topic,
+      inputSource.txid,
+      inputSource.vout,
+      'phantom-parent-not-found',
+    )
+    return
+  }
+
+  // Parent exists (or the check failed): treat as a propagation race and
+  // back the row off long enough for relays to converge instead of the
+  // default 2.5s grace, which is too short for cross-relay propagation.
+  const cooldownMs = Math.max(60_000, Number(process.env.BSV_UTXO_PARENT_RACE_COOLDOWN_MS || 10 * 60 * 1000))
+  console.warn(
+    `⚠️ UTXO-Split: parent ${inputSource.txid.substring(0, 12)}... ` +
+      `${parentKnown === true ? 'exists on-chain but ARC relays have not converged' : 'could not be verified'} — ` +
+      `cooling input down for ${Math.round(cooldownMs / 60_000)} min`,
+  )
+  await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout, { cooldownMs })
 }
 
 async function getSpendableInventoryCount(address: string, legacyConfirmedCount: number): Promise<number> {
@@ -375,6 +444,15 @@ async function doSplit(
     return { txid, address, outputs: outputCount }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
+
+    if (isParentNotFoundError(msg)) {
+      // Phantom-input handling: verify the parent on-chain and either archive
+      // the row (parent unknown → phantom) or apply a long propagation
+      // cooldown. Either way the row is no longer re-acquired every cycle.
+      await handleParentNotFound(inputSource)
+      throw e
+    }
+
     // Cooldown matches the propagation-grace default so a split that just failed
     // its broadcast is not re-acquired by the next maintainer pass before its
     // parent (or its rejection) has settled across relays.

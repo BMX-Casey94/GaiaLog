@@ -1,16 +1,26 @@
 "use client"
 
 import { useEffect, useState } from "react"
+import dynamic from "next/dynamic"
 import { Button } from "@/components/ui/button"
 import { ArrowRight, AlertTriangle, Shield, Globe } from "lucide-react"
-import { SparklesCore } from "@/components/ui/sparkles"
-import { MeshCanvas } from "@/components/ui/gravitational-mesh"
+
+// Heavy canvas visuals are decorative — defer them so they never block first paint.
+const SparklesCore = dynamic(
+  () => import("@/components/ui/sparkles").then((m) => m.SparklesCore),
+  { ssr: false },
+)
+const MeshCanvas = dynamic(
+  () => import("@/components/ui/gravitational-mesh").then((m) => m.MeshCanvas),
+  { ssr: false },
+)
 
 interface HeroStats {
   overlay: {
     totalReadings: number | null
     providerCount: number | null
   }
+  lastRecordAt: number | null
   topAlert: {
     label: string
     value: string
@@ -19,18 +29,28 @@ interface HeroStats {
   } | null
 }
 
+function formatRelativeTime(fromMs: number, nowMs: number): string {
+  const diffSec = Math.max(0, Math.floor((nowMs - fromMs) / 1000))
+  if (diffSec < 60) return `${diffSec} second${diffSec === 1 ? "" : "s"} ago`
+  const diffMin = Math.floor(diffSec / 60)
+  if (diffMin < 60) return `${diffMin} minute${diffMin === 1 ? "" : "s"} ago`
+  const diffHrs = Math.floor(diffMin / 60)
+  if (diffHrs < 24) return `${diffHrs} hour${diffHrs === 1 ? "" : "s"} ago`
+  const diffDays = Math.floor(diffHrs / 24)
+  return `${diffDays} day${diffDays === 1 ? "" : "s"} ago`
+}
+
 export function Hero() {
   const [stats, setStats] = useState<HeroStats>({
     overlay: { totalReadings: null, providerCount: null },
+    lastRecordAt: null,
     topAlert: null,
   })
-  const [loading, setLoading] = useState(true)
-  const [randomSecondsAgo, setRandomSecondsAgo] = useState(1)
+  const [now, setNow] = useState(() => Date.now())
 
+  // Tick every 5s so the relative "last record" label stays fresh between polls.
   useEffect(() => {
-    const tick = () => setRandomSecondsAgo(Math.floor(Math.random() * 5) + 1)
-    tick()
-    const id = setInterval(tick, 5000)
+    const id = setInterval(() => setNow(Date.now()), 5000)
     return () => clearInterval(id)
   }, [])
 
@@ -47,12 +67,15 @@ export function Hero() {
           const explorer = await explorerRes.value.json()
           const data = explorer?.data
           if (data) {
+            const lastUpdatedIso = data.index?.lastUpdated
+            const lastUpdatedMs = lastUpdatedIso ? new Date(lastUpdatedIso).getTime() : NaN
             setStats((prev) => ({
               ...prev,
               overlay: {
                 ...prev.overlay,
                 totalReadings: data.totalReadings ?? data.index?.totalReadings ?? prev.overlay.totalReadings,
               },
+              lastRecordAt: Number.isFinite(lastUpdatedMs) ? lastUpdatedMs : prev.lastRecordAt,
             }))
           }
         }
@@ -86,8 +109,6 @@ export function Hero() {
         if (!(error instanceof Error && error.name === 'AbortError')) {
           console.error('Error fetching hero data:', error)
         }
-      } finally {
-        setLoading(false)
       }
     }
 
@@ -110,14 +131,11 @@ export function Hero() {
   }
 
   const scrollToMonitoring = (): void => {
-    const target = document.getElementById("monitoring")
-    if (!target) return
-    const baseTop = target.getBoundingClientRect().top + window.pageYOffset
-    const extraOffsetPx = window.innerWidth < 640 ? 120 : 0
-    window.scrollTo({ top: baseTop + extraOffsetPx, behavior: "smooth" })
+    document.getElementById("monitoring")?.scrollIntoView({ behavior: "smooth" })
   }
+
   return (
-    <div className="relative overflow-hidden h-screen hero-section-container">
+    <div className="relative overflow-hidden min-h-[100svh] flex flex-col">
       <div
         className="absolute inset-0"
         style={{
@@ -141,10 +159,10 @@ export function Hero() {
         </div>
       </div>
 
-      <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-12 md:pt-20 pb-16 h-full flex flex-col justify-start md:justify-center hero-content-wrapper">
-        <div className="text-center mb-10 md:mb-16 mt-12 md:mt-0">
-          <h1 className="text-4xl md:text-6xl lg:text-7xl font-bold text-white mb-6 relative z-20">
-            <span className="text-white">GaiaLog</span>
+      <div className="relative max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 flex-1 flex flex-col justify-center gap-10 md:gap-14 pt-28 pb-16 md:pt-32 md:pb-20">
+        <div className="text-center">
+          <h1 className="font-display text-5xl md:text-6xl lg:text-7xl font-bold mb-6 relative z-20 tracking-tight">
+            <span className="gradient-heading">GaiaLog</span>
           </h1>
 
           <p className="text-sm md:text-lg text-slate-300 mb-2 max-w-3xl mx-auto leading-relaxed relative z-20">
@@ -156,7 +174,7 @@ export function Hero() {
             Every measurement recorded on the BSV blockchain for transparency and verification.
           </p>
 
-          <div className="flex flex-col sm:flex-row gap-4 justify-center relative z-20">
+          <div className="flex flex-col sm:flex-row gap-4 justify-center relative z-20 mt-6 md:mt-0">
             <Button
               size="lg"
               variant="purple"
@@ -176,8 +194,8 @@ export function Hero() {
           </div>
         </div>
 
-        <div className="hero-dashboard absolute bottom-12 md:bottom-16 left-1/2 transform -translate-x-1/2 max-w-5xl w-full px-4 z-20">
-          <div className="p-6">
+        <div className="max-w-5xl w-full mx-auto z-20">
+          <div className="glass-card glass-card-hover p-5 sm:p-6">
             <div className="flex items-center space-x-2 mb-4">
               <div className="w-3 h-3 bg-red-500 rounded-full" />
               <div className="w-3 h-3 bg-yellow-500 rounded-full" />
@@ -187,7 +205,7 @@ export function Hero() {
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <button
-                className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 hover:border-slate-500/50 hover:bg-slate-800/20 transition-all text-left"
+                className="bg-transparent backdrop-blur-sm rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/20 transition-all text-left"
                 onClick={scrollToMonitoring}
               >
                 <div className="flex items-center space-x-2 mb-2">
@@ -209,7 +227,7 @@ export function Hero() {
 
               <button
                 id="blockchain-status"
-                className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 hover:border-slate-500/50 hover:bg-slate-800/20 transition-all text-left"
+                className="bg-transparent backdrop-blur-sm rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/20 transition-all text-left"
                 onClick={() => document.getElementById('blockchain')?.scrollIntoView({ behavior: 'smooth' })}
               >
                 <div className="flex items-center space-x-2 mb-2">
@@ -217,12 +235,14 @@ export function Hero() {
                   <span className="text-sm text-slate-300">Total Data Records</span>
                 </div>
                 <div className="text-xl md:text-2xl font-bold text-white">{formatTotalReadings(stats.overlay.totalReadings) || '—'}</div>
-                <div className="text-xs text-slate-400">Last TX: {randomSecondsAgo} second{randomSecondsAgo === 1 ? '' : 's'} ago</div>
+                <div className="text-xs text-slate-400">
+                  {stats.lastRecordAt ? `Last record: ${formatRelativeTime(stats.lastRecordAt, now)}` : 'Awaiting data…'}
+                </div>
               </button>
 
               <button
                 id="data-sources-card"
-                className="bg-transparent backdrop-blur-sm rounded-lg p-4 border border-slate-600/30 hover:border-slate-500/50 hover:bg-slate-800/20 transition-all text-left"
+                className="bg-transparent backdrop-blur-sm rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/20 transition-all text-left"
                 onClick={() => document.getElementById('data-sources')?.scrollIntoView({ behavior: 'smooth' })}
               >
                 <div className="flex items-center space-x-2 mb-2">

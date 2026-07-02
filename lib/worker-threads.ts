@@ -2418,15 +2418,15 @@ const PLANNING_COLLECTOR_MAP: Record<string, (limit: number) => Promise<Array<{
 }>>> = {
   uk_planning: async (limit) => {
     const { collectUkPlanningApplications } = await import('./data-collector')
-    return collectUkPlanningApplications(limit)
+    return (await collectUkPlanningApplications(limit)) as any
   },
   scotland_planning: async (limit) => {
     const { collectScotlandPlanningApplications } = await import('./data-collector')
-    return collectScotlandPlanningApplications(limit)
+    return (await collectScotlandPlanningApplications(limit)) as any
   },
   nsw_planning: async (limit) => {
     const { collectNswPlanningApplications } = await import('./data-collector')
-    return collectNswPlanningApplications(limit)
+    return (await collectNswPlanningApplications(limit)) as any
   },
 }
 

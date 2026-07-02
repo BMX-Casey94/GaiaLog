@@ -153,7 +153,7 @@ export class BSVTransactionService {
     // 3. Use the official BSV SDK Transaction constructor
     
     const version = 1
-    const inputs = [] // Would be populated with actual UTXOs
+    const inputs: any[] = [] // Would be populated with actual UTXOs
     const outputs = [
       {
         lockingScript: opReturnScript, // OP_RETURN output with BRC-100 data
@@ -166,7 +166,7 @@ export class BSVTransactionService {
       }
     ]
     
-    const transaction = new Transaction(version, inputs, outputs)
+    const transaction = new Transaction(version, inputs, outputs as any)
     
     // Note: In a real implementation, we would:
     // 1. Add proper UTXO inputs
@@ -206,7 +206,7 @@ export class BSVTransactionService {
       // Broadcast using the official BSV SDK
       const result = await transaction.broadcast(arc)
       
-      if (result.success) {
+      if ('txid' in result && result.txid) {
         const txid = result.txid || this.generatePlaceholderTxid()
         
         this.transactionHistory.set(txid, {
@@ -222,9 +222,10 @@ export class BSVTransactionService {
           timestamp: Date.now()
         }
       } else {
+        const description = 'description' in result ? result.description : undefined
         return {
           success: false,
-          error: result.error || 'Transaction broadcast failed'
+          error: description || 'Transaction broadcast failed'
         }
       }
     } catch (error) {

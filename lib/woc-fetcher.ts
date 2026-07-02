@@ -200,7 +200,7 @@ export async function fetchTxOpReturn(
   network: 'main' | 'test',
   txid: string,
   walletAddr: string
-): Promise<{ data_type: string; payload: any; timestamp: number; provider?: string } | null> {
+): Promise<{ data_type: string; payload: any; timestamp: number; provider?: string; provider_id?: string; dataset_id?: string } | null> {
   const txRes = await fetchWoC(`https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`, walletAddr)
   if (!txRes.ok) return null
   

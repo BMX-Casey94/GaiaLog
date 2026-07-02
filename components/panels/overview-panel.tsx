@@ -5,7 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Wind, Droplets, Activity, BarChart3, Clock, ExternalLink, AlertCircle } from "lucide-react"
 import { useEnvironmentalData } from "@/hooks/use-environmental-data"
-import { useBlockchain } from "@/hooks/use-blockchain"
+import { useBlockchain, getExplorerUrl } from "@/hooks/use-blockchain"
 import { Skeleton } from "@/components/ui/skeleton"
 
 export function OverviewPanel() {
@@ -146,13 +146,22 @@ export function OverviewPanel() {
             <div className="text-2xl font-bold">{connectionStatus?.connected ? "Active" : "Offline"}</div>
             <p className="text-xs text-muted-foreground">
               {transactions.length > 0
-                ? `Last TX: ${new Date(transactions[0].timestamp).toLocaleTimeString()}`
+                ? `Last TX: ${new Date(transactions[0].timestamp).toLocaleTimeString('en-GB')}`
                 : "No transactions yet"}
             </p>
-            <Badge variant="secondary" className="mt-2 text-xs rounded-sm">
-              <ExternalLink className="h-3 w-3 mr-1" />
-              View on BSV
-            </Badge>
+            {transactions.length > 0 && (
+              <a
+                href={getExplorerUrl(transactions[0].txid)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-block mt-2"
+              >
+                <Badge variant="secondary" className="text-xs rounded-sm cursor-pointer hover:bg-secondary/80">
+                  <ExternalLink className="h-3 w-3 mr-1" />
+                  View on BSV
+                </Badge>
+              </a>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -165,11 +174,17 @@ export function OverviewPanel() {
           </CardHeader>
           <CardContent>
             <div className="space-y-3">
-              {transactions.slice(0, 3).map((tx) => (
-                <div key={tx.txid} className="flex items-center justify-between p-3 bg-muted rounded-lg">
+              {transactions.slice(0, 4).map((tx) => (
+                <a
+                  key={tx.txid}
+                  href={getExplorerUrl(tx.txid)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-between p-3 bg-muted rounded-lg hover:bg-muted/70 transition-colors"
+                >
                   <div>
-                    <p className="font-medium text-sm">{tx.data.dataType.replace("_", " ").toUpperCase()}</p>
-                    <p className="text-xs text-muted-foreground">{new Date(tx.timestamp).toLocaleTimeString()}</p>
+                    <p className="font-medium text-sm">{tx.dataType.replace(/_/g, " ").toUpperCase()}</p>
+                    <p className="text-xs text-muted-foreground">{new Date(tx.timestamp).toLocaleTimeString('en-GB')}</p>
                   </div>
                   <div className="text-right">
                     <p className="text-xs font-mono">{tx.txid.substring(0, 8)}...</p>
@@ -177,7 +192,7 @@ export function OverviewPanel() {
                       {tx.status}
                     </Badge>
                   </div>
-                </div>
+                </a>
               ))}
               {transactions.length === 0 && (
                 <p className="text-muted-foreground text-center py-4">No transactions yet</p>

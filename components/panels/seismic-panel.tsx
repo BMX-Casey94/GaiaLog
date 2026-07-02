@@ -23,6 +23,7 @@ import {
   Waves,
   AlertCircle
 } from "lucide-react"
+import { fetchFamilyAggregates, toNumber } from "@/lib/admin-db-stats"
 
 interface SeismicData {
   magnitude: number
@@ -63,56 +64,61 @@ export function SeismicPanel() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
 
-  // Fetch fresh seismic data using the same endpoint as Live Dashboard
+  // Read the latest recorded seismic event from the database (kept fresh by
+  // workers) rather than triggering a fresh collection cycle on every view.
   const fetchSeismicData = async () => {
     try {
-      const response = await fetch('/api/data/collect', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      })
+      const response = await fetch('/api/db/seismic?limit=1&sort=collected_at_desc')
       if (response.ok) {
         const result = await response.json()
-        const seismicData = result.data?.seismic
-        
-        if (seismicData && Array.isArray(seismicData.recent_events) && seismicData.recent_events.length > 0) {
-          const ev = seismicData.recent_events[0]
+        const latest = result?.success && Array.isArray(result.items) && result.items.length > 0
+          ? result.items[0]
+          : null
+
+        if (latest) {
+          const magnitude = toNumber(latest.magnitude) ?? 0
           const mapped: SeismicData = {
-            magnitude: Number(ev.magnitude) || 0,
-            depth: Number(ev.depth) || 0,
-            latitude: ev.coordinates?.lat ?? 0,
-            longitude: ev.coordinates?.lon ?? 0,
-            location: ev.location || 'Unknown',
-            timestamp: ev.time ? Date.parse(ev.time) : Date.now(),
-            source: seismicData?.source || ev.source || 'USGS',
-            intensity: Math.max(1, Math.round((Number(ev.magnitude) || 0) * 1.5)),
+            magnitude,
+            depth: toNumber(latest.depth_km) ?? 0,
+            latitude: toNumber(latest.lat) ?? 0,
+            longitude: toNumber(latest.lon) ?? 0,
+            location: latest.location || 'Unknown',
+            timestamp: latest.collected_at ? Date.parse(latest.collected_at) : Date.now(),
+            source: latest.provider || 'USGS',
+            intensity: Math.max(1, Math.round(magnitude * 1.5)),
             distance: 0,
-            felt: (Number(ev.magnitude) || 0) > 3,
-            tsunami: (Number(ev.magnitude) || 0) > 6,
-            alert: (Number(ev.magnitude) || 0) > 4 ? 'Warning' : 'Normal'
+            felt: magnitude > 3,
+            tsunami: magnitude > 6,
+            alert: magnitude > 4 ? 'Warning' : 'Normal'
           }
           setSeismicData(mapped)
-          setSeismicStats({
-            currentMagnitude: ev?.magnitude || 0,
-            averageMagnitude: Math.floor(Math.random() * 3) + 2,
-            maxMagnitude: Math.floor(Math.random() * 5) + 5,
-            minMagnitude: Math.floor(Math.random() * 2) + 1,
-            totalEvents: Math.floor(Math.random() * 100) + 50,
-            alerts: Math.floor(Math.random() * 3),
-            lastUpdate: Date.now()
-          })
           setLastUpdate(new Date())
+
+          const aggregates = await fetchFamilyAggregates({
+            endpoint: '/api/db/seismic',
+            valueOf: (row) => toNumber(row.magnitude),
+            isAlert: (row) => (toNumber(row.magnitude) ?? 0) >= 5,
+          })
+          if (aggregates) {
+            setSeismicStats({
+              currentMagnitude: magnitude,
+              averageMagnitude: Number(aggregates.average.toFixed(1)),
+              maxMagnitude: Number(aggregates.max.toFixed(1)),
+              minMagnitude: Number(aggregates.min.toFixed(1)),
+              totalEvents: aggregates.totalReadings,
+              alerts: aggregates.alerts,
+              lastUpdate: Date.now()
+            })
+          }
         } else {
-          console.warn('No seismic data in fresh collection response')
+          console.warn('No seismic data available from database')
           setSeismicData(null)
         }
       } else {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
     } catch (error) {
-      console.error('Error fetching fresh seismic data:', error)
-      // Don't fall back to simulated data - show no data instead
+      console.error('Error fetching seismic data:', error)
       setSeismicData(null)
     }
   }

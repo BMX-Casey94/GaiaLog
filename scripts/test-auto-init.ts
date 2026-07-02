@@ -63,7 +63,7 @@ async function testAutoInit() {
     const tests = {
       initialized: finalStatus.initialized === true,
       hasWorkers: finalStatus.workersRunning === finalStatus.totalWorkers,
-      hasWallets: finalStatus.walletCount > 0,
+      hasWallets: (finalStatus.walletCount ?? 0) > 0,
       workersReady: finalStatus.workerManager === true,
       walletsReady: finalStatus.walletManager === true
     }

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { query } from '@/lib/db'
+import { fastTableCount } from '@/lib/db-fast-count'
 
 export const runtime = 'nodejs'
 
@@ -12,18 +12,15 @@ export async function GET() {
   ]
   const results: Record<string, number> = {}
 
-  // First try direct Postgres
-  try {
-    for (const t of tables) {
-      const { rows } = await query<{ c: number }>(`SELECT COUNT(*)::int AS c FROM ${t}`)
-      results[t] = rows[0]?.c ?? 0
-    }
-    return NextResponse.json({ success: true, counts: results })
-  } catch {
-    // Avoid 500 for UI; return zeros
-    for (const t of tables) results[t] = 0
-    return NextResponse.json({ success: true, counts: results })
-  }
+  // Planner estimates (O(1) per table) instead of four sequential full-table
+  // COUNT(*) scans, which were saturating database CPU on every dashboard poll.
+  const settled = await Promise.allSettled(tables.map(t => fastTableCount(t)))
+  tables.forEach((t, i) => {
+    const outcome = settled[i]
+    results[t] = outcome.status === 'fulfilled' ? outcome.value : 0
+  })
+
+  return NextResponse.json({ success: true, counts: results })
 }
 
 

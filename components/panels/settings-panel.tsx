@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -550,7 +550,10 @@ function ProviderCountryEditor({ providerId, label }: { providerId: string; labe
   }
 
   // Load once on mount
-  useState(() => { load() })
+  useEffect(() => {
+    load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const allowSet = new Set(allow.split(',').map(s => s.trim()).filter(Boolean))
   const denySet = new Set(deny.split(',').map(s => s.trim()).filter(Boolean))

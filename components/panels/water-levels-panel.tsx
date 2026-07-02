@@ -24,6 +24,7 @@ import {
   Waves
 } from "lucide-react"
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip"
+import { fetchFamilyAggregates, toNumber } from "@/lib/admin-db-stats"
 
 interface WaterLevelData {
   waterLevel: number
@@ -67,79 +68,62 @@ export function WaterLevelsPanel() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
 
-  // Fetch real water level data
+  // Fetch real water level data — latest DB row for the current reading,
+  // last 24 hours of rows for real aggregate statistics.
   const fetchWaterLevelData = useCallback(async () => {
     try {
-      const response = await fetch('/api/water-levels')
+      const response = await fetch('/api/db/water-levels?limit=1&sort=collected_at_desc')
       if (response.ok) {
-        const api = await response.json()
-        const station = Array.isArray(api?.stations) && api.stations.length > 0 ? api.stations[0] : null
+        const result = await response.json()
+        const latest = result?.success && Array.isArray(result.items) && result.items.length > 0
+          ? result.items[0]
+          : null
+
+        if (!latest) {
+          setWaterLevelData(null)
+          return
+        }
+
         const mapped: WaterLevelData = {
-          waterLevel: typeof station?.level === 'string' ? parseFloat(station.level) : (station?.level ?? 0),
-          tideHeight: typeof station?.tide_height === 'number' ? station.tide_height : undefined,
-          waterTemperature: typeof station?.water_temperature === 'number' ? station.water_temperature : undefined,
-          waveHeight: typeof station?.wave_height === 'number' ? station.wave_height : undefined,
-          salinity: typeof station?.salinity === 'number' ? station.salinity : undefined,
-          ph: typeof station?.ph === 'number' ? station.ph : undefined,
-          dissolvedOxygen: typeof station?.dissolved_oxygen === 'number' ? station.dissolved_oxygen : undefined,
-          turbidity: typeof station?.turbidity === 'number' ? station.turbidity : undefined,
-          currentSpeed: typeof station?.current_speed === 'number' ? station.current_speed : undefined,
-          currentDirection: typeof station?.current_direction === 'number' ? station.current_direction : undefined,
-          windSpeed: typeof station?.wind_speed === 'number' ? station.wind_speed : undefined,
-          windDirection: typeof station?.wind_direction === 'number' ? station.wind_direction : undefined,
-          location: station?.name || 'Unknown',
-          timestamp: api?.timestamp ? Date.parse(api.timestamp) : Date.now(),
-          source: api?.source || 'NOAA'
+          waterLevel: toNumber(latest.level_m) ?? 0,
+          tideHeight: toNumber(latest.tide_height_m) ?? undefined,
+          waveHeight: toNumber(latest.wave_height_m) ?? undefined,
+          salinity: toNumber(latest.salinity_psu) ?? undefined,
+          dissolvedOxygen: toNumber(latest.dissolved_oxygen_mg_l) ?? undefined,
+          turbidity: toNumber(latest.turbidity_ntu) ?? undefined,
+          currentSpeed: toNumber(latest.current_speed_ms) ?? undefined,
+          currentDirection: toNumber(latest.current_direction_deg) ?? undefined,
+          windSpeed: toNumber(latest.wind_kph) ?? undefined,
+          windDirection: toNumber(latest.wind_deg) ?? undefined,
+          location: latest.location || latest.station_code || 'Unknown',
+          timestamp: latest.collected_at ? Date.parse(latest.collected_at) : Date.now(),
+          source: latest.provider || 'NOAA'
         }
         setWaterLevelData(mapped)
-        setWaterLevelStats({
-          currentLevel: mapped.waterLevel || 0,
-          averageLevel: Math.floor(Math.random() * 20) + 10,
-          maxLevel: Math.floor(Math.random() * 30) + 20,
-          minLevel: Math.floor(Math.random() * 10) + 5,
-          totalReadings: Math.floor(Math.random() * 1000) + 500,
-          alerts: Math.floor(Math.random() * 3),
-          lastUpdate: Date.now()
-        })
         setLastUpdate(new Date())
+
+        const aggregates = await fetchFamilyAggregates({
+          endpoint: '/api/db/water-levels',
+          valueOf: (row) => toNumber(row.level_m),
+          isAlert: (row) => (toNumber(row.level_m) ?? 0) > 4,
+        })
+        if (aggregates) {
+          setWaterLevelStats({
+            currentLevel: mapped.waterLevel || 0,
+            averageLevel: Number(aggregates.average.toFixed(2)),
+            maxLevel: Number(aggregates.max.toFixed(2)),
+            minLevel: Number(aggregates.min.toFixed(2)),
+            totalReadings: aggregates.totalReadings,
+            alerts: aggregates.alerts,
+            lastUpdate: Date.now()
+          })
+        }
       }
     } catch (error) {
       console.error('Error fetching water level data:', error)
-      // Fallback to simulated data
-      setSimulatedData()
+      setWaterLevelData(null)
     }
   }, [])
-
-  // Fallback simulated data
-  const setSimulatedData = () => {
-    const simulatedData: WaterLevelData = {
-      waterLevel: Math.floor(Math.random() * 20) + 10,
-      tideHeight: Math.floor(Math.random() * 5) + 2,
-      waveHeight: Math.floor(Math.random() * 3) + 1,
-      waterTemperature: Math.floor(Math.random() * 20) + 10,
-      salinity: Math.floor(Math.random() * 10) + 30,
-      ph: Math.floor(Math.random() * 2) + 7,
-      dissolvedOxygen: Math.floor(Math.random() * 5) + 8,
-      turbidity: Math.floor(Math.random() * 10) + 5,
-      currentSpeed: Math.floor(Math.random() * 5) + 1,
-      currentDirection: Math.floor(Math.random() * 360),
-      windSpeed: Math.floor(Math.random() * 30) + 5,
-      windDirection: Math.floor(Math.random() * 360),
-      location: "Tokyo Bay, Japan",
-      timestamp: Date.now(),
-      source: "NOAA"
-    }
-    setWaterLevelData(simulatedData)
-    setWaterLevelStats({
-      currentLevel: simulatedData.waterLevel,
-      averageLevel: Math.floor(Math.random() * 20) + 10,
-      maxLevel: Math.floor(Math.random() * 30) + 20,
-      minLevel: Math.floor(Math.random() * 10) + 5,
-      totalReadings: Math.floor(Math.random() * 1000) + 500,
-      alerts: Math.floor(Math.random() * 3),
-      lastUpdate: Date.now()
-    })
-  }
 
   // Real-time data updates
   useEffect(() => {

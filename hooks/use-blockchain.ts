@@ -1,91 +1,105 @@
 "use client"
 
 import { useState, useEffect, useCallback } from "react"
-import { bsvClient, type BlockchainTransaction, type WalletConfig } from "@/lib/bsv-client"
 
+export interface BlockchainTransaction {
+  txid: string
+  dataType: string
+  timestamp: string
+  status: string
+  location: string | null
+  provider: string | null
+}
+
+export interface BlockchainConnectionStatus {
+  connected: boolean
+  totalTransactions: number
+  processingRate: number
+  errorRate: number
+  queueSize: number
+  runningWorkers: number
+}
+
+const BSV_NETWORK_PARAM = "main"
+
+export function getExplorerUrl(txid: string): string {
+  return `https://whatsonchain.com/tx/${txid}?network=${BSV_NETWORK_PARAM}`
+}
+
+/**
+ * Reads live blockchain state from the real service APIs:
+ * - /api/blockchain/recent-readings — latest broadcast TX per data family
+ * - /api/bsv/stats — wallet/queue/worker service statistics
+ */
 export function useBlockchain() {
-  const [wallet, setWallet] = useState<WalletConfig | null>(null)
   const [transactions, setTransactions] = useState<BlockchainTransaction[]>([])
-  const [connectionStatus, setConnectionStatus] = useState<{
-    connected: boolean
-    blockHeight: number
-    networkFee: number
-  } | null>(null)
-  const [loading, setLoading] = useState(false)
+  const [connectionStatus, setConnectionStatus] = useState<BlockchainConnectionStatus | null>(null)
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  // Initialize wallet
-  const initializeWallet = useCallback(async (privateKey?: string) => {
+  const refresh = useCallback(async () => {
     try {
-      setLoading(true)
       setError(null)
-      const walletInfo = await bsvClient.initializeWallet(privateKey)
-      setWallet(walletInfo)
-      return walletInfo
+      const [readingsRes, statsRes] = await Promise.allSettled([
+        fetch('/api/blockchain/recent-readings'),
+        fetch('/api/bsv/stats'),
+      ])
+
+      if (readingsRes.status === 'fulfilled' && readingsRes.value.ok) {
+        const data = await readingsRes.value.json()
+        if (data?.success && Array.isArray(data.readings)) {
+          setTransactions(
+            data.readings.map((r: any) => ({
+              txid: r.txid,
+              dataType: r.type,
+              timestamp: r.timestamp,
+              status: r.status || 'confirmed',
+              location: r.location ?? null,
+              provider: r.data?.provider ?? null,
+            }))
+          )
+        }
+      }
+
+      if (statsRes.status === 'fulfilled' && statsRes.value.ok) {
+        const stats = await statsRes.value.json()
+        setConnectionStatus({
+          connected: stats?.success !== false,
+          totalTransactions: Number(stats?.totalTransactions) || 0,
+          processingRate: Number(stats?.processingRate) || 0,
+          errorRate: Number(stats?.errorRate) || 0,
+          queueSize: Number(stats?.queueSize) || 0,
+          runningWorkers: Number(stats?.runningWorkers) || 0,
+        })
+      } else {
+        setConnectionStatus((prev) => prev ? { ...prev, connected: false } : {
+          connected: false,
+          totalTransactions: 0,
+          processingRate: 0,
+          errorRate: 0,
+          queueSize: 0,
+          runningWorkers: 0,
+        })
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to initialize wallet")
-      throw err
+      setError(err instanceof Error ? err.message : 'Failed to fetch blockchain status')
     } finally {
       setLoading(false)
     }
   }, [])
 
-  // Record data on blockchain
-  const recordData = useCallback(async (dataType: string, data: any) => {
-    try {
-      setLoading(true)
-      setError(null)
-      const transaction = await bsvClient.recordEnvironmentalData(dataType, data)
-      setTransactions((prev) => [transaction, ...prev])
-      return transaction
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to record data")
-      throw err
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  // Refresh transaction history
-  const refreshTransactions = useCallback(() => {
-    const history = bsvClient.getTransactionHistory()
-    setTransactions(history)
-  }, [])
-
-  // Check connection status
-  const checkConnection = useCallback(async () => {
-    try {
-      const status = await bsvClient.getConnectionStatus()
-      setConnectionStatus(status)
-      return status
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to check connection")
-      return null
-    }
-  }, [])
-
-  // Initialize on mount
   useEffect(() => {
-    initializeWallet()
-    checkConnection()
-  }, [initializeWallet, checkConnection])
-
-  // Refresh transactions periodically
-  useEffect(() => {
-    const interval = setInterval(refreshTransactions, 5000)
+    refresh()
+    const interval = setInterval(refresh, 45000)
     return () => clearInterval(interval)
-  }, [refreshTransactions])
+  }, [refresh])
 
   return {
-    wallet,
     transactions,
     connectionStatus,
     loading,
     error,
-    initializeWallet,
-    recordData,
-    refreshTransactions,
-    checkConnection,
-    getExplorerUrl: bsvClient.getExplorerUrl,
+    refresh,
+    getExplorerUrl,
   }
 }

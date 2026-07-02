@@ -27,7 +27,7 @@ interface TransactionDisplay {
 
 export function BlockchainExplorer() {
   const [txByFamily, setTxByFamily] = useState<Map<string, TransactionDisplay>>(new Map())
-  const [network, setNetwork] = useState<string>('test')
+  const [network, setNetwork] = useState<string>('main')
   const [loading, setLoading] = useState(true)
   const [showWalletModal, setShowWalletModal] = useState(false)
   const [readingsSource, setReadingsSource] = useState<string | null>(null)
@@ -64,7 +64,7 @@ export function BlockchainExplorer() {
         const netStr =
           result.network === 'mainnet' ? 'main'
           : result.network === 'testnet' ? 'test'
-          : (result.network || 'test')
+          : (result.network || 'main')
         setNetwork(netStr)
 
         const newMap = new Map<string, TransactionDisplay>()
@@ -110,7 +110,7 @@ export function BlockchainExplorer() {
       <div className="relative z-10">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-16">
-            <h2 className="text-3xl md:text-4xl font-bold text-white mb-4">Blockchain Verification</h2>
+            <h2 className="font-display text-3xl md:text-4xl font-bold text-white mb-4 tracking-tight">Blockchain Verification</h2>
             <p className="text-lg text-slate-400 max-w-2xl mx-auto">
               Every environmental measurement is cryptographically secured and stored on the BSV blockchain. Verify any
               data point independently.

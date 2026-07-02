@@ -18,6 +18,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { searchReadings, getAggregates, type SearchParams } from '@/lib/explorer-read-source'
 import { normaliseDataFamily } from '@/lib/stream-registry'
+import { applyPublicReadCacheHeaders } from '@/lib/cache-headers'
 
 export const dynamic = 'force-dynamic'
 
@@ -94,7 +95,7 @@ export async function GET(request: NextRequest) {
       wocUrl: `${WOC_BASE}/tx/${String(item.txid).toLowerCase()}?voutOffset=0&output=0`,
     }))
 
-    return NextResponse.json({
+    return applyPublicReadCacheHeaders(NextResponse.json({
       success: true,
       data: {
         items,
@@ -119,7 +120,7 @@ export async function GET(request: NextRequest) {
           byType: aggregates.byType,
         },
       },
-    })
+    }))
   } catch (error) {
     console.error('Explorer search error:', error)
     return NextResponse.json(

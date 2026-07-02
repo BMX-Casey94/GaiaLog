@@ -1812,26 +1812,40 @@ export async function collectGeomagnetismData(): Promise<GeomagReading[]> {
       const url = `https://geomag.usgs.gov/ws/data/?id=${obs.code}&starttime=${start}&endtime=${end}&type=variation&elements=X,Y,Z,F&format=json&sampling_period=60`
       const data = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'usgs_geomagnetism' })
 
-      const values = data?.values
-      if (!Array.isArray(values) || values.length === 0) continue
+      // Response shape (USGS Timeseries JSON):
+      //   times:  ["2026-07-02T13:50:00.000Z", ...]
+      //   values: [{ id: "X", values: [20396.5, ...] }, { id: "Y", ... }, ...]
+      // i.e. one series per element, aligned by index against `times` —
+      // NOT an array of { t, v } row objects.
+      const times: string[] = Array.isArray(data?.times) ? data.times : []
+      const series: any[] = Array.isArray(data?.values) ? data.values : []
+      if (times.length === 0 || series.length === 0) continue
 
       const lastSeen = _geomagWatermarks.get(obs.code) ?? 0
       let maxTs = lastSeen
-      const elementIds = (data.id || 'X,Y,Z,F').split(',')
 
-      for (const v of values) {
-        if (!v.t) continue
-        const ts = new Date(v.t).getTime()
+      for (let i = 0; i < times.length; i++) {
+        const t = times[i]
+        if (!t) continue
+        const ts = new Date(t).getTime()
         if (isNaN(ts) || ts <= lastSeen) continue
-        if (ts > maxTs) maxTs = ts
 
         const elements: Record<string, number | null> = {}
-        const vals = Array.isArray(v.v) ? v.v : []
-        for (let i = 0; i < elementIds.length; i++) {
-          elements[elementIds[i].trim()] = vals[i] != null ? vals[i] : null
+        let hasValue = false
+        for (const s of series) {
+          const id = String(s?.id || s?.metadata?.element || '').trim()
+          if (!id) continue
+          const value = Array.isArray(s?.values) ? s.values[i] : null
+          elements[id] = typeof value === 'number' && Number.isFinite(value) ? value : null
+          if (elements[id] != null) hasValue = true
         }
+        // Trailing rows arrive with all-null values until the observatory
+        // publishes them (~2-3 minute lag). Skip them WITHOUT advancing the
+        // watermark so they are picked up once real values appear.
+        if (!hasValue) continue
+        if (ts > maxTs) maxTs = ts
 
-        const key = `geomag:${obs.code}:${v.t}`
+        const key = `geomag:${obs.code}:${t}`
         if (await dedupeStore.add(key)) {
           out.push({
             timestamp: ts,
@@ -2070,13 +2084,21 @@ export interface IntermagnetReading {
   f: number | null
 }
 
-const _intermagnetWatermark = { ts: 0 }
+// Per-observatory watermarks. A single shared watermark previously meant the
+// fastest-publishing observatory suppressed every other observatory's
+// readings forever (their timestamps were always <= the shared high-water).
+const _intermagnetWatermarks = new Map<string, number>()
 
 export async function collectIntermagnetData(): Promise<IntermagnetReading[]> {
   const now = new Date()
-  const stop = now.toISOString().replace(/\.\d+Z$/, 'Z')
-  const startDate = new Date(now.getTime() - 2 * 60 * 60 * 1000)
-  const start = startDate.toISOString().replace(/\.\d+Z$/, 'Z')
+  const start = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z')
+  // The BGS HAPI server responds HTTP 400 whenever time.max extends beyond a
+  // dataset's stopDate, and even live 'reported' feeds lag a few minutes
+  // behind wall-clock time — so a naive time.max=now fails for everything.
+  // Primary attempt uses now-5min; the fallback inside the loop retries with
+  // now-30min for slower publishers before giving up on an observatory.
+  const stopPrimary = new Date(now.getTime() - 5 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z')
+  const stopFallback = new Date(now.getTime() - 30 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z')
 
   const capabilitiesUrl = 'https://imag-data.bgs.ac.uk/GIN_V1/hapi/catalog'
   let datasets: any[] = []
@@ -2085,43 +2107,90 @@ export async function collectIntermagnetData(): Promise<IntermagnetReading[]> {
     datasets = Array.isArray(catalog?.catalog) ? catalog.catalog : []
   } catch { return [] }
 
-  const observatories = datasets.slice(0, 30)
-  const lastSeen = _intermagnetWatermark.ts
-  let maxTs = lastSeen
+  // The catalogue lists ~3,000 dataset variants sorted alphabetically by
+  // observatory code (aae/definitive/..., aae/quasi-def/..., abg/...).
+  // Naively taking the first N entries selects many variants of the same
+  // one or two observatories — whose 'definitive'/'quasi-def' products lag
+  // months behind real time — so a near-now window always returns nothing.
+  // Only 'reported' PT1M data is published in near-real-time, so select one
+  // reported minute-cadence dataset per distinct observatory.
+  const seenObservatories = new Set<string>()
+  const observatories: Array<{ id: string }> = []
+  for (const ds of datasets) {
+    const id = String(ds?.id || '')
+    if (!/\/reported\/PT1M\/native$/.test(id)) continue
+    const obsCode = id.split('/')[0]
+    if (!obsCode || seenObservatories.has(obsCode)) continue
+    seenObservatories.add(obsCode)
+    observatories.push({ id })
+    if (observatories.length >= 30) break
+  }
+
   const out: IntermagnetReading[] = []
 
   for (const ds of observatories) {
     const id = ds?.id
     if (!id) continue
     try {
-      const dataUrl = `https://imag-data.bgs.ac.uk/GIN_V1/hapi/data?id=${encodeURIComponent(id)}&time.min=${start}&time.max=${stop}&format=json`
-      const resp = await fetchJsonWithRetry<any>(dataUrl, { retries: 1, providerId: 'intermagnet', timeoutMs: 15000 })
+      // Stale observatories (feed lagging beyond the requested window)
+      // respond HTTP 400; retries stays at 0 so a dead feed costs at most
+      // two requests (primary + fallback window) per cycle.
+      let resp: any = null
+      for (const stop of [stopPrimary, stopFallback]) {
+        try {
+          const dataUrl = `https://imag-data.bgs.ac.uk/GIN_V1/hapi/data?id=${encodeURIComponent(id)}&time.min=${start}&time.max=${stop}&format=json`
+          resp = await fetchJsonWithRetry<any>(dataUrl, { retries: 0, providerId: 'intermagnet', timeoutMs: 15000 })
+          break
+        } catch {
+          resp = null
+        }
+      }
+      if (!resp) continue
       const records = Array.isArray(resp?.data) ? resp.data : []
       if (records.length === 0) continue
       const last = records[records.length - 1]
       const tsStr = Array.isArray(last) ? last[0] : last?.Time || last?.timestamp
       const ts = tsStr ? new Date(tsStr).getTime() : Date.now()
+      const lastSeen = _intermagnetWatermarks.get(id) ?? 0
       if (isNaN(ts) || ts <= lastSeen) continue
-      if (ts > maxTs) maxTs = ts
+      _intermagnetWatermarks.set(id, ts)
 
       const key = `intermagnet:${id}:${tsStr}`
       if (!(await dedupeStore.add(key))) continue
 
-      const vals = Array.isArray(last) ? last : [last?.Time, last?.X, last?.Y, last?.Z, last?.F]
+      // Record shape for reported/PT1M/native:
+      //   ["2026-07-02T13:59Z", { "value": [c1, c2, c3], "Count": 3 }, F, "HDZ"]
+      // where the 3-component field vector is in the observatory's native
+      // orientation (XYZ or HDZ) and the scalar total field F follows it.
+      const vectorRaw = Array.isArray(last) ? last[1] : null
+      const vector: unknown[] = Array.isArray(vectorRaw)
+        ? vectorRaw
+        : (vectorRaw && typeof vectorRaw === 'object' && Array.isArray((vectorRaw as any).value))
+          ? (vectorRaw as any).value
+          : []
+      // 99999 / 88888 are INTERMAGNET fill values for missing measurements.
+      const clean = (value: unknown): number | null => {
+        const parsed = parseNumericValue(value)
+        if (parsed == null || parsed >= 88888) return null
+        return parsed
+      }
+      const scalarF = Array.isArray(last) ? clean(last[2]) : clean(last?.F)
+      // "bou/reported/PT1M/native" → "BOU" (IAGA observatory code); the
+      // dataset variant is an implementation detail, not a location.
+      const observatoryCode = String(id).split('/')[0].toUpperCase()
       out.push({
         timestamp: ts,
         source: 'INTERMAGNET',
-        observatory: id,
+        observatory: observatoryCode,
         latitude: resp?.parameters?.[0]?.latitude ?? 0,
         longitude: resp?.parameters?.[0]?.longitude ?? 0,
-        x: parseNumericValue(vals[1]) ?? null,
-        y: parseNumericValue(vals[2]) ?? null,
-        z: parseNumericValue(vals[3]) ?? null,
-        f: parseNumericValue(vals[4]) ?? null,
+        x: clean(vector[0]),
+        y: clean(vector[1]),
+        z: clean(vector[2]),
+        f: scalarF,
       })
     } catch { /* skip failed observatory */ }
   }
-  if (maxTs > lastSeen) _intermagnetWatermark.ts = maxTs
   return out
 }
 
@@ -4561,7 +4630,9 @@ export async function collectNoaaSwpcIndices(): Promise<NoaaSwpcIndexReading[]> 
     },
     {
       id: 'aurora-forecast',
-      url: 'https://services.swpc.noaa.gov/products/animations/ovation_aurora_latest.json',
+      // The /products/animations/ path was retired by NOAA (404); the JSON
+      // endpoint serves the same OVATION payload shape.
+      url: 'https://services.swpc.noaa.gov/json/ovation_aurora_latest.json',
       parse: (data) => {
         if (!data) return []
         const ts = data?.['Forecast Time'] || data?.['Observation Time']

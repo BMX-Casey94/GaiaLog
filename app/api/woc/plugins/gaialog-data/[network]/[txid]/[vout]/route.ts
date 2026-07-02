@@ -60,12 +60,13 @@ async function fetchTxAndFindScriptHex(network: string, txid: string, vout?: num
 
 export async function GET(
 	req: NextRequest,
-	{ params }: { params: { network: string; txid: string; vout: string } }
+	{ params }: { params: Promise<{ network: string; txid: string; vout: string }> }
 ) {
+	const resolvedParams = await params
 	try {
-		const network = String(params.network || 'main').trim()
-		const txid = String(params.txid || '').trim()
-		const vout = Number(params.vout)
+		const network = String(resolvedParams.network || 'main').trim()
+		const txid = String(resolvedParams.txid || '').trim()
+		const vout = Number(resolvedParams.vout)
 		if (!txid || !Number.isFinite(vout)) throw new Error('Invalid parameters')
 
 		const key = `GET:${network}:${txid}:${vout}`
@@ -116,7 +117,7 @@ export async function GET(
 		let detectedMessage: string | null = null
 		try {
 			// Try fetch the script again to inspect and map to custom error messages
-			const hexForDetect = await fetchTxAndFindScriptHex(params.network, params.txid, Number(params.vout))
+			const hexForDetect = await fetchTxAndFindScriptHex(resolvedParams.network, resolvedParams.txid, Number(resolvedParams.vout))
 			const detected = detectKnownNonGaia(hexForDetect)
 			if (detected) detectedMessage = detected.message
 		} catch {}
@@ -140,8 +141,8 @@ export async function GET(
 		})()
 
 		const html = renderErrorHtml({
-			txid: params.txid,
-			network: params.network,
+			txid: resolvedParams.txid,
+			network: resolvedParams.network,
 			message: detectedMessage || "Unfortunately, this is not a GaiaLog transaction,|and is not compatible for decoding via this Plugin.",
 			logoUrl,
 		})

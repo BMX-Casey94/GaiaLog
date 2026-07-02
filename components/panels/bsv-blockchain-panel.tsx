@@ -102,16 +102,24 @@ export function BSVBlockchainPanel() {
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null)
   const [txItems, setTxItems] = useState<any[]>([])
-  const [txNetwork, setTxNetwork] = useState<'main' | 'test'>('test')
+  const [txNetwork, setTxNetwork] = useState<'main' | 'test'>('main')
+  const [fetchError, setFetchError] = useState<string | null>(null)
 
-  // Fetch real data from our BSV services
+  // Fetch real data from our BSV services — all endpoints in parallel.
   const fetchRealData = useCallback(async () => {
     try {
-      // Fetch wallet information from wallet manager
-      const walletResponse = await fetch('/api/bsv/wallets')
-      if (walletResponse.ok) {
-        const walletData = await walletResponse.json()
-        setWalletInfo(walletData.wallets.map((wallet: any, index: number) => ({
+      const [walletRes, queueRes, workersRes, statsRes, txRes, providersRes] = await Promise.allSettled([
+        fetch('/api/bsv/wallets'),
+        fetch('/api/bsv/queue'),
+        fetch('/api/bsv/workers'),
+        fetch('/api/bsv/stats'),
+        fetch('/api/bsv/tx-log?limit=50'),
+        fetch('/api/providers/status'),
+      ])
+
+      if (walletRes.status === 'fulfilled' && walletRes.value.ok) {
+        const walletData = await walletRes.value.json()
+        setWalletInfo((walletData.wallets ?? []).map((wallet: any, index: number) => ({
           index,
           address: wallet.address,
           balance: wallet.balance / 100000000, // Convert satoshis to BSV
@@ -120,10 +128,8 @@ export function BSVBlockchainPanel() {
         })))
       }
 
-      // Fetch queue status from worker queue
-      const queueResponse = await fetch('/api/bsv/queue')
-      if (queueResponse.ok) {
-        const queueData = await queueResponse.json()
+      if (queueRes.status === 'fulfilled' && queueRes.value.ok) {
+        const queueData = await queueRes.value.json()
         setQueueStatus({
           highPriority: queueData.highPriorityItems,
           normalPriority: queueData.normalPriorityItems,
@@ -133,11 +139,9 @@ export function BSVBlockchainPanel() {
         })
       }
 
-      // Fetch worker statistics
-      const workersResponse = await fetch('/api/bsv/workers')
-      if (workersResponse.ok) {
-        const workersData = await workersResponse.json()
-        setWorkerStats(workersData.workers.map((worker: any) => ({
+      if (workersRes.status === 'fulfilled' && workersRes.value.ok) {
+        const workersData = await workersRes.value.json()
+        setWorkerStats((workersData.workers ?? []).map((worker: any) => ({
           workerId: worker.workerId,
           isRunning: worker.isRunning,
           totalRuns: worker.totalRuns,
@@ -149,10 +153,8 @@ export function BSVBlockchainPanel() {
         })))
       }
 
-      // Fetch overall BSV statistics
-      const statsResponse = await fetch('/api/bsv/stats')
-      if (statsResponse.ok) {
-        const statsData = await statsResponse.json()
+      if (statsRes.status === 'fulfilled' && statsRes.value.ok) {
+        const statsData = await statsRes.value.json()
         setBsvStats({
           totalTransactions: statsData.totalTransactions,
           processingRate: statsData.processingRate,
@@ -197,108 +199,29 @@ export function BSVBlockchainPanel() {
         setProviderHttp(compact)
       }
 
-      // Fetch tx log from DB
-      const txRes = await fetch('/api/bsv/tx-log?limit=50')
-      if (txRes.ok) {
-        const txJson = await txRes.json()
-        setTxNetwork(txJson.network === 'main' ? 'main' : 'test')
+      if (txRes.status === 'fulfilled' && txRes.value.ok) {
+        const txJson = await txRes.value.json()
+        setTxNetwork(txJson.network === 'test' ? 'test' : 'main')
         setTxItems(Array.isArray(txJson.items) ? txJson.items : [])
       }
 
-      // Fetch provider key/health status
-      const providersResponse = await fetch('/api/providers/status')
-      if (providersResponse.ok) {
-        const data = await providersResponse.json()
+      if (providersRes.status === 'fulfilled' && providersRes.value.ok) {
+        const data = await providersRes.value.json()
         setProviderStatus(data.results)
       }
 
+      setFetchError(null)
       setLastUpdate(new Date())
     } catch (error) {
       console.error('Error fetching BSV data:', error)
-      // Fallback to simulated data if API calls fail
-      setSimulatedData()
+      setFetchError(error instanceof Error ? error.message : 'Failed to fetch BSV service data')
     }
   }, [])
 
-  // Fallback simulated data (for development/testing)
-  const setSimulatedData = () => {
-    setWalletInfo([
-      {
-        index: 0,
-        address: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
-        balance: 0.125,
-        lastUsed: Date.now() - 300000,
-        transactionCount: 156
-      },
-      {
-        index: 1,
-        address: "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
-        balance: 0.089,
-        lastUsed: Date.now() - 180000,
-        transactionCount: 142
-      },
-      {
-        index: 2,
-        address: "1C4bFy2Vq2u9YK4xH4jF8iBzgi7EFDbJd9",
-        balance: 0.203,
-        lastUsed: Date.now() - 60000,
-        transactionCount: 189
-      }
-    ])
-
-    setQueueStatus({
-      highPriority: Math.floor(Math.random() * 5),
-      normalPriority: Math.floor(Math.random() * 20) + 10,
-      processing: Math.floor(Math.random() * 3),
-      completed: 2847 + Math.floor(Math.random() * 50),
-      failed: 23 + Math.floor(Math.random() * 5)
-    })
-
-         setWorkerStats([
-       {
-         workerId: "WAQI-Environmental",
-         isRunning: true,
-         totalRuns: 156,
-         totalTransactions: 892,
-         errors: 3,
-         averageProcessingTime: 245,
-         lastRun: Date.now() - 1800000, // 30 minutes ago
-         nextRun: Date.now() + 1800000 // 30 minutes from now
-       },
-       {
-         workerId: "NOAA-Weather",
-         isRunning: true,
-         totalRuns: 78,
-         totalTransactions: 456,
-         errors: 1,
-         averageProcessingTime: 312,
-         lastRun: Date.now() - 3600000, // 60 minutes ago
-         nextRun: Date.now() + 3600000 // 60 minutes from now
-       },
-       {
-         workerId: "USGS-Seismic",
-         isRunning: true,
-         totalRuns: 39,
-         totalTransactions: 234,
-         errors: 0,
-         averageProcessingTime: 189,
-         lastRun: Date.now() - 900000, // 15 minutes ago
-         nextRun: Date.now() + 900000 // 15 minutes from now
-       }
-     ])
-
-    setBsvStats({
-      totalTransactions: 2847,
-      processingRate: 46.3,
-      errorRate: 0.8,
-      dailyCapacity: 4000398
-    })
-  }
-
-  // Real-time data updates
+  // Real-time data updates — 15s aligns with the server-side stats cache TTL.
   useEffect(() => {
     fetchRealData()
-    const interval = setInterval(fetchRealData, 5000) // Update every 5 seconds
+    const interval = setInterval(fetchRealData, 15000)
 
     return () => clearInterval(interval)
   }, [fetchRealData])
@@ -365,6 +288,11 @@ export function BSVBlockchainPanel() {
           <p className="text-xs text-muted-foreground mt-1">
             Last updated: {formatLastUpdate(lastUpdate)}
           </p>
+          {fetchError && (
+            <p className="text-xs text-destructive mt-1" role="alert">
+              Failed to load service data: {fetchError}
+            </p>
+          )}
         </div>
         <Button onClick={handleRefresh} disabled={isRefreshing}>
           <RefreshCw className={`h-4 w-4 mr-2 ${isRefreshing ? 'animate-spin' : ''}`} />
@@ -382,7 +310,14 @@ export function BSVBlockchainPanel() {
           <CardContent>
             <div className="text-2xl font-bold">{(bsvStats.totalTransactions || 0).toLocaleString()}</div>
             <p className="text-xs text-muted-foreground">
-              +{Math.floor(Math.random() * 20) + 10} in last hour
+              {(() => {
+                const hourAgo = Date.now() - 60 * 60 * 1000
+                const recent = txItems.filter((tx) => {
+                  const ts = Date.parse(tx.onchain_at || tx.collected_at || '')
+                  return Number.isFinite(ts) && ts >= hourAgo
+                }).length
+                return `+${recent} in last hour${txItems.length >= 50 ? ' (sampled)' : ''}`
+              })()}
             </p>
           </CardContent>
         </Card>
@@ -705,34 +640,42 @@ export function BSVBlockchainPanel() {
               <CardContent className="space-y-4">
                 <div className="space-y-3">
                   <div className="flex justify-between items-center">
-                    <span className="text-sm">Total Transactions</span>
+                    <span className="text-sm">Total Transactions (24h)</span>
                     <span className="font-semibold">{(bsvStats.totalTransactions || 0).toLocaleString()}</span>
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-sm">Confirmed</span>
                     <span className="font-semibold text-green-600">
-                      {Math.floor((bsvStats.totalTransactions || 0) * 0.95).toLocaleString()}
+                      {(queueStatus.completed || 0).toLocaleString()}
                     </span>
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-sm">Pending</span>
                     <span className="font-semibold text-yellow-600">
-                      {Math.floor((bsvStats.totalTransactions || 0) * 0.05).toLocaleString()}
+                      {txItems.filter((tx) => tx.status === 'pending').length.toLocaleString()}
                     </span>
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-sm">Failed</span>
                     <span className="font-semibold text-red-600">
-                      {Math.floor((bsvStats.totalTransactions || 0) * 0.01).toLocaleString()}
+                      {(queueStatus.failed || 0).toLocaleString()}
                     </span>
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <div className="flex justify-between text-sm">
-                    <span>Success Rate</span>
-                    <span>99.0%</span>
-                  </div>
-                  <Progress value={99} className="h-2" />
+                  {(() => {
+                    const denom = (queueStatus.completed || 0) + (queueStatus.failed || 0)
+                    const rate = denom > 0 ? ((queueStatus.completed || 0) / denom) * 100 : 0
+                    return (
+                      <>
+                        <div className="flex justify-between text-sm">
+                          <span>Success Rate</span>
+                          <span>{rate.toFixed(1)}%</span>
+                        </div>
+                        <Progress value={rate} className="h-2" />
+                      </>
+                    )
+                  })()}
                 </div>
               </CardContent>
             </Card>
@@ -773,22 +716,41 @@ export function BSVBlockchainPanel() {
               </CardHeader>
               <CardContent>
                 <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm">BSV Network</span>
-                    <Badge variant="default" className="bg-green-500">Connected</Badge>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm">ARC API</span>
-                    <Badge variant="default" className="bg-green-500">Active</Badge>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm">Worker Threads</span>
-                    <Badge variant="default" className="bg-green-500">All Running</Badge>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm">Queue Health</span>
-                    <Badge variant="default" className="bg-green-500">Optimal</Badge>
-                  </div>
+                  {(() => {
+                    const runningWorkers = workerStats.filter(w => w.isRunning).length
+                    const totalWorkers = workerStats.length
+                    const allRunning = totalWorkers > 0 && runningWorkers === totalWorkers
+                    const backlog = (queueStatus.highPriority || 0) + (queueStatus.normalPriority || 0)
+                    const networkHealthy = !fetchError && (bsvStats.errorRate || 0) < 5
+                    return (
+                      <>
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm">BSV Network</span>
+                          <Badge variant={networkHealthy ? 'default' : 'destructive'} className={networkHealthy ? 'bg-green-500' : ''}>
+                            {networkHealthy ? 'Connected' : 'Degraded'}
+                          </Badge>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm">Error Rate (24h)</span>
+                          <Badge variant={(bsvStats.errorRate || 0) < 5 ? 'default' : 'destructive'} className={(bsvStats.errorRate || 0) < 5 ? 'bg-green-500' : ''}>
+                            {(bsvStats.errorRate || 0).toFixed(1)}%
+                          </Badge>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm">Worker Threads</span>
+                          <Badge variant={allRunning ? 'default' : 'destructive'} className={allRunning ? 'bg-green-500' : ''}>
+                            {totalWorkers === 0 ? 'None reported' : `${runningWorkers}/${totalWorkers} running`}
+                          </Badge>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm">Queue Backlog</span>
+                          <Badge variant={backlog < 100 ? 'default' : 'destructive'} className={backlog < 100 ? 'bg-green-500' : ''}>
+                            {backlog.toLocaleString()} queued
+                          </Badge>
+                        </div>
+                      </>
+                    )
+                  })()}
                 </div>
               </CardContent>
             </Card>

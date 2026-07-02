@@ -15,14 +15,19 @@ export async function createSupabaseServerClient() {
 
 	return createServerClient(supabaseUrl, supabaseAnonKey, {
 		cookies: {
-			get(name: string) {
-				return cookieStore.get(name)?.value
+			getAll() {
+				return cookieStore.getAll()
 			},
-			set(name: string, value: string, options: Parameters<typeof cookieStore.set>[0]) {
-				cookieStore.set({ name, value, ...options })
-			},
-			remove(name: string, options: Parameters<typeof cookieStore.set>[0]) {
-				cookieStore.set({ name, value: "", ...options, maxAge: 0 })
+			setAll(cookiesToSet) {
+				try {
+					cookiesToSet.forEach(({ name, value, options }) => {
+						cookieStore.set(name, value, options)
+					})
+				} catch {
+					// `setAll` is called from a Server Component where mutating
+					// cookies is not permitted; safe to ignore when middleware
+					// refreshes the session instead.
+				}
 			},
 		},
 	})

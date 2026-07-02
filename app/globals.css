@@ -11,6 +11,11 @@
   --radius-3xl: 1.875rem;
   --radius-full: 9999px;
   --color-button-ripple-color: var(----button-ripple-color);
+
+  /* Typography: DM Sans for body, Space Grotesk for display headings */
+  --font-sans: var(--font-dm-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
+  --font-space-grotesk: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
 }
 
 :root {
@@ -28,17 +33,17 @@
   --card-foreground: #1f2937;
   --popover: #ffffff;
   --popover-foreground: #374151;
-  --primary: #374151;
+  --primary: #4f46e5;
   --primary-foreground: #ffffff;
   --secondary: #6366f1;
   --secondary-foreground: #ffffff;
-  --muted: #f8fafc;
-  --muted-foreground: #1f2937;
+  --muted: #f1f5f9;
+  --muted-foreground: #64748b;
   --accent: #6366f1;
   --accent-foreground: #ffffff;
   --destructive: #dc2626;
   --destructive-foreground: #ffffff;
-  --border: #e5e7eb;
+  --border: #e2e8f0;
   --input: #f8fafc;
   --ring: #6366f1;
   --chart-1: #4f46e5;
@@ -46,7 +51,7 @@
   --chart-3: #fbbf24;
   --chart-4: #dc2626;
   --chart-5: #6366f1;
-  --radius: 0.375rem;
+  --radius: 0.625rem;
   --sidebar: #f8fafc;
   --sidebar-foreground: #374151;
   --sidebar-primary: #e5e7eb;
@@ -55,41 +60,52 @@
   --sidebar-accent-foreground: #ffffff;
   --sidebar-border: #e5e7eb;
   --sidebar-ring: #6366f1;
+  /* Marketing surface tokens (public pages) */
+  --surface-deep: #020617;
+  --surface-glass: rgba(15, 23, 42, 0.55);
+  --surface-glass-border: rgba(100, 116, 139, 0.25);
+  --glow-purple: rgba(139, 92, 246, 0.25);
+  --glow-indigo: rgba(99, 102, 241, 0.25);
 }
 
 .dark {
-  --background: #0f172a;
+  --background: #0b1120;
   --foreground: #f1f5f9;
-  --card: #1e293b;
+  --card: #101a30;
   --card-foreground: #f1f5f9;
-  --popover: #1e293b;
+  --popover: #101a30;
   --popover-foreground: #f1f5f9;
-  --primary: #f1f5f9;
-  --primary-foreground: #0f172a;
+  --primary: #818cf8;
+  --primary-foreground: #0b1120;
   --secondary: #6366f1;
   --secondary-foreground: #ffffff;
-  --muted: #334155;
+  --muted: #1e293b;
   --muted-foreground: #94a3b8;
   --accent: #6366f1;
   --accent-foreground: #ffffff;
-  --destructive: #dc2626;
+  --destructive: #ef4444;
   --destructive-foreground: #ffffff;
-  --border: #334155;
-  --input: #334155;
+  --border: rgba(148, 163, 184, 0.16);
+  --input: #1e293b;
   --ring: #6366f1;
   --chart-1: #6366f1;
   --chart-2: #10b981;
   --chart-3: #f59e0b;
   --chart-4: #ef4444;
   --chart-5: #8b5cf6;
-  --sidebar: #1e293b;
+  --sidebar: #0d1526;
   --sidebar-foreground: #f1f5f9;
-  --sidebar-primary: #334155;
+  --sidebar-primary: #1e293b;
   --sidebar-primary-foreground: #f1f5f9;
   --sidebar-accent: #6366f1;
   --sidebar-accent-foreground: #ffffff;
-  --sidebar-border: #334155;
+  --sidebar-border: rgba(148, 163, 184, 0.12);
   --sidebar-ring: #6366f1;
+  --surface-deep: #020617;
+  --surface-glass: rgba(15, 23, 42, 0.55);
+  --surface-glass-border: rgba(100, 116, 139, 0.25);
+  --glow-purple: rgba(139, 92, 246, 0.25);
+  --glow-indigo: rgba(99, 102, 241, 0.25);
 }
 
 @theme inline {
@@ -129,6 +145,7 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
+  --color-surface-deep: var(--surface-deep);
 }
 
 @layer base {
@@ -141,7 +158,7 @@
   body {
     @apply bg-background text-foreground;
   }
-  
+
   /* Allow touch scrolling on cards */
   [data-glow],
   .group\/card {
@@ -149,108 +166,34 @@
   }
 }
 
-/* Device-specific adjustments for GaiaLog Dashboard on mobile */
-/* Overriding bottom positioning to push the dashboard down (smaller bottom value = closer to bottom = pushed down) */
-/* Adding padding-bottom to Hero content to ensure dashboard isn't clipped */
+@layer components {
+  /* Shared glassmorphism card used across public pages */
+  .glass-card {
+    background: var(--surface-glass);
+    border: 1px solid var(--surface-glass-border);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-radius: 1rem;
+  }
+  .glass-card-hover {
+    transition: border-color 200ms ease, background-color 200ms ease, transform 200ms ease, box-shadow 200ms ease;
+  }
+  .glass-card-hover:hover {
+    border-color: rgba(139, 92, 246, 0.45);
+    box-shadow: 0 0 32px -8px var(--glow-purple);
+  }
 
-/* iPhone SE (375x667) */
-@media only screen 
-  and (min-device-width: 375px) 
-  and (max-device-width: 375px) 
-  and (min-device-height: 667px) 
-  and (max-device-height: 667px) 
-  and (-webkit-device-pixel-ratio: 2) {
-  .hero-dashboard {
-    bottom: 0rem !important; /* Adjust as needed */
+  /* Gradient text used for display headings on marketing pages */
+  .gradient-heading {
+    background: linear-gradient(120deg, #f8fafc 0%, #c7d2fe 55%, #a78bfa 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
   }
-  .hero-content-wrapper {
-    padding-bottom: 6rem !important; /* Increased to prevent clipping */
-  }
-}
 
-/* Samsung Galaxy S8+ (360x740) */
-@media only screen 
-  and (min-device-width: 360px) 
-  and (max-device-width: 360px) 
-  and (min-device-height: 740px) 
-  and (max-device-height: 740px) 
-  and (-webkit-device-pixel-ratio: 4) {
-  .hero-dashboard {
-    bottom: -2rem !important; /* Adjust as needed */
-  }
-  .hero-content-wrapper {
-    padding-bottom: 3rem !important; /* Extra space at bottom to prevent clipping */
-  }
-}
-
-/* Surface Duo (540x720) */
-@media only screen 
-  and (min-device-width: 540px) 
-  and (max-device-width: 540px) 
-  and (min-device-height: 720px) 
-  and (max-device-height: 720px) {
-  .hero-dashboard {
-    bottom: -5rem !important; /* Push down more */
-  }
-  .hero-content-wrapper {
-    padding-bottom: 8rem !important; /* Extra space for -5rem push-down + buffer */
-  }
-}
-
-/* Nest Hub (1024x600 in landscape, typically) - Small adjustment */
-@media only screen 
-  and (min-device-width: 1024px) 
-  and (max-device-width: 1024px) 
-  and (min-device-height: 600px) 
-  and (max-device-height: 600px) {
-  .hero-dashboard {
-    bottom: -1.5rem !important; /* Small adjustment - pushed down */
-  }
-  .hero-content-wrapper {
-    padding-bottom: 4.5rem !important; /* Extra space for -1.5rem push-down + buffer */
-  }
-}
-
-/* Alternative approach for more flexible viewport-based targeting */
-@media only screen and (max-width: 375px) and (max-height: 667px) {
-  .hero-dashboard {
-    bottom: -8rem !important;
-  }
-  .hero-content-wrapper {
-    padding-bottom: 11rem !important; /* Extra space for -8rem push-down + buffer */
-  }
-}
-
-@media only screen and (min-width: 376px) and (max-width: 389px) and (min-height: 800px) {
-  .hero-dashboard {
-    bottom: -4rem !important;
-  }
-  .hero-content-wrapper {
-    padding-bottom: 7rem !important; /* Extra space for -4rem push-down + buffer */
-  }
-}
-
-/* iPhone 12 Pro (390x844) - Small adjustment - Placed after alternative query to ensure it takes precedence */
-@media only screen 
-  and (min-device-width: 390px) 
-  and (max-device-width: 390px) 
-  and (min-device-height: 844px) 
-  and (max-device-height: 844px) 
-  and (-webkit-device-pixel-ratio: 3) {
-  .hero-dashboard {
-    bottom: 1rem !important; /* Brought up to close gap with button above */
-  }
-  .hero-content-wrapper {
-    padding-bottom: 3rem !important; /* Reduced padding since dashboard is higher */
-  }
-}
-
-/* Also target iPhone 12 Pro using viewport dimensions as fallback */
-@media only screen and (min-width: 390px) and (max-width: 390px) and (min-height: 844px) and (max-height: 844px) {
-  .hero-dashboard {
-    bottom: 1rem !important; /* Brought up to close gap with button above */
-  }
-  .hero-content-wrapper {
-    padding-bottom: 3rem !important; /* Reduced padding since dashboard is higher */
+  /* Subtle top divider glow between page sections */
+  .section-divider {
+    background: linear-gradient(90deg, transparent, rgba(139, 92, 246, 0.35), transparent);
+    height: 1px;
   }
 }

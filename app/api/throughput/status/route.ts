@@ -49,7 +49,10 @@ export async function GET(request: Request) {
         kind: config.kind,
         blockchainFriendly: config.blockchainFriendly,
         attributionRequired: config.attributionRequired || false,
-        attributionText: PROVIDER_DESCRIPTORS[config.id].attributionText || null,
+        attributionText: (() => {
+          const d = PROVIDER_DESCRIPTORS[config.id]
+          return 'attributionText' in d ? (d.attributionText ?? null) : null
+        })(),
         metrics: providerMetrics.get(config.id) || null,
       })),
       datasets: Object.values(datasetConfigs).map(config => ({

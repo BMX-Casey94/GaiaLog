@@ -7,6 +7,7 @@
   },
   "scripts": {
     "split:utxos": "tsx scripts/split-utxos.ts",
+    "sweep:treasury": "tsx scripts/sweep-to-treasury-wallets.ts",
     "build": "next build",
     "dev": "next dev",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
@@ -100,6 +101,7 @@
     "@types/pg": "^8.15.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/three": "^0.185.0",
     "eslint": "^8.57.1",
     "eslint-config-next": "^15.5.12",
     "postcss": "^8.5",

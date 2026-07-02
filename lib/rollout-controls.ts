@@ -1,7 +1,7 @@
 export type RolloutGate = 'gate_a' | 'gate_b' | 'gate_c' | 'gate_d'
 
 export interface RolloutRule {
-  phase: 1 | 2 | 3
+  phase: 1 | 2 | 3 | 4
   minimumGate: RolloutGate
   recommendedOrder?: number | null
   note: string

@@ -70,13 +70,7 @@ export function DataSources() {
     return () => clearInterval(interval)
   }, [])
 
-  const allSources = sources.length > 0 ? sources : [
-    { id: 'waqi', name: 'WAQI API', type: 'Air Quality', icon: Cloud, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
-    { id: 'noaa', name: 'NOAA Tides & Currents', type: 'Water Levels', icon: Droplets, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
-    { id: 'usgs', name: 'USGS Earthquake API', type: 'Seismic Activity', icon: Activity, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
-    { id: 'env', name: 'Environmental Monitoring', type: 'UV, Soil, Wildfire Risk', icon: Database, refreshRate: '10 min', coverage: 'Global', status: 'operational' },
-  ]
-
+  const allSources = sources
   const visibleSources = showAll ? allSources : allSources.slice(0, PAGE_SIZE)
   const hasMore = allSources.length > PAGE_SIZE
 
@@ -86,13 +80,37 @@ export function DataSources() {
       <div className="relative z-10">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-16">
-            <h2 className="text-3xl md:text-4xl font-bold text-white mb-4">Data Sources & APIs</h2>
+            <h2 className="font-display text-3xl md:text-4xl font-bold text-white mb-4 tracking-tight">Data Sources & APIs</h2>
             <p className="text-lg text-slate-400 max-w-2xl mx-auto">
               GaiaLog gathers environmental data from trusted, authoritative sources every 10 minutes and records that data immutably on the
               blockchain.
             </p>
           </div>
 
+          {loading ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <div key={i} className="glass-card p-6 animate-pulse">
+                  <div className="flex items-center space-x-3 mb-4">
+                    <div className="w-10 h-10 bg-slate-800 rounded-full" />
+                    <div className="space-y-2">
+                      <div className="h-3 w-28 bg-slate-800 rounded" />
+                      <div className="h-3 w-20 bg-slate-800/60 rounded" />
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <div className="h-3 bg-slate-800/60 rounded" />
+                    <div className="h-3 bg-slate-800/60 rounded" />
+                    <div className="h-3 bg-slate-800/60 rounded" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : allSources.length === 0 ? (
+            <div className="text-center text-slate-400 py-12">
+              Provider status is temporarily unavailable. Please check back shortly.
+            </div>
+          ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
             {visibleSources.map((source) => {
               const Icon = source.icon
@@ -129,6 +147,7 @@ export function DataSources() {
               </GlowCard>
             )})}
           </div>
+          )}
 
           {hasMore && (
             <div className="text-center mt-8">

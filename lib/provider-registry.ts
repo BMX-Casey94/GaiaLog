@@ -401,7 +401,10 @@ const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
   nasa_eonet: 30 * 60 * 1000,
   global_forest_watch: 24 * 60 * 60 * 1000,
   usgs_mrds: 7 * 24 * 60 * 60 * 1000,
-  opensky: 60 * 1000,
+  // Anonymous OpenSky allows ~100 /states/all calls per day (4 credits each,
+  // ~400 credit budget); 15 min ≈ 96/day.  Override via
+  // OPENSKY_WORKER_INTERVAL_MS once OPENSKY_USERNAME/PASSWORD are configured.
+  opensky: 15 * 60 * 1000,
   aisstream: 60 * 1000,
   movebank: 6 * 60 * 60 * 1000,
   uk_planning: 24 * 60 * 60 * 1000,
@@ -580,7 +583,7 @@ function buildProviderConfigs(): Record<ProviderId, ProviderConfig> {
         throughputClass: descriptor.throughputClass,
         keyRequired: descriptor.keyRequired,
         blockchainFriendly: descriptor.blockchainFriendly,
-        attributionRequired: descriptor.attributionRequired,
+        attributionRequired: 'attributionRequired' in descriptor ? descriptor.attributionRequired : undefined,
         sourceAliases: descriptor.sourceAliases,
         countries: PROVIDER_COUNTRIES[providerId],
         requestedRolloutGate,
@@ -588,7 +591,7 @@ function buildProviderConfigs(): Record<ProviderId, ProviderConfig> {
         rollout,
       } satisfies ProviderConfig]
     }),
-  ) as Record<ProviderId, ProviderConfig>
+  ) as unknown as Record<ProviderId, ProviderConfig>
 }
 
 function buildDatasetConfigs(providers: Record<ProviderId, ProviderConfig>): Record<DatasetId, ProviderDatasetConfig> {
@@ -634,7 +637,7 @@ function buildDatasetConfigs(providers: Record<ProviderId, ProviderConfig>): Rec
         keyRequired: descriptor.keyRequired,
         blockchainFriendly: descriptor.blockchainFriendly,
         kind: descriptor.kind,
-        metricPreviewKeys: descriptor.metricPreviewKeys,
+        metricPreviewKeys: 'metricPreviewKeys' in descriptor ? descriptor.metricPreviewKeys : undefined,
         requestedRolloutGate,
         rolloutEnabled,
         rollout,

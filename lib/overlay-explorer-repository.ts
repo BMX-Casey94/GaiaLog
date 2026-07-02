@@ -107,40 +107,101 @@ export async function searchReadings(params: SearchParams): Promise<{
   const offset = (page - 1) * pageSize
 
   const { whereSql, sqlParams } = buildWhereClause(params)
+  const whereParams = [...sqlParams]
 
   sqlParams.push(pageSize, offset)
   const limitIdx = sqlParams.length - 1
   const offsetIdx = sqlParams.length
 
-  const result = await query<any>(
-    `SELECT
-       txid, data_family, location, lat, lon,
-       reading_ts, provider_id, block_height, block_time,
-       metrics_preview,
-       COUNT(*) OVER()::bigint AS total_count
-     FROM overlay_explorer_readings
-     ${whereSql}
-     ORDER BY reading_ts DESC
-     LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
-    sqlParams,
-  )
+  // Rows and total run in parallel.  The total avoids COUNT(*) OVER(), which
+  // forced Postgres to count the entire filtered set on every page fetch.
+  const [result, total] = await Promise.all([
+    query<any>(
+      `SELECT
+         txid, data_family, location, lat, lon,
+         reading_ts, provider_id, block_height, block_time,
+         metrics_preview
+       FROM overlay_explorer_readings
+       ${whereSql}
+       ORDER BY reading_ts DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      sqlParams,
+    ),
+    countSearchTotal(params, whereSql, whereParams),
+  ])
 
   const rows = result.rows || []
-  let total = rows.length > 0 ? Number(rows[0].total_count || 0) : 0
-
-  if (rows.length === 0 && offset > 0) {
-    const countResult = await query<{ total: string }>(
-      `SELECT COUNT(*)::bigint AS total
-       FROM overlay_explorer_readings
-       ${whereSql}`,
-      sqlParams.slice(0, sqlParams.length - 2),
-    )
-    total = Number(countResult.rows?.[0]?.total || 0)
-  }
-
   const items: StoredReading[] = rows.map(overlayRowToStoredReading)
 
   return { items, total, page, pageSize, hasMore: offset + items.length < total }
+}
+
+// ─── Search total helpers ────────────────────────────────────────────────────
+
+const SEARCH_COUNT_CACHE_TTL_MS = Math.max(5000, Number(process.env.EXPLORER_SEARCH_COUNT_TTL_MS || 30000))
+const SEARCH_COUNT_CACHE_MAX_ENTRIES = 200
+const searchCountCache = new Map<string, { total: number; ts: number }>()
+
+/**
+ * Resolve the total row count for a search as cheaply as possible:
+ *  1. Unfiltered search    → trigger-maintained overlay_explorer_stats rollup.
+ *  2. Family-only filter   → trigger-maintained overlay_explorer_family_counts.
+ *  3. Anything else        → COUNT(*) with a short in-process cache so repeat
+ *                            pagination over the same filter set is free.
+ */
+async function countSearchTotal(
+  params: SearchParams,
+  whereSql: string,
+  whereParams: unknown[],
+): Promise<number> {
+  const hasQuery = !!params.q?.trim()
+  const hasDates = !!params.from || !!params.to
+
+  // 1. Unfiltered (the default explorer page load).
+  if (!hasQuery && !hasDates && !params.dataType) {
+    const result = await query<{ stat_value: string }>(
+      `SELECT stat_value FROM overlay_explorer_stats WHERE stat_key = 'total_readings'`,
+    )
+    return Number(result.rows?.[0]?.stat_value || 0)
+  }
+
+  // 2. Family filter only.
+  if (!hasQuery && !hasDates && params.dataType) {
+    const families = getDataFamilyFilterValues(params.dataType)
+    if (families.length > 0) {
+      const result = await query<{ total: string }>(
+        `SELECT COALESCE(SUM(reading_count), 0)::bigint AS total
+         FROM overlay_explorer_family_counts
+         WHERE data_family = ANY($1)`,
+        [families],
+      )
+      return Number(result.rows?.[0]?.total || 0)
+    }
+  }
+
+  // 3. Filtered search — cached COUNT(*).
+  const cacheKey = `${whereSql}|${JSON.stringify(whereParams)}`
+  const cached = searchCountCache.get(cacheKey)
+  if (cached && Date.now() - cached.ts < SEARCH_COUNT_CACHE_TTL_MS) {
+    return cached.total
+  }
+
+  const countResult = await query<{ total: string }>(
+    `SELECT COUNT(*)::bigint AS total
+     FROM overlay_explorer_readings
+     ${whereSql}`,
+    whereParams,
+  )
+  const total = Number(countResult.rows?.[0]?.total || 0)
+
+  if (searchCountCache.size >= SEARCH_COUNT_CACHE_MAX_ENTRIES) {
+    // Drop the oldest entry to bound memory (Map preserves insertion order).
+    const oldestKey = searchCountCache.keys().next().value
+    if (oldestKey !== undefined) searchCountCache.delete(oldestKey)
+  }
+  searchCountCache.set(cacheKey, { total, ts: Date.now() })
+
+  return total
 }
 
 export async function getLocationSuggestions(
@@ -210,6 +271,18 @@ export async function getLocationSuggestions(
 }
 
 export async function getUniqueLocationCount(): Promise<number> {
+  // Planner estimate first: O(1) regardless of table size and immune to the
+  // DB CPU saturation that made the exact COUNT(*) time out.  Autovacuum
+  // keeps reltuples accurate enough for a headline stat.  Fall back to the
+  // exact count only when the table has never been analysed (reltuples < 0).
+  const estimateResult = await query<{ cnt: string }>(
+    `SELECT reltuples::bigint AS cnt
+     FROM pg_class
+     WHERE oid = 'overlay_explorer_location_keys'::regclass`,
+  )
+  const estimate = Number(estimateResult.rows?.[0]?.cnt ?? -1)
+  if (estimate >= 0) return estimate
+
   const result = await query<{ cnt: string }>(
     `SELECT COUNT(*)::bigint AS cnt FROM overlay_explorer_location_keys`,
   )
@@ -487,8 +560,10 @@ function buildWhereClause(params: SearchParams): { whereSql: string; sqlParams: 
       sqlParams.push(coordQuery.lon + COORD_SEARCH_RADIUS_DEG)
       parts.push(`lon <= $${sqlParams.length}`)
     } else {
-      sqlParams.push(`%${params.q.trim()}%`)
-      parts.push(`location ILIKE $${sqlParams.length}`)
+      // Filter on normalized_location (lowercased at ingest) so the GIN
+      // trigram index oer_location_trgm_idx is used instead of a seq scan.
+      sqlParams.push(`%${params.q.trim().toLowerCase()}%`)
+      parts.push(`normalized_location ILIKE $${sqlParams.length}`)
     }
   }
 

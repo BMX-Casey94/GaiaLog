@@ -74,7 +74,7 @@ async function main() {
   const tx = new Transaction(version, inputs as any, outputs as any)
 
   // Sign input 0 with explicit P2PKH and source output context
-  await tx.sign(0, key, new P2PKH(), { sourceOutputs: [(prevTx as any).outputs?.[u.tx_pos]] })
+  await (tx as any).sign(0, key, new P2PKH(), { sourceOutputs: [(prevTx as any).outputs?.[u.tx_pos]] })
 
   const arc = new ARC(arcEndpoint, arcKey)
   const result = await tx.broadcast(arc)
