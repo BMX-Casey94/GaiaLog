@@ -139,12 +139,14 @@ When the pool has degraded to sub-spendable UTXOs (~97 sats), run:
 
 ```bash
 cd /opt/gaialog
-npx tsx scripts/consolidate-wallet-utxos.ts --skip-snapshot          # dry-run
-npx tsx scripts/consolidate-wallet-utxos.ts --apply --skip-snapshot  # apply
+npx tsx scripts/consolidate-wallet-utxos.ts --include-unconfirmed --batch-size 500 --skip-snapshot
+npx tsx scripts/consolidate-wallet-utxos.ts --apply --include-unconfirmed --batch-size 500 --skip-snapshot
 ```
 
-`--skip-snapshot` avoids the pre-flight aggregate that times out on a
-bloated heap; the consolidation batches themselves use indexed queries.
+Production dust is typically `confirmed=false` and ~97 sats — without
+`--include-unconfirmed` the lock query scans for confirmed rows that do not
+exist and times out. `--batch-size 500` keeps each statement small;
+`--skip-snapshot` avoids the pre-flight aggregate.
 
 Without step 2 the table heap grows unbounded even after compaction, and the acquire query eventually falls back to a sequential scan and times out. If you suspect bloat, check:
 

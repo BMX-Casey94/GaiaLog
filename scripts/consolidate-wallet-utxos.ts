@@ -61,6 +61,7 @@
  *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --include-unconfirmed
  *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --min-input-sats 50
  *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --skip-snapshot
+ *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --include-unconfirmed --batch-size 500 --skip-snapshot
  *
  * Economically-spendable floor (--min-input-sats)
  * -----------------------------------------------
@@ -120,6 +121,8 @@ interface CliOptions {
   // work starts — the batches themselves use indexed LIMIT queries and
   // are fine. Prefer this when the DB is under CPU pressure.
   skipSnapshot: boolean
+  // Only lock UTXOs at or below this size (keeps the index range tight).
+  maxInputSats: number
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -135,7 +138,7 @@ function parseArgs(argv: string[]): CliOptions {
     throw new Error(`--wallet must be one of W1, W2, W3 (got "${walletArg}")`)
   }
 
-  const batchSizeRaw = Number(takeValue(argv, '--batch-size') || '5000')
+  const batchSizeRaw = Number(takeValue(argv, '--batch-size') || '500')
   if (!Number.isFinite(batchSizeRaw) || batchSizeRaw < 50 || batchSizeRaw > 8000) {
     throw new Error(`--batch-size must be between 50 and 8000 (got ${batchSizeRaw})`)
   }
@@ -181,6 +184,15 @@ function parseArgs(argv: string[]): CliOptions {
     )
   }
 
+  const maxInputSatsArg = takeValue(argv, '--max-input-sats')
+  const maxInputSatsRaw =
+    maxInputSatsArg === null
+      ? Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 2000)
+      : Number(maxInputSatsArg)
+  if (!Number.isFinite(maxInputSatsRaw) || maxInputSatsRaw < 1) {
+    throw new Error(`--max-input-sats must be ≥ 1 (got ${maxInputSatsArg})`)
+  }
+
   return {
     apply,
     rebalance,
@@ -193,6 +205,7 @@ function parseArgs(argv: string[]): CliOptions {
     unconfirmedMinAgeSeconds: Math.floor(unconfirmedMinAge),
     maxConsecutiveFailures: Math.floor(maxFailures),
     skipSnapshot,
+    maxInputSats: Math.floor(maxInputSatsRaw),
   }
 }
 
@@ -389,12 +402,62 @@ async function lockBatch(
   minInputSats: number,
   unconfirmedMinAgeSeconds: number,
   lockedBy: string,
+  maxInputSats: number,
 ): Promise<LockedInput[]> {
+  const statementTimeoutMs = Math.max(
+    30_000,
+    Number(process.env.CONSOLIDATE_STATEMENT_TIMEOUT_MS || 180_000),
+  )
+
   return withOverlayTransaction(async (client) => {
-    // Statement timeout guard: very large LIMIT + ORDER BY satoshis can be
-    // slow on a heavily bloated table. Bound it so we fail loud rather than
-    // hold a pool client hostage.
-    await client.query(`SET LOCAL statement_timeout = 30000`)
+    // Consolidation on a bloated heap previously timed out at 30s because
+    // FOR UPDATE SKIP LOCKED + ORDER BY satoshis scanned millions of rows
+    // (especially when filtering confirmed=true against an unconfirmed-dust
+    // pool). Two-phase select-then-update + utxo_role/satoshis range lets
+    // the planner use overlay_admitted_utxos_acquire_ready_idx.
+    await client.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`)
+
+    // Prefer pool dust (the starvation case); top up from reserve if needed.
+    const roles: Array<'pool' | 'reserve'> = ['pool', 'reserve']
+    const selected: Array<{ topic: string; txid: string; vout: number }> = []
+
+    for (const role of roles) {
+      const need = batchSize - selected.length
+      if (need <= 0) break
+
+      const pick = await client.query<{ topic: string; txid: string; vout: number }>(
+        `SELECT topic, txid, vout
+           FROM overlay_admitted_utxos
+          WHERE wallet_index = $1
+            AND removed = false
+            AND locked = false
+            AND utxo_role = $2
+            AND satoshis >= $3
+            AND satoshis <= $4
+            AND acquirable_at <= now()
+            AND ($5::boolean = true OR confirmed = true)
+            AND (confirmed = true OR admitted_at <= now() - ($6::bigint * interval '1 second'))
+          ORDER BY satoshis ASC, admitted_at ASC
+          LIMIT $7`,
+        [
+          binding.walletIndex,
+          role,
+          Math.max(0, Math.floor(minInputSats)),
+          Math.max(Math.floor(minInputSats), Math.floor(maxInputSats)),
+          includeUnconfirmed,
+          Math.max(0, Math.floor(unconfirmedMinAgeSeconds)),
+          need,
+        ],
+      )
+      selected.push(...pick.rows)
+    }
+
+    if (selected.length === 0) return []
+
+    const topics = selected.map((r) => r.topic)
+    const txids = selected.map((r) => r.txid)
+    const vouts = selected.map((r) => r.vout)
+
     const res = await client.query<{
       topic: string
       txid: string
@@ -402,42 +465,20 @@ async function lockBatch(
       satoshis: string
       output_script: string
     }>(
-      `WITH candidates AS (
-         SELECT topic, txid, vout
-           FROM overlay_admitted_utxos
-          WHERE wallet_index = $1
-            AND removed = false
-            AND locked = false
-            AND satoshis >= $5
-            AND ($2::boolean = true OR confirmed = true)
-            AND acquirable_at <= now()
-            -- Unconfirmed inputs must have aged at least N seconds in the
-            -- inventory before we spend them. This prevents us picking up
-            -- splitter-produced outputs whose parents have not yet
-            -- propagated to all ARC relays (production saw WoC reject
-            -- with "Missing inputs" 400 at 0s grace). Confirmed rows
-            -- are exempt — their parent is already in a block.
-            AND (confirmed = true OR admitted_at <= now() - ($6::bigint * interval '1 second'))
-          ORDER BY satoshis ASC, admitted_at ASC, txid ASC, vout ASC
-          FOR UPDATE SKIP LOCKED
-          LIMIT $3
-       )
-       UPDATE overlay_admitted_utxos u
+      `UPDATE overlay_admitted_utxos u
           SET locked = true,
               locked_by = $4,
               locked_at = now()
-         FROM candidates c
-        WHERE u.topic = c.topic AND u.txid = c.txid AND u.vout = c.vout
+         FROM unnest($1::text[], $2::text[], $3::int[]) AS t(topic, txid, vout)
+        WHERE u.topic = t.topic
+          AND u.txid = t.txid
+          AND u.vout = t.vout
+          AND u.removed = false
+          AND u.locked = false
        RETURNING u.topic, u.txid, u.vout, u.satoshis, u.output_script`,
-      [
-        binding.walletIndex,
-        includeUnconfirmed,
-        batchSize,
-        lockedBy,
-        Math.max(0, Math.floor(minInputSats)),
-        Math.max(0, Math.floor(unconfirmedMinAgeSeconds)),
-      ],
+      [topics, txids, vouts, lockedBy],
     )
+
     return res.rows.map((row) => ({
       topic: row.topic,
       txid: row.txid,
@@ -681,15 +722,36 @@ async function consolidateWallet(
   let consecutiveFailures = 0
   while (true) {
     batchNo += 1
-    const inputs = await lockBatch(
-      binding,
-      options.batchSize,
-      options.includeUnconfirmed,
-      minInputSats,
-      options.unconfirmedMinAgeSeconds,
-      lockedBy,
-    )
+    let inputs: LockedInput[]
+    try {
+      inputs = await lockBatch(
+        binding,
+        options.batchSize,
+        options.includeUnconfirmed,
+        minInputSats,
+        options.unconfirmedMinAgeSeconds,
+        lockedBy,
+        options.maxInputSats,
+      )
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      if (/statement timeout|canceling statement/i.test(message)) {
+        throw new Error(
+          `${message}\n` +
+            `  Hint: production dust is often confirmed=false — re-run with ` +
+            `--include-unconfirmed --batch-size 500 --skip-snapshot. ` +
+            `Or raise CONSOLIDATE_STATEMENT_TIMEOUT_MS (default 180000).`,
+        )
+      }
+      throw err
+    }
     if (inputs.length === 0) {
+      if (!options.includeUnconfirmed && batchNo === 1) {
+        console.warn(
+          `  ⚠️  No confirmed eligible UTXOs for ${binding.label}. ` +
+            `Earlier probes showed pool dust as confirmed=false — try --include-unconfirmed.`,
+        )
+      }
       console.log(`  Batch #${batchNo}: no more eligible UTXOs — wallet ${binding.label} done.`)
       break
     }
@@ -1247,6 +1309,8 @@ async function main(): Promise<void> {
   console.log(`Batch size: ${options.batchSize}`)
   console.log(`Fee rate: ${options.feeRate} sat/byte`)
   console.log(`Include unconfirmed UTXOs as inputs: ${options.includeUnconfirmed}`)
+  console.log(`Max input sats (dust ceiling): ${options.maxInputSats}`)
+  console.log(`Skip snapshot: ${options.skipSnapshot}`)
   if (options.walletFilter) console.log(`Wallet filter: ${options.walletFilter} only`)
 
   const allBindings = deriveBindings()
