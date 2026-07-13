@@ -60,6 +60,7 @@
  *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --batch-size 3000
  *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --include-unconfirmed
  *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --min-input-sats 50
+ *   npx tsx scripts/consolidate-wallet-utxos.ts --apply --skip-snapshot
  *
  * Economically-spendable floor (--min-input-sats)
  * -----------------------------------------------
@@ -113,12 +114,19 @@ interface CliOptions {
   // wallet. A single failure (often transient — ARC 504, fetch failed) used
   // to abort the entire wallet. We now treat each batch independently.
   maxConsecutiveFailures: number
+  // Skip the pre/post-flight aggregate snapshot. On a bloated
+  // overlay_admitted_utxos heap the snapshot COUNT/SUM can exceed the
+  // statement timeout and abort the whole run before any consolidation
+  // work starts — the batches themselves use indexed LIMIT queries and
+  // are fine. Prefer this when the DB is under CPU pressure.
+  skipSnapshot: boolean
 }
 
 function parseArgs(argv: string[]): CliOptions {
   const apply = argv.includes('--apply')
   const rebalance = argv.includes('--rebalance')
   const includeUnconfirmed = argv.includes('--include-unconfirmed')
+  const skipSnapshot = argv.includes('--skip-snapshot')
 
   const walletArg = takeValue(argv, '--wallet')
   const walletFilter =
@@ -184,6 +192,7 @@ function parseArgs(argv: string[]): CliOptions {
     minInputSats,
     unconfirmedMinAgeSeconds: Math.floor(unconfirmedMinAge),
     maxConsecutiveFailures: Math.floor(maxFailures),
+    skipSnapshot,
   }
 }
 
@@ -288,57 +297,78 @@ async function snapshotWallet(
   minInputSats: number,
   unconfirmedMinAgeSeconds: number,
 ): Promise<WalletSnapshot> {
-  const res = await withOverlayTransaction(async (client) => {
-    return client.query<{
-      live_utxos: string
-      confirmed_utxos: string
-      largest_sats: string
-      largest_confirmed_sats: string
-      total_live_sats: string
-      total_confirmed_sats: string
-      eligible_sats: string
-      eligible_utxos: string
-    }>(
-      `SELECT
-         COUNT(*) FILTER (WHERE removed = false)::text                                                      AS live_utxos,
-         COUNT(*) FILTER (WHERE removed = false AND confirmed = true)::text                                 AS confirmed_utxos,
-         COALESCE(MAX(satoshis) FILTER (WHERE removed = false), 0)::text                                    AS largest_sats,
-         COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text               AS largest_confirmed_sats,
-         COALESCE(SUM(satoshis) FILTER (WHERE removed = false), 0)::text                                    AS total_live_sats,
-         COALESCE(SUM(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text               AS total_confirmed_sats,
-         COALESCE(SUM(satoshis) FILTER (WHERE removed = false
-                                           AND locked = false
-                                           AND satoshis >= $3
-                                           AND ($2::boolean = true OR confirmed = true)
-                                           AND (confirmed = true OR admitted_at <= now() - ($4::bigint * interval '1 second'))
-                                          ), 0)::text AS eligible_sats,
-         COUNT(*) FILTER (WHERE removed = false
-                            AND locked = false
-                            AND satoshis >= $3
-                            AND ($2::boolean = true OR confirmed = true)
-                            AND (confirmed = true OR admitted_at <= now() - ($4::bigint * interval '1 second'))
-                         )::text AS eligible_utxos
-       FROM overlay_admitted_utxos
-       WHERE wallet_index = $1`,
-      [
-        binding.walletIndex,
-        includeUnconfirmed,
-        Math.max(0, Math.floor(minInputSats)),
-        Math.max(0, Math.floor(unconfirmedMinAgeSeconds)),
-      ],
+  try {
+    const res = await withOverlayTransaction(async (client) => {
+      // Snapshot is informational only. Bound it so a bloated heap cannot
+      // abort the entire consolidation run (production Jul 2026).
+      await client.query(`SET LOCAL statement_timeout = 30000`)
+      return client.query<{
+        live_utxos: string
+        confirmed_utxos: string
+        largest_sats: string
+        largest_confirmed_sats: string
+        total_live_sats: string
+        total_confirmed_sats: string
+        eligible_sats: string
+        eligible_utxos: string
+      }>(
+        `SELECT
+           COUNT(*)::text AS live_utxos,
+           COUNT(*) FILTER (WHERE confirmed = true)::text AS confirmed_utxos,
+           COALESCE(MAX(satoshis), 0)::text AS largest_sats,
+           COALESCE(MAX(satoshis) FILTER (WHERE confirmed = true), 0)::text AS largest_confirmed_sats,
+           COALESCE(SUM(satoshis), 0)::text AS total_live_sats,
+           COALESCE(SUM(satoshis) FILTER (WHERE confirmed = true), 0)::text AS total_confirmed_sats,
+           COALESCE(SUM(satoshis) FILTER (WHERE locked = false
+                                             AND satoshis >= $3
+                                             AND ($2::boolean = true OR confirmed = true)
+                                             AND (confirmed = true OR admitted_at <= now() - ($4::bigint * interval '1 second'))
+                                            ), 0)::text AS eligible_sats,
+           COUNT(*) FILTER (WHERE locked = false
+                              AND satoshis >= $3
+                              AND ($2::boolean = true OR confirmed = true)
+                              AND (confirmed = true OR admitted_at <= now() - ($4::bigint * interval '1 second'))
+                           )::text AS eligible_utxos
+         FROM overlay_admitted_utxos
+         WHERE wallet_index = $1
+           AND removed = false`,
+        [
+          binding.walletIndex,
+          includeUnconfirmed,
+          Math.max(0, Math.floor(minInputSats)),
+          Math.max(0, Math.floor(unconfirmedMinAgeSeconds)),
+        ],
+      )
+    })
+    const row = res.rows[0]
+    return {
+      binding,
+      liveUtxos: Number(row?.live_utxos || '0'),
+      confirmedUtxos: Number(row?.confirmed_utxos || '0'),
+      largestSats: Number(row?.largest_sats || '0'),
+      largestConfirmedSats: Number(row?.largest_confirmed_sats || '0'),
+      totalLiveSats: Number(row?.total_live_sats || '0'),
+      totalConfirmedSats: Number(row?.total_confirmed_sats || '0'),
+      eligibleSats: Number(row?.eligible_sats || '0'),
+      eligibleUtxos: Number(row?.eligible_utxos || '0'),
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.warn(
+      `⚠️  Snapshot timed out/failed for ${binding.label} (${message}). ` +
+        `Continuing with unknown totals — consolidation batches still run.`,
     )
-  })
-  const row = res.rows[0]
-  return {
-    binding,
-    liveUtxos: Number(row?.live_utxos || '0'),
-    confirmedUtxos: Number(row?.confirmed_utxos || '0'),
-    largestSats: Number(row?.largest_sats || '0'),
-    largestConfirmedSats: Number(row?.largest_confirmed_sats || '0'),
-    totalLiveSats: Number(row?.total_live_sats || '0'),
-    totalConfirmedSats: Number(row?.total_confirmed_sats || '0'),
-    eligibleSats: Number(row?.eligible_sats || '0'),
-    eligibleUtxos: Number(row?.eligible_utxos || '0'),
+    return {
+      binding,
+      liveUtxos: 0,
+      confirmedUtxos: 0,
+      largestSats: 0,
+      largestConfirmedSats: 0,
+      totalLiveSats: 0,
+      totalConfirmedSats: 0,
+      eligibleSats: 0,
+      eligibleUtxos: 0,
+    }
   }
 }
 
@@ -1235,23 +1265,27 @@ async function main(): Promise<void> {
         ? `  (auto: 2× per-input fee at ${options.feeRate} sat/byte)`
         : '  (operator override)'),
   )
-  console.log('Pre-flight snapshot:')
-  const preSnapshots = await Promise.all(
-    bindings.map((b) =>
-      snapshotWallet(b, options.includeUnconfirmed, effectiveMin, options.unconfirmedMinAgeSeconds),
-    ),
-  )
-  for (const s of preSnapshots) {
-    const eligibleBatches = Math.ceil(s.eligibleUtxos / options.batchSize)
-    const estFeesPerBatch = estimateFee(options.batchSize, 1, options.feeRate)
-    const estTotalFees = eligibleBatches * estFeesPerBatch
-    console.log(
-      `  ${s.binding.label} (${s.binding.address}): ` +
-        `live=${s.liveUtxos.toLocaleString()}  confirmed=${s.confirmedUtxos.toLocaleString()}  ` +
-        `largest=${s.largestSats.toLocaleString()} sats  total=${s.totalLiveSats.toLocaleString()} sats  ` +
-        `eligible=${s.eligibleUtxos.toLocaleString()} (${s.eligibleSats.toLocaleString()} sats)  ` +
-        `est. ${eligibleBatches} batch(es), ~${estTotalFees.toLocaleString()} sats fees total`,
+  if (options.skipSnapshot) {
+    console.log('Pre-flight snapshot: skipped (--skip-snapshot)')
+  } else {
+    console.log('Pre-flight snapshot:')
+    const preSnapshots = await Promise.all(
+      bindings.map((b) =>
+        snapshotWallet(b, options.includeUnconfirmed, effectiveMin, options.unconfirmedMinAgeSeconds),
+      ),
     )
+    for (const s of preSnapshots) {
+      const eligibleBatches = Math.ceil(s.eligibleUtxos / options.batchSize)
+      const estFeesPerBatch = estimateFee(options.batchSize, 1, options.feeRate)
+      const estTotalFees = eligibleBatches * estFeesPerBatch
+      console.log(
+        `  ${s.binding.label} (${s.binding.address}): ` +
+          `live=${s.liveUtxos.toLocaleString()}  confirmed=${s.confirmedUtxos.toLocaleString()}  ` +
+          `largest=${s.largestSats.toLocaleString()} sats  total=${s.totalLiveSats.toLocaleString()} sats  ` +
+          `eligible=${s.eligibleUtxos.toLocaleString()} (${s.eligibleSats.toLocaleString()} sats)  ` +
+          `est. ${eligibleBatches} batch(es), ~${estTotalFees.toLocaleString()} sats fees total`,
+      )
+    }
   }
 
   const lockedBy = `consolidate_${getLockOwnerId()}`
@@ -1326,7 +1360,7 @@ async function main(): Promise<void> {
   }
 
   // Post-flight snapshot (apply mode only — dry-run state is unchanged).
-  if (options.apply) {
+  if (options.apply && !options.skipSnapshot) {
     console.log('')
     console.log('Post-flight snapshot:')
     const postSnapshots = await Promise.all(
@@ -1341,6 +1375,9 @@ async function main(): Promise<void> {
           `total=${s.totalLiveSats.toLocaleString()} sats`,
       )
     }
+  } else if (options.apply && options.skipSnapshot) {
+    console.log('')
+    console.log('Post-flight snapshot: skipped (--skip-snapshot)')
   }
 
   if (!options.apply) {

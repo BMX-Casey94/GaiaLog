@@ -101,12 +101,50 @@ runs):
 
 Each pass automatically:
 
-1. Prunes old `overlay_explorer_readings` per family retention windows.
-2. Deletes confirmed `tx_log` rows older than `RETENTION_TX_LOG_DAYS` (default `30`).
+1. Prunes old `overlay_explorer_readings` per family retention windows
+   (capped by `RETENTION_MAX_DELETES_PER_FAMILY`, default `250000`).
+2. Deletes confirmed `tx_log` rows older than `RETENTION_TX_LOG_DAYS`
+   (default `30`), capped by `RETENTION_MAX_TX_LOG_DELETES_PER_RUN`
+   (default `500000`) so a single pass always finishes before PM2's
+   30-minute `cron_restart`.
 3. Compacts spent UTXO rows by nulling out their `raw_tx` and `beef` blobs.
 4. Physically deletes spent rows older than `RETENTION_UTXO_PRUNE_DAYS` (default `3`).
 5. Deletes `overlay_submissions` audit rows older than `RETENTION_SUBMISSIONS_DAYS`
    (default `14`) — this table reached 15 GB in production before pruning existed.
+
+The scheduler claims `last_run_ms` *before* the heavy work begins, so a
+process kill mid-pass cannot re-fire on the next boot and thrash the DB.
+If you need to stop retention urgently (e.g. during a CPU incident):
+
+```bash
+# In /opt/gaialog/.env:
+RETENTION_SCHEDULER_DISABLED=true
+pm2 restart gaialog-workers --update-env
+```
+
+Re-enable by removing that line (or setting it to `false`) after the capped
+scheduler is deployed.
+
+### VPS deploy install
+
+Workers need `tsx` and `next build` needs `@tailwindcss/postcss` /
+`tailwindcss` / `postcss` at install time. Those packages live in
+`dependencies`, so `npm install --omit=dev` is safe. If a build fails with
+`Cannot find module '@tailwindcss/postcss'`, run a full `npm install` once
+and confirm `package.json` is current.
+
+### Dust consolidation
+
+When the pool has degraded to sub-spendable UTXOs (~97 sats), run:
+
+```bash
+cd /opt/gaialog
+npx tsx scripts/consolidate-wallet-utxos.ts --skip-snapshot          # dry-run
+npx tsx scripts/consolidate-wallet-utxos.ts --apply --skip-snapshot  # apply
+```
+
+`--skip-snapshot` avoids the pre-flight aggregate that times out on a
+bloated heap; the consolidation batches themselves use indexed queries.
 
 Without step 2 the table heap grows unbounded even after compaction, and the acquire query eventually falls back to a sequential scan and times out. If you suspect bloat, check:
 

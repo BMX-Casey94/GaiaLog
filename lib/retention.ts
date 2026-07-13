@@ -64,6 +64,12 @@ const DEFAULT_MAX_UTXO_PRUNES_PER_RUN = 500_000
 // rows older than this window carry no recovery value. 0 disables pruning.
 const DEFAULT_SUBMISSIONS_RETENTION_DAYS = 14
 const DEFAULT_MAX_SUBMISSION_PRUNES_PER_RUN = 500_000
+// tx_log was previously deleted in an uncapped loop. On a multi-million-row
+// backlog that never finished before PM2's 30-minute cron_restart, so
+// last_run_ms was never written and the scheduler re-fired every tick —
+// thrashing Supabase CPU for days. Cap each pass so it completes promptly;
+// subsequent daily runs chew through the remainder.
+const DEFAULT_MAX_TX_LOG_DELETES_PER_RUN = 500_000
 
 // ─── Configuration helpers ───────────────────────────────────────────────────
 
@@ -251,6 +257,7 @@ export interface RetentionRunResult {
     retentionDays: number
     deleted: number
     durationMs: number
+    capped: boolean
   }
   utxoCompaction: {
     rowsCompacted: number
@@ -344,13 +351,16 @@ export async function runRetention(opts?: { dryRun?: boolean }): Promise<Retenti
 
   // ─ tx_log retention ────────────────────────────────────────────────────────
   const txLogDays = envInt('RETENTION_TX_LOG_DAYS', DEFAULT_TX_LOG_RETENTION_DAYS)
+  const txLogCap = envInt('RETENTION_MAX_TX_LOG_DELETES_PER_RUN', DEFAULT_MAX_TX_LOG_DELETES_PER_RUN)
   const txLogCutoff = new Date(Date.now() - txLogDays * 86_400_000)
   const txLogStarted = Date.now()
   let txLogDeleted = 0
+  let txLogCapped = false
 
   if (!dryRun) {
-    let more = true
-    while (more) {
+    while (txLogDeleted < txLogCap) {
+      const remaining = txLogCap - txLogDeleted
+      const limit = Math.min(batchSize, remaining)
       const result = await query(
         `WITH eligible AS (
            SELECT txid
@@ -362,12 +372,13 @@ export async function runRetention(opts?: { dryRun?: boolean }): Promise<Retenti
          DELETE FROM tx_log t
            USING eligible e
           WHERE t.txid = e.txid`,
-        [txLogCutoff, batchSize],
+        [txLogCutoff, limit],
       )
       const rowsThisBatch = result.rowCount ?? 0
       txLogDeleted += rowsThisBatch
-      more = rowsThisBatch === batchSize
+      if (rowsThisBatch < limit) break
     }
+    txLogCapped = txLogDeleted >= txLogCap
   }
 
   // ─ Spent-UTXO blob compaction ──────────────────────────────────────────────
@@ -502,6 +513,7 @@ export async function runRetention(opts?: { dryRun?: boolean }): Promise<Retenti
       retentionDays: txLogDays,
       deleted: txLogDeleted,
       durationMs: Date.now() - txLogStarted,
+      capped: txLogCapped,
     },
     utxoCompaction: {
       rowsCompacted: utxoCompacted,
@@ -562,14 +574,33 @@ async function retentionSchedulerTick(): Promise<void> {
     const lastRunLocked = Number(await readCursor('__retention__', '', 'last_run_ms')) || 0
     if (now - lastRunLocked < RETENTION_MIN_INTERVAL_MS) return
 
+    // Claim the slot BEFORE the heavy work. If PM2 cron_restart kills us
+    // mid-pass, last_run_ms is already set so the next boot does not
+    // immediately re-fire and thrash the database (observed Jul 2026).
+    await writeCursor('__retention__', '', 'last_run_ms', Date.now())
+
     console.log('🧹 Retention: starting scheduled pass...')
     const result = await runRetention({ dryRun: false })
-    await writeCursor('__retention__', '', 'last_run_ms', Date.now())
     const familyDeleted = result.families.reduce((sum, f) => sum + f.deleted, 0)
+    const cappedBits = [
+      result.txLog.capped ? 'tx_log' : null,
+      result.utxoPrune.capped ? 'utxo' : null,
+      result.submissionsPrune.capped ? 'submissions' : null,
+      ...result.families.filter((f) => f.capped).map((f) => f.family),
+    ].filter(Boolean)
     console.log(
-      `🧹 Retention: done — explorer=${familyDeleted} tx_log=${result.txLog.deleted} ` +
-        `utxoCompacted=${result.utxoCompaction.rowsCompacted} utxoPruned=${result.utxoPrune.rowsDeleted} ` +
+      `🧹 Retention: done — explorer=${familyDeleted} tx_log=${result.txLog.deleted}` +
+        `${result.txLog.capped ? ' (capped)' : ''} ` +
+        `utxoCompacted=${result.utxoCompaction.rowsCompacted} ` +
+        `utxoPruned=${result.utxoPrune.rowsDeleted} ` +
+        `submissions=${result.submissionsPrune.rowsDeleted}` +
+        `${cappedBits.length ? ` capped=[${cappedBits.join(',')}]` : ''} ` +
         `(${result.startedAt} → ${result.finishedAt})`,
+    )
+  } catch (e) {
+    // last_run_ms already claimed — intentional so a crash cannot thrash.
+    console.warn(
+      `🧹 Retention: pass failed (next retry after interval): ${e instanceof Error ? e.message : String(e)}`,
     )
   } finally {
     await query(`SELECT pg_advisory_unlock(hashtext('gaialog:retention'))`).catch(() => {})
@@ -577,7 +608,10 @@ async function retentionSchedulerTick(): Promise<void> {
 }
 
 export function startRetentionScheduler(): void {
-  if (process.env.RETENTION_SCHEDULER_DISABLED === 'true') return
+  if (process.env.RETENTION_SCHEDULER_DISABLED === 'true') {
+    console.log('🧹 Retention scheduler disabled (RETENTION_SCHEDULER_DISABLED=true)')
+    return
+  }
   const globalState = globalThis as any
   if (globalState[RETENTION_SCHEDULER_KEY]) return
   globalState[RETENTION_SCHEDULER_KEY] = true
