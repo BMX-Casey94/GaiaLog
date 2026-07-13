@@ -517,6 +517,46 @@ async function releaseBatch(
   })
 }
 
+/**
+ * Soft-archive a batch of phantom inputs whose parents are unknown on-chain
+ * (ARC 460 / missing-inputs). Mirrors lib/utxo-inventory.archivePhantomUtxo
+ * but bulk so a 500-input consolidate failure does not issue 500 round-trips.
+ */
+async function archivePhantomBatch(inputs: LockedInput[], reason: string): Promise<number> {
+  if (inputs.length === 0) return 0
+  const safeReason = reason.substring(0, 64)
+  return withOverlayTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = 120000`)
+    const topics = inputs.map((i) => i.topic)
+    const txids = inputs.map((i) => i.txid)
+    const vouts = inputs.map((i) => i.vout)
+    const res = await client.query<{ topic: string }>(
+      `UPDATE overlay_admitted_utxos u
+          SET removed = true,
+              removed_at = now(),
+              spending_txid = $4,
+              locked = false,
+              locked_by = NULL,
+              locked_at = NULL
+         FROM unnest($1::text[], $2::text[], $3::int[]) AS t(topic, txid, vout)
+        WHERE u.topic = t.topic
+          AND u.txid = t.txid
+          AND u.vout = t.vout
+          AND u.removed = false
+      RETURNING u.topic`,
+      [topics, txids, vouts, safeReason],
+    )
+    const byTopic = new Map<string, number>()
+    for (const row of res.rows) {
+      byTopic.set(row.topic, (byTopic.get(row.topic) || 0) + 1)
+    }
+    for (const [topic, delta] of byTopic) {
+      await refreshTopicCounts(client, topic, -delta)
+    }
+    return res.rowCount ?? 0
+  })
+}
+
 // ─── Atomic admit: mark inputs spent + insert new output (one DB tx) ─────────
 
 interface AdmittedOutput {
@@ -813,15 +853,46 @@ async function consolidateWallet(
       txid = await broadcastSplitTransactionRaw(built.rawHex)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      const transient = classifyBroadcastError(message)
+      const classified = classifyBroadcastError(message)
+
+      // Phantom parents: archive the batch so we stop retrying dead inventory.
+      // This is progress (inventory cleanup), so do NOT count toward the
+      // consecutive-failure abort — keep chewing through the phantom pile.
+      if (classified.label === 'missing-inputs') {
+        const archived = await archivePhantomBatch(inputs, 'consolidate-missing-inputs')
+        // Sweep further matching dust WITHOUT rebroadcasting — one ARC 460 is
+        // enough evidence for this wallet's aged unconfirmed dust pile. Avoids
+        // thousands of wasted ARC calls when ~all pool rows are phantoms.
+        let swept = 0
+        for (let sweep = 0; sweep < 40; sweep++) {
+          const more = await lockBatch(
+            binding,
+            options.batchSize,
+            options.includeUnconfirmed,
+            minInputSats,
+            options.unconfirmedMinAgeSeconds,
+            lockedBy,
+            options.maxInputSats,
+          )
+          if (more.length === 0) break
+          swept += await archivePhantomBatch(more, 'consolidate-phantom-sweep')
+        }
+        console.warn(
+          `  🗑️  Batch #${batchNo}: missing-inputs/ARC 460 — archived ${archived} from failed TX` +
+            `${swept > 0 ? ` + swept ${swept} more without rebroadcast` : ''}. Continuing.`,
+        )
+        if (classified.hint) console.warn(`     hint: ${classified.hint}`)
+        continue
+      }
+
       consecutiveFailures += 1
       console.error(
-        `  ❌ Batch #${batchNo}: broadcast failed (${transient.label}) — ${message.split('\n')[0].substring(0, 200)}. ` +
-          `Releasing locks (${Math.round(transient.cooldownMs / 1000)}s cooldown). ` +
+        `  ❌ Batch #${batchNo}: broadcast failed (${classified.label}) — ${message.split('\n')[0].substring(0, 200)}. ` +
+          `Releasing locks (${Math.round(classified.cooldownMs / 1000)}s cooldown). ` +
           `Consecutive failures: ${consecutiveFailures}/${options.maxConsecutiveFailures}.`,
       )
-      if (transient.hint) console.error(`     hint: ${transient.hint}`)
-      await releaseBatch(inputs, lockedBy, transient.cooldownMs)
+      if (classified.hint) console.error(`     hint: ${classified.hint}`)
+      await releaseBatch(inputs, lockedBy, classified.cooldownMs)
       if (consecutiveFailures >= options.maxConsecutiveFailures) {
         console.error(
           `  ⛔ Wallet ${binding.label}: ${consecutiveFailures} consecutive broadcast failures — ` +
@@ -830,8 +901,7 @@ async function consolidateWallet(
         )
         break
       }
-      // Wait briefly before next batch attempt to let upstream issues clear.
-      await new Promise((r) => setTimeout(r, transient.preBatchSleepMs))
+      await new Promise((r) => setTimeout(r, classified.preBatchSleepMs))
       continue
     }
 
@@ -895,14 +965,21 @@ interface BroadcastErrorClassification {
 
 function classifyBroadcastError(message: string): BroadcastErrorClassification {
   const lower = message.toLowerCase()
-  if (lower.includes('missing inputs') || lower.includes('missing-inputs')) {
+  if (
+    lower.includes('missing inputs') ||
+    lower.includes('missing-inputs') ||
+    lower.includes('parent transaction not found') ||
+    /\b460\b/.test(lower) ||
+    lower.includes('not extended')
+  ) {
     return {
       label: 'missing-inputs',
-      cooldownMs: 5 * 60_000,
-      preBatchSleepMs: 5_000,
+      cooldownMs: 0,
+      preBatchSleepMs: 0,
       hint:
-        'WoC reports an input does not exist on-chain — likely an unconfirmed parent that has not yet propagated. ' +
-        'Increase --unconfirmed-min-age-seconds (default 60) so we wait longer before consolidating fresh splitter outputs.',
+        'Parent TX is unknown on-chain (phantom inventory). These inputs will be archived as removed ' +
+        'so consolidation can skip them and move on. If the whole pool is phantoms, fund the wallet ' +
+        'with a fresh confirmed UTXO after archival clears the dust.',
     }
   }
   if (lower.includes('mempool_chain_limit') || lower.includes('too-long-mempool-chain')) {
