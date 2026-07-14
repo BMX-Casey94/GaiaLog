@@ -110,7 +110,13 @@ dbPool.on('error', (err) => {
 // instead of a process crash.
 let lastClientErrorLogAt = 0
 let suppressedClientErrorCount = 0
+const CLIENT_ERROR_HANDLER_ATTACHED = Symbol.for('gaialog.pgClientErrorHandler')
 export function attachClientErrorHandler(client: PoolClient): void {
+  // Pool clients are reused; attaching on every checkout stacked listeners
+  // until MaxListenersExceededWarning fired (seen during consolidate sweeps).
+  const tagged = client as PoolClient & { [CLIENT_ERROR_HANDLER_ATTACHED]?: boolean }
+  if (tagged[CLIENT_ERROR_HANDLER_ATTACHED]) return
+  tagged[CLIENT_ERROR_HANDLER_ATTACHED] = true
   client.on('error', (err) => {
     const now = Date.now()
     if (now - lastClientErrorLogAt >= POOL_ERROR_LOG_INTERVAL_MS) {
