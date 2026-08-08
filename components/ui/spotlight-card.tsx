@@ -163,14 +163,18 @@ const GlowCard: React.FC<GlowCardProps> = ({
 
   // Shared layout classes – overflow-hidden prevents glow pseudo-elements
   // and content from leaking outside the card boundary.
+  //
+  // Default (fixed-aspect) cards use CSS grid with a growing first row.
+  // customSize cards (e.g. Live Dashboard) must NOT — that grid rule stretched
+  // the header strip to absorb leftover height, so sparse cards grew tall
+  // headers while content-heavy ones stayed thin. Flex + caller-controlled
+  // flex-1 on the body keeps headers as thin strips.
   const layoutClasses = `
     ${getSizeClasses()}
-    ${!customSize ? 'aspect-[3/4]' : ''}
+    ${!customSize ? 'aspect-[3/4] grid grid-rows-[1fr_auto]' : 'flex flex-col'}
     rounded-2xl 
     relative 
     overflow-hidden
-    grid 
-    grid-rows-[1fr_auto] 
     shadow-[0_1rem_2rem_-1rem_black] 
     p-4 
     gap-4 

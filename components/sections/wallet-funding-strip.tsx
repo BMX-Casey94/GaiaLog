@@ -106,8 +106,10 @@ export function WalletFundingStrip() {
     return () => clearInterval(id)
   }, [fetchFunding])
 
-  // Duplicate chips so the marquee loop is seamless when content is short.
-  const track = wallets.length > 0 ? [...wallets, ...wallets, ...wallets] : []
+  // Three identical groups for a seamless -33.333% loop. Extra horizontal
+  // padding on each group creates a clear pause between W3 → W1 so the strip
+  // reads as three wallets, not an endless chain.
+  const groups = wallets.length > 0 ? [0, 1, 2] : []
 
   return (
     <section
@@ -149,9 +151,17 @@ export function WalletFundingStrip() {
             {loading ? 'Fetching wallet balances…' : (error || 'No wallet data')}
           </div>
         ) : (
-          <div className="flex gap-3 w-max animate-wallet-funding-marquee hover:[animation-play-state:paused] px-4">
-            {track.map((wallet, i) => (
-              <WalletChip key={`${wallet.label}-${i}`} wallet={wallet} />
+          <div className="flex w-max animate-wallet-funding-marquee hover:[animation-play-state:paused]">
+            {groups.map((group) => (
+              <div
+                key={group}
+                className="flex gap-3 shrink-0 px-10 sm:px-16"
+                aria-hidden={group > 0 ? true : undefined}
+              >
+                {wallets.map((wallet) => (
+                  <WalletChip key={`${group}-${wallet.label}`} wallet={wallet} />
+                ))}
+              </div>
             ))}
           </div>
         )}

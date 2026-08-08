@@ -4,6 +4,12 @@ import { useEffect, useState } from "react"
 import dynamic from "next/dynamic"
 import { Button } from "@/components/ui/button"
 import { ArrowRight, AlertTriangle, Shield, Globe } from "lucide-react"
+import {
+  metricAlertToHeroDisplay,
+  pickTopMetricAlert,
+  processDataIntoAlerts,
+  readingsToEnvironmentalData,
+} from "@/lib/metric-alerts"
 
 // Heavy canvas visuals are decorative — defer them so they never block first paint.
 const SparklesCore = dynamic(
@@ -57,9 +63,10 @@ export function Hero() {
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const [explorerRes, alertsRes, providersRes] = await Promise.allSettled([
+        const [explorerRes, readingsRes, providersRes] = await Promise.allSettled([
           fetch('/api/explorer/stats', { cache: 'no-store' }),
-          fetch('/api/explorer/priority-alerts?limit=1', { cache: 'no-store' }),
+          // Genuine sensor metrics only — never on-chain event/priority alerts.
+          fetch('/api/explorer/latest-readings', { cache: 'no-store' }),
           fetch('/api/providers/status', { cache: 'no-store' }),
         ])
 
@@ -80,20 +87,14 @@ export function Hero() {
           }
         }
 
-        if (alertsRes.status === 'fulfilled' && alertsRes.value.ok) {
-          const alerts = await alertsRes.value.json()
-          if (alerts?.success && Array.isArray(alerts.alerts) && alerts.alerts.length > 0) {
-            const a = alerts.alerts[0]
-            setStats((prev) => ({
-              ...prev,
-              topAlert: {
-                label: a.label ?? a.family ?? 'Alert',
-                value: a.value ?? '',
-                location: a.location ?? 'Unknown',
-                timestamp: a.timestamp,
-              },
-            }))
-          }
+        if (readingsRes.status === 'fulfilled' && readingsRes.value.ok) {
+          const latest = await readingsRes.value.json()
+          const readings = latest?.success && Array.isArray(latest.readings) ? latest.readings : []
+          const top = pickTopMetricAlert(processDataIntoAlerts(readingsToEnvironmentalData(readings)))
+          setStats((prev) => ({
+            ...prev,
+            topAlert: top ? metricAlertToHeroDisplay(top) : null,
+          }))
         }
 
         if (providersRes.status === 'fulfilled' && providersRes.value.ok) {
