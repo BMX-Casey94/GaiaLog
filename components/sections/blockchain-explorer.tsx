@@ -126,14 +126,22 @@ export function BlockchainExplorer() {
 
           <>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
-              {Object.values(DATA_FAMILY_DESCRIPTORS).map((descriptor) => {
-                const tx = txByFamily.get(descriptor.id)
-                const metricsSummary = tx ? buildMetricsSummary(descriptor.id, tx.metrics) : null
-                const description = loading
-                  ? 'Loading...'
-                  : tx
-                    ? (metricsSummary ?? `${descriptor.label} data recorded`)
-                    : 'No recent transactions found yet.'
+              {loading && txByFamily.size === 0 && (
+                <div className="md:col-span-2 text-center text-sm text-slate-500 py-8">
+                  Loading recent on-chain readings…
+                </div>
+              )}
+              {!loading && txByFamily.size === 0 && (
+                <div className="md:col-span-2 text-center text-sm text-slate-500 py-8">
+                  No recent on-chain readings in the current window yet.
+                </div>
+              )}
+              {Object.values(DATA_FAMILY_DESCRIPTORS)
+                .filter((descriptor) => txByFamily.has(descriptor.id))
+                .map((descriptor) => {
+                const tx = txByFamily.get(descriptor.id)!
+                const metricsSummary = buildMetricsSummary(descriptor.id, tx.metrics)
+                const description = metricsSummary ?? `${descriptor.label} data recorded`
 
                 return (
                   <GlowCard key={descriptor.id} glowColor="purple" customSize>
@@ -145,50 +153,44 @@ export function BlockchainExplorer() {
                         <div className="flex items-start justify-between gap-2 mb-1">
                           <div className="flex items-center gap-2 min-w-0 flex-wrap">
                             <span className="font-medium text-white">{descriptor.label}</span>
-                            {tx && (
-                              <Badge
-                                variant="secondary"
-                                className={tx.status === 'pending'
-                                  ? "bg-yellow-900/50 text-yellow-400 rounded-sm"
-                                  : "bg-green-900/50 text-green-400 rounded-sm"}
-                              >
-                                {tx.status}
-                              </Badge>
-                            )}
-                          </div>
-                          {tx ? (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="text-purple-300 hover:text-purple-200 shrink-0 h-auto px-2 py-1"
-                              onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
+                            <Badge
+                              variant="secondary"
+                              className={tx.status === 'pending'
+                                ? "bg-yellow-900/50 text-yellow-400 rounded-sm"
+                                : "bg-green-900/50 text-green-400 rounded-sm"}
                             >
-                              <span className="inline-flex items-center whitespace-nowrap">
-                                View TX
-                                <ExternalLink className="ml-1 h-3 w-3" />
-                              </span>
-                            </Button>
-                          ) : null}
+                              {tx.status}
+                            </Badge>
+                          </div>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-purple-300 hover:text-purple-200 shrink-0 h-auto px-2 py-1"
+                            onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
+                          >
+                            <span className="inline-flex items-center whitespace-nowrap">
+                              View TX
+                              <ExternalLink className="ml-1 h-3 w-3" />
+                            </span>
+                          </Button>
                         </div>
                         <div className="text-sm text-slate-400 mb-1 line-clamp-2">
                           {description}
                         </div>
-                        {tx?.location && (
+                        {tx.location && (
                           <div className="flex items-start gap-1 text-xs text-slate-500 mb-1 min-w-0">
                             <MapPin className="h-3 w-3 shrink-0 mt-0.5" />
                             <span className="min-w-0 line-clamp-2 break-words">{tx.location}</span>
                           </div>
                         )}
-                        {tx ? (
-                          <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-xs text-slate-500">
-                            <Clock className="h-3 w-3 shrink-0" />
-                            <span>{tx.timestamp}</span>
-                            <span>•</span>
-                            <span className="font-mono">
-                              {tx.id.slice(0, 8)}...{tx.id.slice(-8)}
-                            </span>
-                          </div>
-                        ) : null}
+                        <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-xs text-slate-500">
+                          <Clock className="h-3 w-3 shrink-0" />
+                          <span>{tx.timestamp}</span>
+                          <span>•</span>
+                          <span className="font-mono">
+                            {tx.id.slice(0, 8)}...{tx.id.slice(-8)}
+                          </span>
+                        </div>
                       </div>
                     </div>
                   </GlowCard>
