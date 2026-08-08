@@ -10,6 +10,7 @@ import { getSpendSourceForWallet, getTreasuryTopicForWallet } from './spend-sour
 import { getQueueGateMinConfirmations } from './utxo-spend-policy'
 import { normaliseDataFamily, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
+import { isWritePausedForFunding } from './write-dry-mode'
 
 export interface QueueItem {
   id: string
@@ -317,6 +318,18 @@ export class WorkerQueue {
       if (!bsvTransactionService.isReady()) {
         if (this.shouldLogQueueSkip('txServiceNotReady')) {
           console.warn(`🔍 [queue-debug] Skipping processQueue: bsvTransactionService not ready (items=${totalItems})`)
+        }
+        return
+      }
+
+      // Funding outage guard. Unlike the collectors (which drop and re-collect),
+      // queued items are already-accepted work, so they are held in place —
+      // draining them now would only convert them into failed retries.
+      if (isWritePausedForFunding()) {
+        if (this.shouldLogQueueSkip('writeDryMode')) {
+          console.warn(
+            `⏸️  [queue] holding ${totalItems} item(s): writes paused (wallet funding dry)`,
+          )
         }
         return
       }

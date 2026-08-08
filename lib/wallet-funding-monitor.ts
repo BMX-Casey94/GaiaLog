@@ -15,6 +15,10 @@
  * a human has to top it up from cold storage. This monitor exists to give
  * that human at least N days' notice instead of a surprise outage.
  *
+ * After a top-up, `lib/wallet-funding-admit.ts` admits confirmed on-chain
+ * funding into overlay inventory so the splitter can resume without a
+ * manual recovery-import.
+ *
  * Behaviour:
  *   - Every BSV_WALLET_FUNDING_CHECK_INTERVAL_MS (default 5 min):
  *     - For each wallet, computes (live UTXOs, total live sats, days runway).

@@ -137,13 +137,13 @@ export function BlockchainExplorer() {
 
                 return (
                   <GlowCard key={descriptor.id} glowColor="purple" customSize>
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center space-x-4 min-w-0 flex-1">
-                        <div className="w-10 h-10 shrink-0 bg-slate-950/60 rounded-full flex items-center justify-center">
-                          <Hash className="h-5 w-5 text-purple-300" />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center space-x-2 mb-1">
+                    <div className="flex items-start gap-3 min-w-0">
+                      <div className="w-10 h-10 shrink-0 bg-slate-950/60 rounded-full flex items-center justify-center">
+                        <Hash className="h-5 w-5 text-purple-300" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-start justify-between gap-2 mb-1">
+                          <div className="flex items-center gap-2 min-w-0 flex-wrap">
                             <span className="font-medium text-white">{descriptor.label}</span>
                             {tx && (
                               <Badge
@@ -156,39 +156,40 @@ export function BlockchainExplorer() {
                               </Badge>
                             )}
                           </div>
-                          <div className="text-sm text-slate-400 mb-1 truncate">
-                            {description}
-                          </div>
-                          {tx?.location && (
-                            <div className="flex items-center gap-1 text-xs text-slate-500 mb-1">
-                              <MapPin className="h-3 w-3 shrink-0" />
-                              <span className="truncate">{tx.location}</span>
-                            </div>
-                          )}
                           {tx ? (
-                            <div className="flex items-center space-x-2 text-xs text-slate-500">
-                              <Clock className="h-3 w-3" />
-                              <span>{tx.timestamp}</span>
-                              <span>•</span>
-                              <span className="font-mono">
-                                {tx.id.slice(0, 8)}...{tx.id.slice(-8)}
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="text-purple-300 hover:text-purple-200 shrink-0 h-auto px-2 py-1"
+                              onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
+                            >
+                              <span className="inline-flex items-center whitespace-nowrap">
+                                View TX
+                                <ExternalLink className="ml-1 h-3 w-3" />
                               </span>
-                            </div>
+                            </Button>
                           ) : null}
                         </div>
+                        <div className="text-sm text-slate-400 mb-1 line-clamp-2">
+                          {description}
+                        </div>
+                        {tx?.location && (
+                          <div className="flex items-start gap-1 text-xs text-slate-500 mb-1 min-w-0">
+                            <MapPin className="h-3 w-3 shrink-0 mt-0.5" />
+                            <span className="min-w-0 line-clamp-2 break-words">{tx.location}</span>
+                          </div>
+                        )}
+                        {tx ? (
+                          <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-xs text-slate-500">
+                            <Clock className="h-3 w-3 shrink-0" />
+                            <span>{tx.timestamp}</span>
+                            <span>•</span>
+                            <span className="font-mono">
+                              {tx.id.slice(0, 8)}...{tx.id.slice(-8)}
+                            </span>
+                          </div>
+                        ) : null}
                       </div>
-                      {tx ? (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="text-purple-300 hover:text-purple-200 shrink-0 ml-2"
-                          onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
-                        >
-                          <span className="sm:hidden inline-flex items-center">TX<ExternalLink className="ml-1 h-3 w-3" /></span>
-                          <span className="hidden sm:inline">View BSV TX</span>
-                          <ExternalLink className="ml-2 h-3 w-3 hidden sm:inline" />
-                        </Button>
-                      ) : null}
                     </div>
                   </GlowCard>
                 )

@@ -133,6 +133,80 @@ Workers need `tsx` and `next build` needs `@tailwindcss/postcss` /
 `Cannot find module '@tailwindcss/postcss'`, run a full `npm install` once
 and confirm `package.json` is current.
 
+### Resume blockchain writes after funding
+
+Overlay spends only from `overlay_admitted_utxos`. Sending BSV on-chain is
+not enough by itself — confirmed funding must be admitted into inventory.
+
+**Normal path (workers running):**
+
+1. Send a confirmed top-up to each wallet that needs runway (prefer one large
+   UTXO per wallet, ≥ `BSV_FUNDING_ADMIT_MIN_SATS`, default 10 000 sats).
+2. Wait for ≥1 confirmation.
+3. Within ~5 minutes the funding-admit scheduler (`lib/wallet-funding-admit.ts`)
+   discovers the UTXO via Bitails and inserts it as `reserve`/`confirmed`.
+4. The UTXO maintainer splits it into pool outputs; logs show `UTXO-Split` and
+   non-zero `submitted=` again.
+
+No PM2 restart is required after funding. Opt out with
+`BSV_FUNDING_ADMIT_DISABLED=true` if needed.
+
+**Full rebuild path (inventory wiped / phantoms):** still use the recovery
+import with workers stopped:
+
+```bash
+pm2 stop gaialog-workers
+# discover → /tmp/recovery/W{1,2,3}.utxos.json
+npx tsx scripts/recovery-import-onchain-utxos.ts
+npx tsx scripts/recovery-import-onchain-utxos.ts --apply
+pm2 start gaialog-workers
+```
+
+### Write dry mode (wallet ran out of funds)
+
+`lib/write-dry-mode.ts` stops the pipeline from attempting chain writes when no
+wallet holds a spendable UTXO. Without it, every collector kept building
+transactions that could not be funded, each failure was retried within seconds,
+and the resulting churn produced ARC 460 storms and chains of unconfirmed change
+that later became phantoms.
+
+Detection deliberately ignores UTXO *counts* — a wallet can hold hundreds of
+thousands of sub-fee dust rows and still fund nothing. The gate is:
+
+```
+dry  ⟺  largest spendable UTXO across all wallets < BSV_WRITE_DRY_MIN_INPUT_SATS
+```
+
+The floor defaults to `BSV_UTXO_SPLIT_OUTPUT_SATS` (the denomination the
+maintainer mints for writes). Entering dry mode needs two consecutive checks so
+it cannot flap mid-split; leaving is immediate on the first healthy check.
+
+While dry:
+
+- collectors still poll providers (so provider health stays visible) but skip
+  the chain write **without** touching the dedupe store, so readings are simply
+  re-collected once funding returns — no backlog, no dropped-then-blocked data
+- the queue *holds* already-accepted items rather than draining them into
+  failures
+- the normal collection interval applies (not the 10s backpressure retry), so a
+  long outage does not hammer upstream providers
+- `funding-monitor` and `funding-admit` keep running, so a top-up is detected
+  and admitted automatically
+
+Log lines to watch:
+
+```bash
+pm2 logs gaialog-workers --raw 2>/dev/null | grep -E "write-dry-mode|writes paused|writes_suppressed"
+```
+
+`⏸️ [write-dry-mode] ENGAGED` means fund a wallet with a single confirmed UTXO;
+`▶️ [write-dry-mode] CLEARED` confirms writes resumed and reports how many write
+attempts were suppressed during the outage.
+
+Env: `BSV_WRITE_DRY_MODE_DISABLED=true` (opt out),
+`BSV_WRITE_DRY_CHECK_INTERVAL_MS` (default 30 000),
+`BSV_WRITE_DRY_MIN_INPUT_SATS`, `BSV_WRITE_DRY_LOG_INTERVAL_MS` (default 10 min).
+
 ### Dust consolidation
 
 When the pool has degraded to sub-spendable UTXOs (~97 sats), run:

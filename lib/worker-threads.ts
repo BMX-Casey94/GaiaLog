@@ -25,6 +25,7 @@ import { blockchainService } from './blockchain'
 import { DataFamily, DatasetId, mapWorkerTypeToFamily, ProviderId, QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
 import { applySensitivityControls } from './sensitivity-controls'
+import { isWritePausedForFunding, recordSuppressedWrites } from './write-dry-mode'
 
 export interface WorkerStats {
   workerId: string
@@ -143,6 +144,7 @@ export abstract class BaseWorker {
       duplicateDropped: 0,
       alreadyOnChainDropped: 0,
       backpressured: 0,
+      writesSuppressed: 0,
     }
     const metaForItem = (item: EnvironmentalData) => ({
       family: item.family || mapWorkerTypeToFamily(item.type),
@@ -156,8 +158,32 @@ export abstract class BaseWorker {
       
       const data = await this.collectData()
       this.recordCollectionBatch(data)
-      
-      for (const item of data) {
+
+      // Funding outage guard: when no wallet holds a spendable UTXO there is
+      // nothing to be gained by building transactions — every broadcast would
+      // fail and be retried, which is how the pipeline previously turned a
+      // funding gap into an ARC 460 retry storm. Collection still runs (so
+      // provider health stays observable); the chain write is skipped without
+      // touching the dedupe store, so these readings are simply re-collected
+      // once funding is restored.
+      //
+      // Deliberately NOT counted as backpressure: backpressure shortens the
+      // next run to 10s, which during a multi-hour funding outage would hammer
+      // upstream providers for no benefit. The normal interval applies instead.
+      const writesPaused = data.length > 0 && isWritePausedForFunding()
+      if (writesPaused) {
+        recordSuppressedWrites(data.length)
+        cycleStats.writesSuppressed += data.length
+        if (bsvConfig.logging.level !== 'error') {
+          console.warn(
+            `⏸️  ${this.workerId}: writes paused (wallet funding dry) — skipped ${data.length} reading(s)`,
+          )
+        }
+      }
+
+      const itemsToBroadcast: EnvironmentalData[] = writesPaused ? [] : data
+
+      for (const item of itemsToBroadcast) {
         const itemMeta = metaForItem(item)
 
         let unifiedHash: string
@@ -332,13 +358,14 @@ export abstract class BaseWorker {
         const BYPASS_QUEUE = process.env.BSV_BYPASS_QUEUE === 'true'
 
         if (BYPASS_QUEUE) {
-          // Direct broadcast - bypass queue to avoid Supabase bottleneck
+          // Direct broadcast - bypass queue to avoid Supabase bottleneck.
+          // Stream must be the canonical data family (same as worker-queue
+          // mapTypeToStream). The previous air/water/seismic/else→advanced
+          // collapse indexed geomagnetism, hydrology, flood, NWS, etc. under
+          // advanced_metrics and left those explorer cards empty.
           try {
-            const stream = item.type === 'air-quality' ? 'air_quality' 
-              : item.type === 'water-level' ? 'water_levels'
-              : item.type === 'seismic' ? 'seismic_activity'
-              : 'advanced_metrics'
-            
+            const stream = resolvedFamily
+
             const txid = await blockchainService.writeToChain({
               stream,
               timestamp: item.timestamp,
@@ -350,13 +377,17 @@ export abstract class BaseWorker {
                 location: item.location,
                 timestamp: new Date(item.timestamp).toISOString(),
                 source: resolveSourceLabel(bsvData.providerId, bsvData.datasetId, item.source),
-                ...item.measurement,
+                ...(bsvData.coordinates
+                  ? { latitude: bsvData.coordinates.lat, longitude: bsvData.coordinates.lon }
+                  : {}),
+                ...(bsvData.stationId ? { station_id: bsvData.stationId } : {}),
+                ...bsvData.measurement,
                 source_hash: unifiedHash
               }
             })
             
             if (bsvConfig.logging.level !== 'error') {
-              console.log(`✅ ${this.workerId}: Direct broadcast ${item.type} - ${txid}`)
+              console.log(`✅ ${this.workerId}: Direct broadcast ${item.type} (${stream}) - ${txid}`)
             }
             this.stats.totalTransactions++
             cycleStats.submitted++
@@ -416,7 +447,8 @@ export abstract class BaseWorker {
         console.log(
           `✅ ${this.workerId}: Processed ${data.length} data points in ${processingTime}ms ` +
           `(submitted=${cycleStats.submitted}, queued=${cycleStats.queued}, duplicate=${cycleStats.duplicateDropped}, ` +
-          `already_on_chain=${cycleStats.alreadyOnChainDropped}, backpressured=${cycleStats.backpressured}) ` +
+          `already_on_chain=${cycleStats.alreadyOnChainDropped}, backpressured=${cycleStats.backpressured}` +
+          `${cycleStats.writesSuppressed > 0 ? `, writes_suppressed=${cycleStats.writesSuppressed}` : ''}) ` +
           `novel=${novel} nextRunIn=${(nextRunIn / 1000).toFixed(0)}s`
         )
       }

@@ -128,6 +128,19 @@ async function main() {
     // exhausts its BSV. Self-throttled CRITICAL alerts; opt-out via
     // BSV_WALLET_FUNDING_DISABLED=true.
     startWalletFundingMonitor()
+    // Funding admit: Bitails-poll confirmed funding-sized UTXOs into
+    // overlay_admitted_utxos so top-ups resume writes without a manual
+    // recovery-import. Safe while workers run (insert/revive only).
+    // Opt-out via BSV_FUNDING_ADMIT_DISABLED=true.
+    const { startWalletFundingAdmit } = await import('../lib/wallet-funding-admit')
+    startWalletFundingAdmit()
+    // Write dry mode: when no wallet holds a spendable UTXO, suppress chain
+    // writes instead of letting every collector fail and retry (which is how a
+    // funding gap previously became an ARC 460 retry storm). Resumes
+    // automatically once funding is admitted. Opt-out via
+    // BSV_WRITE_DRY_MODE_DISABLED=true.
+    const { startWriteDryModeMonitor } = await import('../lib/write-dry-mode')
+    startWriteDryModeMonitor()
     // Retention scheduler: the Vercel Cron in vercel.json never fires on the
     // VPS/PM2 deployment, so without this the tx_log / spent-UTXO heaps grow
     // unbounded and saturate the database CPU. Runs the daily retention pass
@@ -219,6 +232,14 @@ async function main() {
       } catch {}
       try {
         stopWalletFundingMonitor()
+      } catch {}
+      try {
+        const { stopWalletFundingAdmit } = await import('../lib/wallet-funding-admit')
+        stopWalletFundingAdmit()
+      } catch {}
+      try {
+        const { stopWriteDryModeMonitor } = await import('../lib/write-dry-mode')
+        stopWriteDryModeMonitor()
       } catch {}
       console.log('✅ Worker service shut down cleanly.')
       process.exit(0)
