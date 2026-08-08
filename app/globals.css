@@ -196,4 +196,18 @@
     background: linear-gradient(90deg, transparent, rgba(139, 92, 246, 0.35), transparent);
     height: 1px;
   }
+
+  /* Homepage treasury funding marquee (3× repeated track → -33.333%) */
+  @keyframes wallet-funding-marquee {
+    from { transform: translateX(0); }
+    to { transform: translateX(-33.333%); }
+  }
+  .animate-wallet-funding-marquee {
+    animation: wallet-funding-marquee 36s linear infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .animate-wallet-funding-marquee {
+      animation: none;
+    }
+  }
 }

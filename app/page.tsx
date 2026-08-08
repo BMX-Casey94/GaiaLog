@@ -4,6 +4,7 @@ import { LiveDashboard } from "@/components/sections/live-dashboard"
 import { BlockchainExplorer } from "@/components/sections/blockchain-explorer"
 import { DataSources } from "@/components/sections/data-sources"
 import { HowItWorks } from "@/components/sections/how-it-works"
+import { WalletFundingStrip } from "@/components/sections/wallet-funding-strip"
 import { Footer } from "@/components/sections/footer"
 
 export const metadata: Metadata = {
@@ -64,6 +65,7 @@ export default function HomePage() {
       <BlockchainExplorer />
       <DataSources />
       <HowItWorks />
+      <WalletFundingStrip />
       <Footer />
     </div>
   )
