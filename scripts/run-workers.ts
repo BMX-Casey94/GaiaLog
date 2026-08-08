@@ -134,6 +134,13 @@ async function main() {
     // Opt-out via BSV_FUNDING_ADMIT_DISABLED=true.
     const { startWalletFundingAdmit } = await import('../lib/wallet-funding-admit')
     startWalletFundingAdmit()
+    // Auto-consolidate: sweep stranded sub-split-floor dust back into one
+    // splittable reserve UTXO whenever a wallet runs out of split capital.
+    // Without it, dust accumulation eventually starves the splitter and only
+    // a manual `scripts/consolidate-wallet-utxos.ts` run restores writes.
+    // Opt-out via BSV_AUTO_CONSOLIDATE_DISABLED=true.
+    const { startUtxoAutoConsolidate } = await import('../lib/utxo-auto-consolidate')
+    startUtxoAutoConsolidate()
     // Write dry mode: when no wallet holds a spendable UTXO, suppress chain
     // writes instead of letting every collector fail and retry (which is how a
     // funding gap previously became an ARC 460 retry storm). Resumes
@@ -236,6 +243,10 @@ async function main() {
       try {
         const { stopWalletFundingAdmit } = await import('../lib/wallet-funding-admit')
         stopWalletFundingAdmit()
+      } catch {}
+      try {
+        const { stopUtxoAutoConsolidate } = await import('../lib/utxo-auto-consolidate')
+        stopUtxoAutoConsolidate()
       } catch {}
       try {
         const { stopWriteDryModeMonitor } = await import('../lib/write-dry-mode')

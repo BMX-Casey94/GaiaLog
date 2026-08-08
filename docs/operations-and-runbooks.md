@@ -151,6 +151,28 @@ not enough by itself — confirmed funding must be admitted into inventory.
 No PM2 restart is required after funding. Opt out with
 `BSV_FUNDING_ADMIT_DISABLED=true` if needed.
 
+**How discovery finds funding behind a dust pile.** Bitails returns unspents in
+pages, and a wallet holding tens of thousands of dust outputs can push a fresh
+top-up well past any fixed scan depth — in August 2026 that silently left three
+funded wallets STARVED because the scan stopped at 10 000 outputs. Each cycle
+now compares the address' confirmed chain balance with the sats the wallet
+already holds in `overlay_admitted_utxos`:
+
+- gap below `BSV_FUNDING_ADMIT_MIN_SATS` → one balance request, no paging
+- gap at or above it → page from a persisted cursor, `BSV_FUNDING_ADMIT_PAGES_PER_CYCLE`
+  pages (default 250 = 25 000 outputs) per cycle, resuming next cycle until the
+  address is fully swept
+
+A completed sweep that admitted nothing will not re-run until the chain balance
+moves or `BSV_FUNDING_ADMIT_SWEEP_BACKOFF_MS` (default 6 h) elapses, so a wallet
+whose inventory is permanently below its chain balance cannot loop on Bitails.
+
+Watch it with:
+
+```bash
+pm2 logs gaialog-workers --raw 2>/dev/null | grep "funding-admit"
+```
+
 **Full rebuild path (inventory wiped / phantoms):** still use the recovery
 import with workers stopped:
 
@@ -207,9 +229,47 @@ Env: `BSV_WRITE_DRY_MODE_DISABLED=true` (opt out),
 `BSV_WRITE_DRY_CHECK_INTERVAL_MS` (default 30 000),
 `BSV_WRITE_DRY_MIN_INPUT_SATS`, `BSV_WRITE_DRY_LOG_INTERVAL_MS` (default 10 min).
 
-### Dust consolidation
+### Auto-consolidation (dust starvation guard)
 
-When the pool has degraded to sub-spendable UTXOs (~97 sats), run:
+`lib/utxo-auto-consolidate.ts` runs inside `gaialog-workers` and removes the
+manual step below in the common case. Every 5 minutes it compares each wallet's
+largest usable output against the split floor
+(`2 × BSV_UTXO_SPLIT_OUTPUT_SATS` + split fee). A wallet below the trigger
+(default 3 × floor) has its stranded dust swept into a single large `reserve`
+output, which the maintainer splits again on its next cycle.
+
+The selection window is the safety property worth remembering: only rows
+**between** `BSV_AUTO_CONSOLIDATE_MIN_INPUT_SATS` (default 3 × the per-input
+fee, so nothing uneconomic is swept) and `BSV_AUTO_CONSOLIDATE_MAX_INPUT_SATS`
+(default the split floor − 1) are eligible. Auto-consolidation therefore can
+never consume an output the splitter itself could have used. Inputs are locked
+before signing, marked spent and re-admitted in one database transaction, and
+an ARC missing-inputs (460) response archives the batch as phantom rather than
+retrying dead inventory.
+
+Confirmed rows only by default; set `BSV_AUTO_CONSOLIDATE_INCLUDE_UNCONFIRMED=true`
+only when the dust pile is genuinely unconfirmed, since spending unconfirmed
+ancestors risks ARC mempool-chain limits.
+
+```bash
+pm2 logs gaialog-workers --raw 2>/dev/null | grep "auto-consolidate"
+```
+
+`♻️ swept N dust input(s) into X sats reserve` is the success line. `no eligible
+dust to sweep — wallet requires external funding` means the wallet is genuinely
+empty, not fragmented: send BSV.
+
+Env: `BSV_AUTO_CONSOLIDATE_DISABLED=true` (opt out),
+`BSV_AUTO_CONSOLIDATE_INTERVAL_MS` (default 300 000),
+`BSV_AUTO_CONSOLIDATE_TRIGGER_SATS`, `BSV_AUTO_CONSOLIDATE_BATCH_SIZE`
+(default 500 inputs per TX), `BSV_AUTO_CONSOLIDATE_MAX_BATCHES` (default 4 per
+wallet per cycle).
+
+### Dust consolidation (manual)
+
+For a full cleanup sweep — millions of rows, or dust that auto-consolidation
+skips because it is unconfirmed — run the script by hand. When the pool has
+degraded to sub-spendable UTXOs (~97 sats):
 
 ```bash
 cd /opt/gaialog
