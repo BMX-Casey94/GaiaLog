@@ -17,16 +17,15 @@
  *
  * Scan strategy (production Aug 2026):
  *   A wallet holding tens of thousands of dust outputs pushes fresh funding
- *   arbitrarily deep into Bitails' unspent pagination, so the previous
- *   fixed 10,000-output scan silently missed real top-ups and the wallet
- *   stayed STARVED while holding BSV on-chain. Instead of paging every
- *   cycle, each cycle compares the address' confirmed on-chain balance with
- *   the sats this wallet already has in `overlay_admitted_utxos`:
- *     gap < minSats  → nothing missing, one cheap balance call, done.
- *     gap ≥ minSats  → page through unspents from a persisted cursor with a
- *                      per-cycle page budget, admitting funding-sized
- *                      outputs, resuming next cycle until the address is
- *                      fully swept.
+ *   arbitrarily deep into Bitails' unspent pagination, so a fixed-depth
+ *   unspent scan silently missed real top-ups. Each cycle:
+ *     1. Compare confirmed chain balance vs overlay live sats.
+ *        gap < minSats → one cheap balance call, done.
+ *     2. History-first: recent address history (newest first) for receives
+ *        ≥ minSats, then resolve each tx's unspent outputs to this address.
+ *        Recent top-ups land in seconds instead of after paging all dust.
+ *     3. Fallback: cursor-resumed unspent pagination with a per-cycle page
+ *        budget, continuing until the address is fully swept.
  *
  * Env:
  *   BSV_FUNDING_ADMIT_DISABLED=true          - opt out
@@ -35,6 +34,7 @@
  *   BSV_FUNDING_ADMIT_MIN_CONFIRMATIONS      - default 1
  *   BSV_FUNDING_ADMIT_PAGES_PER_CYCLE        - default 250 (25,000 outputs)
  *   BSV_FUNDING_ADMIT_PAGE_DELAY_MS          - default 60
+ *   BSV_FUNDING_ADMIT_HISTORY_LIMIT          - default 200 recent history rows
  */
 
 import { P2PKH } from '@bsv/sdk'
@@ -70,6 +70,16 @@ const PAGES_PER_CYCLE = Math.max(
   Number(process.env.BSV_FUNDING_ADMIT_PAGES_PER_CYCLE || 250),
 )
 const PAGE_DELAY_MS = Math.max(0, Number(process.env.BSV_FUNDING_ADMIT_PAGE_DELAY_MS || 60))
+const HISTORY_LIMIT = Math.min(
+  5000,
+  Math.max(20, Number(process.env.BSV_FUNDING_ADMIT_HISTORY_LIMIT || 200)),
+)
+// When a gap exists and the unspent cursor is mid-sweep, poll again soon
+// instead of waiting a full INTERVAL_MS between 25k-output chunks.
+const RESUME_INTERVAL_MS = Math.max(
+  15_000,
+  Number(process.env.BSV_FUNDING_ADMIT_RESUME_INTERVAL_MS || 30_000),
+)
 // A wallet whose overlay inventory is permanently below its chain balance
 // (archived phantoms that are actually unspent, sub-minSats dust) would
 // otherwise re-sweep the whole address every cycle forever.
@@ -110,6 +120,21 @@ interface BitailsUnspent {
 
 function buildP2PKHHex(address: string): string {
   return new P2PKH().lock(address).toHex().toLowerCase()
+}
+
+/** Bitails output status: exists/false and mempool/false are unspent. */
+function isBitailsUnspent(status: unknown): boolean {
+  if (typeof status === 'string') {
+    if (status === 'exists/false' || status === 'mempool/false') return true
+    if (status === 'exists/true' || status === 'mempool/true' || status === 'unknown') return false
+    return status === 'exists' || status === 'mempool'
+  }
+  if (status && typeof status === 'object') {
+    const o = status as { spent?: boolean; status?: string }
+    if (typeof o.spent === 'boolean') return !o.spent
+    return isBitailsUnspent(o.status)
+  }
+  return false
 }
 
 function isAdmittableFunding(u: BitailsUnspent): boolean {
@@ -194,47 +219,110 @@ async function scanUnspentForFunding(
   return { candidates, nextCursor: from, reachedEnd: false, scanned }
 }
 
-async function admitWalletFunding(walletIndex: number, address: string): Promise<{ admitted: number; revived: number }> {
-  const [balanceSats, overlaySats] = await Promise.all([
-    fetchConfirmedBalance(address),
-    fetchOverlayLiveSats(walletIndex),
-  ])
-  const gapSats = balanceSats - overlaySats
-  const state = getScanState(address)
+interface HistoryRow {
+  txid?: string
+  inputSatoshis?: number
+  outputSatoshis?: number
+  time?: number
+  blockheight?: number
+}
 
-  if (gapSats < MIN_SATS) {
-    // Inventory already accounts for the chain balance — no scan required.
-    state.cursor = 0
-    return { admitted: 0, revived: 0 }
-  }
-
-  // Mid-sweep always continues; a fresh sweep only starts if the chain balance
-  // moved or the previous sweep has aged out.
-  const sweepAgedOut = Date.now() - state.lastSweepAt >= SWEEP_BACKOFF_MS
-  const balanceMoved = balanceSats !== state.lastSweepBalanceSats
-  if (state.cursor === 0 && !sweepAgedOut && !balanceMoved) {
-    return { admitted: 0, revived: 0 }
-  }
-
-  const cursor = state.cursor
-  const scan = await scanUnspentForFunding(address, cursor)
-  state.cursor = scan.nextCursor
-  if (scan.reachedEnd) {
-    state.lastSweepAt = Date.now()
-    state.lastSweepBalanceSats = balanceSats
-  }
-  console.log(
-    `💰 [funding-admit] W${walletIndex + 1} gap=${gapSats.toLocaleString()} sats ` +
-      `(chain=${balanceSats.toLocaleString()} overlay=${overlaySats.toLocaleString()}) — ` +
-      `scanned ${scan.scanned.toLocaleString()} outputs from ${cursor.toLocaleString()}, ` +
-      `${scan.candidates.length} funding candidate(s)` +
-      `${scan.reachedEnd ? ', sweep complete' : `, resuming at ${scan.nextCursor.toLocaleString()}`}`,
+/**
+ * Fast path for recent top-ups. Bitails address history is newest-first and
+ * tags receives via `outputSatoshis`, so a 0.2 BSV funding TX shows up in the
+ * first page long before unspent pagination reaches it behind 40k+ dust rows.
+ */
+async function discoverFundingViaHistory(address: string): Promise<BitailsUnspent[]> {
+  const scriptHex = buildP2PKHHex(address)
+  const raw = await bitailsJson<unknown>(
+    `/address/${encodeURIComponent(address)}/history?limit=${HISTORY_LIMIT}`,
   )
 
-  const candidates = scan.candidates
-  if (candidates.length === 0) {
-    return { admitted: 0, revived: 0 }
+  let histories: HistoryRow[] = []
+  if (Array.isArray(raw)) {
+    // Shape A: [ { address, histories: [...] } ]  or  [ { txid, outputSatoshis, ... } ]
+    if (raw.length > 0 && raw[0] && typeof raw[0] === 'object' && 'histories' in (raw[0] as object)) {
+      histories = ((raw[0] as { histories?: HistoryRow[] }).histories || []) as HistoryRow[]
+    } else {
+      histories = raw as HistoryRow[]
+    }
+  } else if (raw && typeof raw === 'object' && Array.isArray((raw as { histories?: HistoryRow[] }).histories)) {
+    histories = (raw as { histories: HistoryRow[] }).histories
   }
+
+  const received = histories.filter((h) => {
+    const out = Number(h.outputSatoshis || 0)
+    return Number.isFinite(out) && out >= MIN_SATS && typeof h.txid === 'string' && h.txid.length === 64
+  })
+  if (received.length === 0) return []
+
+  const candidates: BitailsUnspent[] = []
+  const seen = new Set<string>()
+
+  // Cap how many funding-sized receives we resolve per cycle — recent top-ups
+  // are almost always in the first handful of rows.
+  for (const h of received.slice(0, 25)) {
+    const txid = String(h.txid).toLowerCase()
+    let tx: {
+      confirmations?: number
+      outputs?: Array<{ index?: number; satoshis?: number; script?: string }>
+      outputsCount?: number
+      partialOutputs?: boolean
+    }
+    try {
+      tx = await bitailsJson(`/tx/${txid}`)
+    } catch {
+      continue
+    }
+    const confirmations = Number(tx.confirmations ?? 0)
+    if (!Number.isFinite(confirmations) || confirmations < MIN_CONFIRMATIONS) continue
+
+    let outputs = Array.isArray(tx.outputs) ? tx.outputs : []
+    if ((tx.partialOutputs || outputs.length === 0) && Number(tx.outputsCount || 0) > 0) {
+      try {
+        const count = Math.min(50, Number(tx.outputsCount))
+        outputs = await bitailsJson(`/tx/${txid}/outputs/0/${count}`)
+      } catch {
+        continue
+      }
+    }
+
+    for (const o of outputs) {
+      const vout = Number(o.index)
+      const satoshis = Number(o.satoshis)
+      const script = String(o.script || '').toLowerCase()
+      if (!Number.isInteger(vout) || vout < 0) continue
+      if (!Number.isFinite(satoshis) || satoshis < MIN_SATS) continue
+      if (script && script !== scriptHex) continue
+
+      const key = `${txid}:${vout}`
+      if (seen.has(key)) continue
+
+      let unspent = false
+      try {
+        const status = await bitailsJson<{ status?: string; spent?: boolean } | string>(
+          `/tx/${txid}/output/${vout}/status`,
+        )
+        unspent = isBitailsUnspent(status)
+      } catch {
+        continue
+      }
+      if (!unspent) continue
+
+      seen.add(key)
+      candidates.push({ txid, vout, satoshis, confirmations })
+    }
+  }
+
+  return candidates
+}
+
+async function admitCandidates(
+  walletIndex: number,
+  address: string,
+  candidates: BitailsUnspent[],
+): Promise<{ admitted: number; revived: number }> {
+  if (candidates.length === 0) return { admitted: 0, revived: 0 }
 
   const topic = getTreasuryTopicForWallet(walletIndex)
   const outputScript = buildP2PKHHex(address)
@@ -279,7 +367,6 @@ async function admitWalletFunding(walletIndex: number, address: string): Promise
 
       const row = existing.rows[0]
       if (row.removed === true) {
-        // Revive archived funding only; do not touch live locked inventory.
         const upd = await client.query(
           `UPDATE overlay_admitted_utxos
               SET satoshis = $4,
@@ -306,12 +393,92 @@ async function admitWalletFunding(walletIndex: number, address: string): Promise
           )
         }
       }
-      // Live row (locked or not): leave alone — workers own it.
       void row.locked
     }
 
     return { admitted, revived }
   })
+}
+
+async function admitWalletFunding(walletIndex: number, address: string): Promise<{ admitted: number; revived: number }> {
+  const [balanceSats, overlaySats] = await Promise.all([
+    fetchConfirmedBalance(address),
+    fetchOverlayLiveSats(walletIndex),
+  ])
+  const gapSats = balanceSats - overlaySats
+  const state = getScanState(address)
+
+  if (gapSats < MIN_SATS) {
+    state.cursor = 0
+    return { admitted: 0, revived: 0 }
+  }
+
+  // Mid-sweep always continues; a fresh sweep only starts if the chain balance
+  // moved or the previous sweep has aged out.
+  const sweepAgedOut = Date.now() - state.lastSweepAt >= SWEEP_BACKOFF_MS
+  const balanceMoved = balanceSats !== state.lastSweepBalanceSats
+  if (state.cursor === 0 && !sweepAgedOut && !balanceMoved) {
+    return { admitted: 0, revived: 0 }
+  }
+
+  // 1) History-first — finds recent top-ups without paging the dust pile.
+  try {
+    const fromHistory = await discoverFundingViaHistory(address)
+    if (fromHistory.length > 0) {
+      console.log(
+        `💰 [funding-admit] W${walletIndex + 1} history-hit: ${fromHistory.length} funding candidate(s) ` +
+          `for gap=${gapSats.toLocaleString()} sats ` +
+          `(chain=${balanceSats.toLocaleString()} overlay=${overlaySats.toLocaleString()})`,
+      )
+      const result = await admitCandidates(walletIndex, address, fromHistory)
+      if (result.admitted > 0 || result.revived > 0) {
+        // Funding landed — drop any mid-sweep cursor; next cycle re-checks gap.
+        state.cursor = 0
+        return result
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `⚠️  [funding-admit] W${walletIndex + 1} history scan failed: ` +
+        `${err instanceof Error ? err.message : String(err)} — falling back to unspent pagination`,
+    )
+  }
+
+  // 2) Fallback: cursor-resumed unspent pagination (covers older funding not
+  //    present in the recent history window).
+  const cursor = state.cursor
+  const scan = await scanUnspentForFunding(address, cursor)
+  state.cursor = scan.nextCursor
+  if (scan.reachedEnd) {
+    state.lastSweepAt = Date.now()
+    state.lastSweepBalanceSats = balanceSats
+  }
+  console.log(
+    `💰 [funding-admit] W${walletIndex + 1} gap=${gapSats.toLocaleString()} sats ` +
+      `(chain=${balanceSats.toLocaleString()} overlay=${overlaySats.toLocaleString()}) — ` +
+      `scanned ${scan.scanned.toLocaleString()} outputs from ${cursor.toLocaleString()}, ` +
+      `${scan.candidates.length} funding candidate(s)` +
+      `${scan.reachedEnd ? ', sweep complete' : `, resuming at ${scan.nextCursor.toLocaleString()}`}`,
+  )
+
+  return admitCandidates(walletIndex, address, scan.candidates)
+}
+
+function anyMidSweep(): boolean {
+  for (const st of scanStateByAddress.values()) {
+    if (st.cursor > 0) return true
+  }
+  return false
+}
+
+function scheduleNext(delayMs: number): void {
+  if (timer) clearTimeout(timer)
+  timer = setTimeout(() => {
+    void runCycle().finally(() => {
+      // Mid-sweep resumes quickly; idle wallets keep the long interval.
+      scheduleNext(anyMidSweep() ? RESUME_INTERVAL_MS : INTERVAL_MS)
+    })
+  }, delayMs)
 }
 
 async function runCycle(): Promise<void> {
@@ -355,21 +522,17 @@ export function startWalletFundingAdmit(): void {
   }
   if (timer) return
   // Stagger after funding-monitor (30s) so Bitails + DB load do not stack.
-  setTimeout(() => {
-    void runCycle()
-    timer = setInterval(() => {
-      void runCycle()
-    }, INTERVAL_MS)
-  }, 90_000)
+  scheduleNext(90_000)
   console.log(
-    `💰 [funding-admit] started: intervalMs=${INTERVAL_MS} minSats=${MIN_SATS} ` +
-      `minConf=${MIN_CONFIRMATIONS} pagesPerCycle=${PAGES_PER_CYCLE} source=bitails`,
+    `💰 [funding-admit] started: intervalMs=${INTERVAL_MS} resumeMs=${RESUME_INTERVAL_MS} ` +
+      `minSats=${MIN_SATS} minConf=${MIN_CONFIRMATIONS} pagesPerCycle=${PAGES_PER_CYCLE} ` +
+      `historyLimit=${HISTORY_LIMIT} source=bitails`,
   )
 }
 
 export function stopWalletFundingAdmit(): void {
   if (timer) {
-    clearInterval(timer)
+    clearTimeout(timer)
     timer = null
   }
 }

@@ -182,7 +182,11 @@ interface LockedInput {
  * Largest-first: starvation is cleared fastest by the highest-value dust, and
  * every candidate is already below the split floor.
  */
-async function lockDustBatch(binding: WalletBinding, lockedBy: string): Promise<LockedInput[]> {
+async function lockDustBatch(
+  binding: WalletBinding,
+  lockedBy: string,
+  includeUnconfirmed: boolean,
+): Promise<LockedInput[]> {
   return withOverlayTransaction(async (client) => {
     await client.query(`SET LOCAL statement_timeout = ${STATEMENT_TIMEOUT_MS}`)
 
@@ -203,7 +207,7 @@ async function lockDustBatch(binding: WalletBinding, lockedBy: string): Promise<
         binding.walletIndex,
         MIN_INPUT_SATS,
         maxInputSats(),
-        INCLUDE_UNCONFIRMED,
+        includeUnconfirmed,
         UNCONFIRMED_MIN_AGE_SECONDS,
         BATCH_SIZE,
       ],
@@ -423,12 +427,16 @@ interface WalletResult {
   archived: number
 }
 
-async function consolidateWallet(binding: WalletBinding, lockedBy: string): Promise<WalletResult> {
+async function consolidateWallet(
+  binding: WalletBinding,
+  lockedBy: string,
+  includeUnconfirmed: boolean,
+): Promise<WalletResult> {
   const result: WalletResult = { batches: 0, inputsSpent: 0, satsRecovered: 0, archived: 0 }
   const floor = splitFloorSats()
 
   for (let batch = 0; batch < MAX_BATCHES_PER_WALLET; batch++) {
-    const inputs = await lockDustBatch(binding, lockedBy)
+    const inputs = await lockDustBatch(binding, lockedBy, includeUnconfirmed)
     if (inputs.length === 0) break
 
     const inputSum = inputs.reduce((acc, i) => acc + i.satoshis, 0)
@@ -530,14 +538,25 @@ async function runCycle(): Promise<void> {
       const largestUsable = confirmedOnly ? diag.largestConfirmedSats : diag.largestSats
       if (largestUsable >= trigger) continue
 
+      // Prefer confirmed dust. If the heap is entirely confirmed=false (the
+      // production failure mode after a write storm), fall back to aged
+      // unconfirmed dust so the wallet can self-heal without a manual script.
+      const allowUnconfirmed =
+        INCLUDE_UNCONFIRMED ||
+        (diag.largestConfirmedSats < splitFloorSats() && diag.totalLiveSats >= splitFloorSats())
+
       console.warn(
         `♻️  [auto-consolidate] ${binding.label} below split capital: largest usable ` +
           `${largestUsable.toLocaleString()} sats < trigger ${trigger.toLocaleString()} ` +
           `(live=${diag.totalLiveUtxos.toLocaleString()} utxos / ${diag.totalLiveSats.toLocaleString()} sats). ` +
-          `Sweeping dust below ${maxInputSats().toLocaleString()} sats.`,
+          `Sweeping dust below ${maxInputSats().toLocaleString()} sats` +
+          `${allowUnconfirmed ? ' (incl. aged unconfirmed)' : ''}.`,
       )
 
-      const res = await consolidateWallet(binding, lockedBy)
+      let res = await consolidateWallet(binding, lockedBy, false)
+      if (res.batches === 0 && res.archived === 0 && allowUnconfirmed) {
+        res = await consolidateWallet(binding, lockedBy, true)
+      }
       if (res.batches === 0 && res.archived === 0) {
         console.warn(
           `♻️  [auto-consolidate] ${binding.label}: no eligible dust to sweep — ` +

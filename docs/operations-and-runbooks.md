@@ -155,17 +155,20 @@ No PM2 restart is required after funding. Opt out with
 pages, and a wallet holding tens of thousands of dust outputs can push a fresh
 top-up well past any fixed scan depth — in August 2026 that silently left three
 funded wallets STARVED because the scan stopped at 10 000 outputs. Each cycle
-now compares the address' confirmed chain balance with the sats the wallet
-already holds in `overlay_admitted_utxos`:
+now:
 
-- gap below `BSV_FUNDING_ADMIT_MIN_SATS` → one balance request, no paging
-- gap at or above it → page from a persisted cursor, `BSV_FUNDING_ADMIT_PAGES_PER_CYCLE`
-  pages (default 250 = 25 000 outputs) per cycle, resuming next cycle until the
-  address is fully swept
+1. Compares the address' confirmed chain balance with overlay live sats
+   (gap below `BSV_FUNDING_ADMIT_MIN_SATS` → one balance request, done).
+2. **History-first:** recent Bitails address history (newest first) for receives
+   ≥ minSats, then resolves each TX's unspent outputs to this address. A fresh
+   top-up is admitted in seconds without paging the dust pile.
+3. Fallback: cursor-resumed unspent pagination
+   (`BSV_FUNDING_ADMIT_PAGES_PER_CYCLE`, default 250 = 25 000 outputs), with
+   mid-sweep resumes every `BSV_FUNDING_ADMIT_RESUME_INTERVAL_MS` (default 30 s)
+   instead of waiting the full 5-minute idle interval.
 
-A completed sweep that admitted nothing will not re-run until the chain balance
-moves or `BSV_FUNDING_ADMIT_SWEEP_BACKOFF_MS` (default 6 h) elapses, so a wallet
-whose inventory is permanently below its chain balance cannot loop on Bitails.
+A completed unspent sweep that admitted nothing will not re-run until the chain
+balance moves or `BSV_FUNDING_ADMIT_SWEEP_BACKOFF_MS` (default 6 h) elapses.
 
 Watch it with:
 
