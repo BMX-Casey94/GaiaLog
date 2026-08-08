@@ -49,8 +49,13 @@ const nextConfig = {
   webpack: (config, { isServer }) => {
     // Force single instance of 'bsv' to avoid duplicate-module warnings
     config.resolve = config.resolve || {}
-    config.resolve.alias = config.resolve.alias || {}
-    config.resolve.alias['bsv'] = require.resolve('bsv', { paths: [__dirname] })
+    config.resolve.alias = {
+      ...(config.resolve.alias || {}),
+      // Explicit repo-root alias — some VPS builds failed to resolve `@/components/...`
+      // when tsconfig paths lacked baseUrl / Next did not inject the mapping.
+      '@': path.join(__dirname),
+      bsv: require.resolve('bsv', { paths: [__dirname] }),
+    }
     // Ensure server bundles use the single Node runtime copy of bsv
     if (isServer) {
       config.externals = config.externals || []
