@@ -27,6 +27,8 @@ export interface StoredReading {
   provider: string | null
   blockHeight: number
   blockTime: number | null
+  /** True once mined (1+ confirmation). May be true even if blockHeight is still 0. */
+  confirmed?: boolean
 }
 
 export interface SearchParams {
@@ -791,6 +793,7 @@ function rowToReading(row: any): StoredReading {
   if (metrics.lon == null && row.lon != null) metrics.lon = row.lon
   if (metrics.latitude == null && row.lat != null) metrics.latitude = row.lat
   if (metrics.longitude == null && row.lon != null) metrics.longitude = row.lon
+  const blockHeight = Number(row.block_height) || 0
   return {
     txid: row.txid,
     dataType,
@@ -800,7 +803,8 @@ function rowToReading(row: any): StoredReading {
     timestamp: new Date(row.timestamp).getTime(),
     metrics,
     provider: row.provider,
-    blockHeight: row.block_height,
+    blockHeight,
     blockTime: row.block_time ? new Date(row.block_time).getTime() : null,
+    confirmed: Boolean(row.confirmed) || blockHeight > 0,
   }
 }

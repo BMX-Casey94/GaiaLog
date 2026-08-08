@@ -85,7 +85,8 @@ interface CandidateTxid {
 async function fetchCandidates(): Promise<CandidateTxid[]> {
   const minAge = `${MIN_AGE_SECONDS} seconds`
   const maxAge = `${MAX_AGE_HOURS} hours`
-  const result = await query<CandidateTxid>(
+  // Primary window: recent unconfirmed broadcasts the worker actively chases.
+  const primary = await query<CandidateTxid>(
     `SELECT txid
        FROM overlay_explorer_readings
       WHERE confirmed = false
@@ -95,7 +96,29 @@ async function fetchCandidates(): Promise<CandidateTxid[]> {
       LIMIT $3`,
     [minAge, maxAge, BATCH_SIZE],
   )
-  return result.rows
+
+  const primaryRows = primary.rows || []
+  if (primaryRows.length >= BATCH_SIZE) return primaryRows
+
+  // Catch-up: older rows that aged out of the chase window while still
+  // unconfirmed (worker downtime / WoC rate-limits). Small residual batch only.
+  const residual = BATCH_SIZE - primaryRows.length
+  const stale = await query<CandidateTxid>(
+    `SELECT txid
+       FROM overlay_explorer_readings
+      WHERE confirmed = false
+        AND reading_ts <= now() - $1::interval
+        AND reading_ts > now() - INTERVAL '30 days'
+      ORDER BY reading_ts DESC
+      LIMIT $2`,
+    [maxAge, residual],
+  )
+
+  const seen = new Set(primaryRows.map((r) => r.txid))
+  for (const row of stale.rows || []) {
+    if (!seen.has(row.txid)) primaryRows.push(row)
+  }
+  return primaryRows
 }
 
 interface WocTxStatus {
@@ -140,9 +163,13 @@ async function lookupTxStatus(txid: string): Promise<WocTxStatus | null | 'rate-
       typeof body.blockheight === 'number' ? body.blockheight :
       typeof body.blockHeight === 'number' ? body.blockHeight :
       null
+    const confirmations =
+      typeof body.confirmations === 'number' ? body.confirmations : 0
 
-    if (!blockHeightRaw || blockHeightRaw <= 0) {
-      // Returned but not yet in a block — caller will retry next cycle.
+    // On BSV, confirmations >= 1 means mined (including the first confirmation).
+    // Some WoC payloads expose confirmations/blockhash before blockheight is filled.
+    const mined = (blockHeightRaw != null && blockHeightRaw > 0) || confirmations >= 1
+    if (!mined) {
       return null
     }
 
@@ -152,7 +179,7 @@ async function lookupTxStatus(txid: string): Promise<WocTxStatus | null | 'rate-
       null
 
     return {
-      blockHeight: blockHeightRaw,
+      blockHeight: blockHeightRaw != null && blockHeightRaw > 0 ? blockHeightRaw : null,
       blockTime: blockTimeRaw ? new Date(blockTimeRaw * 1000) : null,
     }
   } catch {
@@ -163,8 +190,8 @@ async function lookupTxStatus(txid: string): Promise<WocTxStatus | null | 'rate-
 }
 
 async function applyConfirmation(txid: string, status: WocTxStatus): Promise<void> {
-  const blockHeight = status.blockHeight ?? 0
-  if (blockHeight <= 0) return
+  // Height may be unknown briefly even when confirmations >= 1 — still flip confirmed.
+  const blockHeight = status.blockHeight != null && status.blockHeight > 0 ? status.blockHeight : 0
 
   await confirmReading(txid, blockHeight, status.blockTime)
 
@@ -185,7 +212,10 @@ async function applyConfirmation(txid: string, status: WocTxStatus): Promise<voi
     await query(
       `UPDATE tx_log
           SET status = 'confirmed',
-              block_height = GREATEST(COALESCE(block_height, 0), $2),
+              block_height = CASE
+                WHEN $2 > 0 THEN GREATEST(COALESCE(block_height, 0), $2)
+                ELSE COALESCE(block_height, 0)
+              END,
               onchain_at   = COALESCE(onchain_at, $3)
         WHERE txid = $1
           AND status <> 'confirmed'`,
@@ -224,7 +254,7 @@ async function runCycle(): Promise<void> {
         break
       }
 
-      if (result && result.blockHeight && result.blockHeight > 0) {
+      if (result) {
         try {
           await applyConfirmation(txid, result)
           confirmed++

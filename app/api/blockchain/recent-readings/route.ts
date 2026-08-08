@@ -44,7 +44,9 @@ export async function GET(req: NextRequest) {
               type: r.data_family,
               location: r.location,
               timestamp: r.reading_ts,
-              status: r.confirmed ? 'confirmed' : 'pending',
+              // 1+ on-chain confirmation (or a stored block height) = confirmed.
+              // "pending" is reserved for mempool / not-yet-mined broadcasts only.
+              status: (r.confirmed || Number(r.block_height) > 0) ? 'confirmed' : 'pending',
               data: {
                 provider: r.provider_id || 'unknown',
                 metrics: r.metrics_preview ?? {},

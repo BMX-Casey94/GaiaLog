@@ -19,6 +19,7 @@ export interface ExplorerReading {
   metrics: Record<string, any>
   provider: string | null
   blockHeight: number
+  confirmed?: boolean
   wocUrl: string
 }
 

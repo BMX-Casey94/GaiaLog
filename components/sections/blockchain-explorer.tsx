@@ -159,7 +159,7 @@ export function BlockchainExplorer() {
                                 ? "bg-yellow-900/50 text-yellow-400 rounded-sm"
                                 : "bg-green-900/50 text-green-400 rounded-sm"}
                             >
-                              {tx.status}
+                              {tx.status === 'pending' ? 'Unconfirmed' : 'Confirmed'}
                             </Badge>
                           </div>
                           <Button

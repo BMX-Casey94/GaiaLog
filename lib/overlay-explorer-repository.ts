@@ -83,12 +83,21 @@ export async function confirmReading(
   blockHeight: number,
   blockTime: Date | null,
 ): Promise<void> {
+  // Height may be 0 when WoC reports confirmations>=1 without blockheight yet.
+  // Still mark confirmed; back-fill height when a positive value arrives later.
   await query(
     `UPDATE overlay_explorer_readings
         SET confirmed = true,
-            block_height = GREATEST(block_height, $2),
+            block_height = CASE
+              WHEN $2 > 0 THEN GREATEST(COALESCE(block_height, 0), $2)
+              ELSE COALESCE(block_height, 0)
+            END,
             block_time = COALESCE($3, block_time)
-      WHERE txid = $1 AND NOT confirmed`,
+      WHERE txid = $1
+        AND (
+          NOT confirmed
+          OR ($2 > 0 AND COALESCE(block_height, 0) < $2)
+        )`,
     [txid, blockHeight, blockTime],
   )
 }
@@ -120,7 +129,7 @@ export async function searchReadings(params: SearchParams): Promise<{
       `SELECT
          txid, data_family, location, lat, lon,
          reading_ts, provider_id, block_height, block_time,
-         metrics_preview
+         confirmed, metrics_preview
        FROM overlay_explorer_readings
        ${whereSql}
        ORDER BY reading_ts DESC
@@ -475,12 +484,13 @@ export async function getLatestReadingsWithMetrics(
     confirmed: boolean
   }>(
     `SELECT DISTINCT ON (data_family)
-       txid, data_family, location, reading_ts, provider_id, metrics_preview, block_height, confirmed
+       txid, data_family, location, reading_ts, provider_id, metrics_preview, block_height,
+       (confirmed OR COALESCE(block_height, 0) > 0) AS confirmed
      FROM overlay_explorer_readings
      WHERE data_family = ANY($1::text[])
        AND reading_ts > NOW() - INTERVAL '7 days'
-       AND (confirmed = true OR reading_ts > NOW() - INTERVAL '2 hours')
-     ORDER BY data_family, confirmed DESC, reading_ts DESC`,
+       AND (confirmed = true OR COALESCE(block_height, 0) > 0 OR reading_ts > NOW() - INTERVAL '2 hours')
+     ORDER BY data_family, (confirmed OR COALESCE(block_height, 0) > 0) DESC, reading_ts DESC`,
     [families],
   )
   return result.rows || []
@@ -502,12 +512,13 @@ export async function getRecentReadingsByFamily(
     confirmed: boolean
   }>(
     `SELECT DISTINCT ON (data_family)
-       txid, data_family, location, reading_ts, provider_id, block_height, confirmed
+       txid, data_family, location, reading_ts, provider_id, block_height,
+       (confirmed OR COALESCE(block_height, 0) > 0) AS confirmed
      FROM overlay_explorer_readings
      WHERE data_family = ANY($1::text[])
        AND reading_ts > NOW() - INTERVAL '7 days'
-       AND (confirmed = true OR reading_ts > NOW() - INTERVAL '2 hours')
-     ORDER BY data_family, confirmed DESC, reading_ts DESC`,
+       AND (confirmed = true OR COALESCE(block_height, 0) > 0 OR reading_ts > NOW() - INTERVAL '2 hours')
+     ORDER BY data_family, (confirmed OR COALESCE(block_height, 0) > 0) DESC, reading_ts DESC`,
     [families],
   )
   return result.rows || []
@@ -616,7 +627,8 @@ function overlayRowToStoredReading(row: any): StoredReading {
     timestamp: new Date(row.reading_ts).getTime(),
     metrics,
     provider: row.provider_id,
-    blockHeight: row.block_height ?? 0,
+    blockHeight: Number(row.block_height) || 0,
     blockTime: row.block_time ? new Date(row.block_time).getTime() : null,
+    confirmed: Boolean(row.confirmed) || Number(row.block_height) > 0,
   }
 }
