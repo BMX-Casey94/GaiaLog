@@ -414,37 +414,42 @@ export async function upsertTxLog(entry: {
 }
 
 
-// On-chain per-transaction copies (non-destructive; created lazily)
+// On-chain per-transaction copies (non-destructive; created lazily).
+// Assign the Promise synchronously before awaiting so concurrent first
+// callers share one CREATE instead of racing dozens of identical DDL
+// statements (visible as CREATE TABLE spam in Supabase logs).
 let _onchainTablesReady: Promise<void> | null = null
 
 function ensureOnchainTables(): Promise<void> {
   if (!_onchainTablesReady) {
-    _onchainTablesReady = query(`
-      CREATE TABLE IF NOT EXISTS air_quality_onchain (
-        txid text PRIMARY KEY,
-        provider text,
-        collected_at timestamptz,
-        payload jsonb
-      );
-      CREATE TABLE IF NOT EXISTS water_levels_onchain (
-        txid text PRIMARY KEY,
-        provider text,
-        collected_at timestamptz,
-        payload jsonb
-      );
-      CREATE TABLE IF NOT EXISTS seismic_onchain (
-        txid text PRIMARY KEY,
-        provider text,
-        collected_at timestamptz,
-        payload jsonb
-      );
-      CREATE TABLE IF NOT EXISTS advanced_metrics_onchain (
-        txid text PRIMARY KEY,
-        provider text,
-        collected_at timestamptz,
-        payload jsonb
-      );
-    `).then(() => {}).catch((err) => {
+    _onchainTablesReady = (async () => {
+      await query(`
+        CREATE TABLE IF NOT EXISTS air_quality_onchain (
+          txid text PRIMARY KEY,
+          provider text,
+          collected_at timestamptz,
+          payload jsonb
+        );
+        CREATE TABLE IF NOT EXISTS water_levels_onchain (
+          txid text PRIMARY KEY,
+          provider text,
+          collected_at timestamptz,
+          payload jsonb
+        );
+        CREATE TABLE IF NOT EXISTS seismic_onchain (
+          txid text PRIMARY KEY,
+          provider text,
+          collected_at timestamptz,
+          payload jsonb
+        );
+        CREATE TABLE IF NOT EXISTS advanced_metrics_onchain (
+          txid text PRIMARY KEY,
+          provider text,
+          collected_at timestamptz,
+          payload jsonb
+        );
+      `)
+    })().catch((err) => {
       _onchainTablesReady = null
       throw err
     })

@@ -169,20 +169,17 @@ async function applyConfirmation(txid: string, blockHeight: number, blockTime: D
     [txid],
   )
   try {
+    // tx_log has no block_height column — only flip status / onchain_at.
     await query(
       `UPDATE tx_log
           SET status = 'confirmed',
-              block_height = CASE
-                WHEN $2 > 0 THEN GREATEST(COALESCE(block_height, 0), $2)
-                ELSE COALESCE(block_height, 0)
-              END,
-              onchain_at = COALESCE(onchain_at, $3)
+              onchain_at = COALESCE(onchain_at, $2)
         WHERE txid = $1
-          AND (status IS DISTINCT FROM 'confirmed' OR COALESCE(block_height, 0) = 0)`,
-      [txid, blockHeight, blockTime],
+          AND status IS DISTINCT FROM 'confirmed'`,
+      [txid, blockTime ?? new Date()],
     )
   } catch {
-    // tx_log schema variants — best effort only.
+    // Best effort — explorer row is the source of truth for UI.
   }
 }
 

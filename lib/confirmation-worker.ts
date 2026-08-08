@@ -8,7 +8,8 @@
  *
  *   - overlay_explorer_readings: confirmed=true, block_height, block_time
  *   - overlay_admitted_utxos:    confirmed=true (where txid matches)
- *   - tx_log:                    status='confirmed', block_height, onchain_at
+ *   - tx_log:                    status='confirmed', onchain_at
+ *                                (tx_log has no block_height column — do not SET it)
  *
  * Without this worker, *nothing* in the pipeline ever transitions a row to
  * `confirmed=true`.  That:
@@ -212,24 +213,19 @@ async function applyConfirmation(txid: string, status: WocTxStatus): Promise<voi
     [txid],
   )
 
-  // tx_log status, if a row exists.  Best-effort — schema variants observed
-  // in the wild use either `status`/`onchain_at`/`block_height` or just
-  // `confirmed_at`.  Try the richest shape first, fall back gracefully.
+  // tx_log has status + onchain_at only (no block_height — that lives on
+  // overlay_explorer_readings). Updating a non-existent column flooded
+  // Supabase with 42703 errors even though the catch swallowed them.
   try {
     await query(
       `UPDATE tx_log
           SET status = 'confirmed',
-              block_height = CASE
-                WHEN $2 > 0 THEN GREATEST(COALESCE(block_height, 0), $2)
-                ELSE COALESCE(block_height, 0)
-              END,
-              onchain_at   = COALESCE(onchain_at, $3)
+              onchain_at = COALESCE(onchain_at, $2)
         WHERE txid = $1
           AND status <> 'confirmed'`,
-      [txid, blockHeight, status.blockTime ?? new Date()],
+      [txid, status.blockTime ?? new Date()],
     )
   } catch (err) {
-    // Older tx_log schemas — silently ignore so the worker keeps progressing.
     void err
   }
 }
