@@ -30,7 +30,8 @@
  *   BSV_CONFIRMATION_INTERVAL_MS=30000        - between cycles (default 30s)
  *   BSV_CONFIRMATION_BATCH_SIZE=30            - txids per cycle
  *   BSV_CONFIRMATION_MIN_AGE_SECONDS=60       - skip txids younger than this
- *   BSV_CONFIRMATION_MAX_AGE_HOURS=72         - stop chasing after this
+ *   BSV_CONFIRMATION_MAX_AGE_HOURS=72         - primary chase window
+ *   BSV_CONFIRMATION_CATCHUP_DAYS=400         - residual catch-up for stale rows
  *   BSV_CONFIRMATION_REQ_INTERVAL_MS=400      - per-request throttle
  *   BSV_CONFIRMATION_BACKOFF_MS=120000        - cool-down on rate limit
  */
@@ -49,6 +50,10 @@ const INTERVAL_MS = envInt('BSV_CONFIRMATION_INTERVAL_MS', 30_000, 5_000)
 const BATCH_SIZE = envInt('BSV_CONFIRMATION_BATCH_SIZE', 30, 1)
 const MIN_AGE_SECONDS = envInt('BSV_CONFIRMATION_MIN_AGE_SECONDS', 60, 0)
 const MAX_AGE_HOURS = envInt('BSV_CONFIRMATION_MAX_AGE_HOURS', 72, 1)
+// Residual catch-up for rows that aged out of the primary window while still
+// unconfirmed (worker downtime / WoC 429s). Default ~13 months so months-old
+// explorer "Unconfirmed" badges eventually clear without a manual backfill.
+const CATCHUP_DAYS = envInt('BSV_CONFIRMATION_CATCHUP_DAYS', 400, 30)
 const REQ_INTERVAL_MS = envInt('BSV_CONFIRMATION_REQ_INTERVAL_MS', 400, 200)
 const BACKOFF_MS = envInt('BSV_CONFIRMATION_BACKOFF_MS', 120_000, 5_000)
 
@@ -101,17 +106,19 @@ async function fetchCandidates(): Promise<CandidateTxid[]> {
   if (primaryRows.length >= BATCH_SIZE) return primaryRows
 
   // Catch-up: older rows that aged out of the chase window while still
-  // unconfirmed (worker downtime / WoC rate-limits). Small residual batch only.
+  // unconfirmed (worker downtime / WoC rate-limits). Small residual batch only;
+  // for multi-month backlogs use scripts/backfill-explorer-confirmations.ts.
   const residual = BATCH_SIZE - primaryRows.length
+  const catchup = `${CATCHUP_DAYS} days`
   const stale = await query<CandidateTxid>(
     `SELECT txid
        FROM overlay_explorer_readings
       WHERE confirmed = false
         AND reading_ts <= now() - $1::interval
-        AND reading_ts > now() - INTERVAL '30 days'
+        AND reading_ts > now() - $2::interval
       ORDER BY reading_ts DESC
-      LIMIT $2`,
-    [maxAge, residual],
+      LIMIT $3`,
+    [maxAge, catchup, residual],
   )
 
   const seen = new Set(primaryRows.map((r) => r.txid))
@@ -292,7 +299,8 @@ export function startConfirmationWorker(): void {
   }, 10_000)
   console.log(
     `[confirmation-worker] started: intervalMs=${INTERVAL_MS} batch=${BATCH_SIZE} ` +
-    `minAgeSec=${MIN_AGE_SECONDS} maxAgeHr=${MAX_AGE_HOURS} reqIntervalMs=${REQ_INTERVAL_MS}`,
+    `minAgeSec=${MIN_AGE_SECONDS} maxAgeHr=${MAX_AGE_HOURS} catchupDays=${CATCHUP_DAYS} ` +
+      `reqIntervalMs=${REQ_INTERVAL_MS}`,
   )
 }
 

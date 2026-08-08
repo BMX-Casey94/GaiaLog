@@ -453,6 +453,9 @@ export interface InventoryDiagnostic {
   largestSats: number
   largestConfirmedSats: number
   largestConfirmedReserveSats: number
+  /** Largest live pool-role UTXO (what writeToChain actually spends). */
+  largestPoolSats: number
+  largestConfirmedPoolSats: number
   totalLiveSats: number
   confirmedLiveSats: number
 }
@@ -477,6 +480,8 @@ export async function getInventoryDiagnostic(walletIndex: number): Promise<Inven
       largest_sats: string
       largest_confirmed_sats: string
       largest_confirmed_reserve_sats: string
+      largest_pool_sats: string
+      largest_confirmed_pool_sats: string
       total_live_sats: string
       confirmed_live_sats: string
     }>(
@@ -488,6 +493,8 @@ export async function getInventoryDiagnostic(walletIndex: number): Promise<Inven
          COALESCE(MAX(satoshis) FILTER (WHERE removed = false), 0)::text AS largest_sats,
          COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text AS largest_confirmed_sats,
          COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true AND utxo_role = 'reserve'), 0)::text AS largest_confirmed_reserve_sats,
+         COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND utxo_role = 'pool'), 0)::text AS largest_pool_sats,
+         COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true AND utxo_role = 'pool'), 0)::text AS largest_confirmed_pool_sats,
          COALESCE(SUM(satoshis) FILTER (WHERE removed = false), 0)::text AS total_live_sats,
          COALESCE(SUM(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text AS confirmed_live_sats
        FROM overlay_admitted_utxos
@@ -504,6 +511,8 @@ export async function getInventoryDiagnostic(walletIndex: number): Promise<Inven
       largestSats: Number(row?.largest_sats || '0'),
       largestConfirmedSats: Number(row?.largest_confirmed_sats || '0'),
       largestConfirmedReserveSats: Number(row?.largest_confirmed_reserve_sats || '0'),
+      largestPoolSats: Number(row?.largest_pool_sats || '0'),
+      largestConfirmedPoolSats: Number(row?.largest_confirmed_pool_sats || '0'),
       totalLiveSats: Number(row?.total_live_sats || '0'),
       confirmedLiveSats: Number(row?.confirmed_live_sats || '0'),
     }

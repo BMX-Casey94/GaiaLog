@@ -76,6 +76,40 @@ If UTXO lookups fail with `404`, verify:
 - `BSV_OVERLAY_LOOKUP_URL` and `BSV_OVERLAY_SUBMIT_URL` match the actual service routes
 - the overlay service is bound to the expected host and port
 
+### Explorer shows "Unconfirmed" for months-old TXs
+
+The live confirmation worker chases a recent window plus a residual catch-up
+(`BSV_CONFIRMATION_CATCHUP_DAYS`, default 400). Multi-month backlogs from
+before the worker existed (or from prolonged WoC 429 outages) still need a
+one-shot backfill. Safe while workers are running:
+
+```bash
+cd /opt/gaialog
+npx tsx scripts/backfill-explorer-confirmations.ts
+npx tsx scripts/backfill-explorer-confirmations.ts --apply --limit 2000
+# re-run until remaining ≈ 0
+npx tsx scripts/backfill-explorer-confirmations.ts --apply --limit 5000
+```
+
+Uses Bitails (not WhatsOnChain) so it does not steal the confirmation worker's
+WoC quota. Idempotent — already-confirmed rows are skipped.
+
+### Explorer 500: `timeout exceeded when trying to connect`
+
+This is a **Postgres pool connect timeout**, not a BSV/explorer logic bug.
+`gaialog-web` could not obtain a free client from `pg` within
+`PG_CONNECT_TIMEOUT_MS` (default 15s). Under write recovery the workers hold
+many connections; the web process then fails intermittent `/api/explorer/*`
+reads with HTTP 500.
+
+Mitigations:
+- Prefer Supavisor **transaction** mode (port `6543`) for the web process
+- Keep `PGPOOL_MAX` modest per process (default 10) — three PM2 apps × 10 can
+  exhaust a small pooler plan
+- Watch `pm2 logs gaialog-web` for the timeout string during spikes
+- After heavy consolidation / funding-admit storms, give the pool a minute to
+  drain before treating explorer 500s as a separate outage
+
 ### Explorer writing to the wrong table
 
 If you see writes targeting legacy explorer storage when the overlay-backed table is the real path, set:

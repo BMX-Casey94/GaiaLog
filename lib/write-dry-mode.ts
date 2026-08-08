@@ -18,11 +18,13 @@
  * Detection
  * ---------
  * Gating on UTXO *counts* is unsafe: a wallet can hold hundreds of thousands
- * of sub-fee dust rows and still be unable to fund a single write. We
- * therefore gate on the *largest single spendable UTXO* per wallet, since a
- * BSV write is funded from one input:
+ * of sub-fee dust rows and still be unable to fund a single write. We also
+ * must not treat `reserve` capital as write-ready — `writeToChain` only
+ * acquires `pool` UTXOs; reserves exist for the splitter. After a consolidate
+ * or funding revive the wallets can hold large reserves while the pool is
+ * empty, which previously left dry-mode OFF and produced a retry storm.
  *
- *   dry  ⟺  max(largest usable UTXO across all wallets) < MIN_INPUT_SATS
+ *   dry  ⟺  max(largest usable POOL UTXO across all wallets) < MIN_INPUT_SATS
  *
  * `MIN_INPUT_SATS` defaults to the maintainer's split output size, which is
  * exactly the denomination the system mints for writes. When
@@ -66,6 +68,8 @@ export interface DryModeWalletSnapshot {
   walletIndex: number
   largestSats: number
   largestConfirmedSats: number
+  largestPoolSats: number
+  largestConfirmedPoolSats: number
   totalLiveSats: number
   usable: boolean
 }
@@ -152,13 +156,17 @@ async function evaluate(): Promise<void> {
   for (let walletIndex = 0; walletIndex < walletCount; walletIndex++) {
     try {
       const diag = await getInventoryDiagnostic(walletIndex)
-      const largestUsable = confirmedOnly ? diag.largestConfirmedSats : diag.largestSats
+      // Writes only acquire pool-role UTXOs. Reserve capital is for the
+      // splitter and must not keep dry-mode disengaged.
+      const largestPool = confirmedOnly ? diag.largestConfirmedPoolSats : diag.largestPoolSats
       snapshots.push({
         walletIndex,
         largestSats: diag.largestSats,
         largestConfirmedSats: diag.largestConfirmedSats,
+        largestPoolSats: diag.largestPoolSats,
+        largestConfirmedPoolSats: diag.largestConfirmedPoolSats,
         totalLiveSats: diag.totalLiveSats,
-        usable: largestUsable >= floor,
+        usable: largestPool >= floor,
       })
     } catch (err) {
       failures++
@@ -180,7 +188,7 @@ async function evaluate(): Promise<void> {
   state.lastCheckedAt = Date.now()
   state.wallets = snapshots
   state.largestUsableSats = snapshots.reduce(
-    (max, s) => Math.max(max, confirmedOnly ? s.largestConfirmedSats : s.largestSats),
+    (max, s) => Math.max(max, confirmedOnly ? s.largestConfirmedPoolSats : s.largestPoolSats),
     0,
   )
 
@@ -191,8 +199,8 @@ async function evaluate(): Promise<void> {
     if (state.dry) {
       const outageMs = state.sinceMs ? Date.now() - state.sinceMs : 0
       console.log(
-        `▶️  [write-dry-mode] CLEARED: spendable inventory restored ` +
-          `(largest=${state.largestUsableSats.toLocaleString()} sats ≥ floor=${floor.toLocaleString()}). ` +
+        `▶️  [write-dry-mode] CLEARED: pool inventory restored ` +
+          `(largestPool=${state.largestUsableSats.toLocaleString()} sats ≥ floor=${floor.toLocaleString()}). ` +
           `Outage lasted ${Math.round(outageMs / 60_000)} min; ` +
           `${state.suppressedWrites.toLocaleString()} write attempts were suppressed. Resuming writes.`,
       )
@@ -220,15 +228,16 @@ async function evaluate(): Promise<void> {
     const detail = snapshots
       .map(
         (s) =>
-          `W${s.walletIndex + 1}=[largest=${(confirmedOnly ? s.largestConfirmedSats : s.largestSats).toLocaleString()} ` +
+          `W${s.walletIndex + 1}=[pool=${(confirmedOnly ? s.largestConfirmedPoolSats : s.largestPoolSats).toLocaleString()} ` +
+          `largest=${(confirmedOnly ? s.largestConfirmedSats : s.largestSats).toLocaleString()} ` +
           `total=${s.totalLiveSats.toLocaleString()}]`,
       )
       .join(' ')
     console.error(
-      `⏸️  [write-dry-mode] ENGAGED: no wallet holds a spendable UTXO ≥ ${floor.toLocaleString()} sats ` +
+      `⏸️  [write-dry-mode] ENGAGED: no wallet holds a pool UTXO ≥ ${floor.toLocaleString()} sats ` +
         `(confirmedOnly=${confirmedOnly}). ${detail}. ` +
-        `Chain writes are now suppressed instead of failing in a retry loop. ` +
-        `ACTION: fund a wallet with a single confirmed UTXO; funding-admit will admit it and writes resume automatically.`,
+        `Chain writes are suppressed while the splitter refills the pool from reserve capital ` +
+        `(or until an external top-up is admitted).`,
     )
     return
   }
@@ -239,8 +248,9 @@ async function evaluate(): Promise<void> {
     const outageMs = state.sinceMs ? Date.now() - state.sinceMs : 0
     console.error(
       `⏸️  [write-dry-mode] still dry after ${Math.round(outageMs / 60_000)} min ` +
-        `(largest=${state.largestUsableSats.toLocaleString()} sats < floor=${floor.toLocaleString()}, ` +
-        `${state.suppressedWrites.toLocaleString()} writes suppressed). Awaiting funding.`,
+        `(largestPool=${state.largestUsableSats.toLocaleString()} sats < floor=${floor.toLocaleString()}, ` +
+        `${state.suppressedWrites.toLocaleString()} writes suppressed). ` +
+        `Awaiting pool refill (splitter) or funding admit.`,
     )
   }
 }
