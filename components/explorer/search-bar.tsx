@@ -162,12 +162,14 @@ export function SearchBar({
   }, [dropdownOpen, scheduleReposition])
 
   return (
-    <div ref={searchRef} className="relative max-w-2xl mx-auto mb-8">
+    <div ref={searchRef} className="relative max-w-2xl mx-auto mb-5 sm:mb-8 px-0">
       <div ref={inputWrapperRef} className="relative">
-        <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400 z-10" />
+        <Search className="absolute left-3 sm:left-4 top-1/2 -translate-y-1/2 h-4 w-4 sm:h-5 sm:w-5 text-slate-400 z-10" />
         <Input
           type="text"
-          placeholder="Search by location or coordinates (e.g. London, Tokyo, 47.14, 24.48...)"
+          placeholder="Search location or lat, lon…"
+          aria-label="Search by location or coordinates"
+          title="Search by location or coordinates (e.g. London, Tokyo, 47.14, 24.48)"
           value={searchQuery}
           onChange={(e) => {
             setSearchQuery(e.target.value)
@@ -180,7 +182,7 @@ export function SearchBar({
               onSubmit(searchQuery)
             }
           }}
-          className="w-full h-14 pl-12 pr-12 text-lg bg-black/40 backdrop-blur-sm border-slate-600/40 text-white placeholder:text-slate-500 focus:border-purple-500 rounded-xl"
+          className="w-full h-12 sm:h-14 pl-10 sm:pl-12 pr-10 sm:pr-12 text-base sm:text-lg bg-black/40 backdrop-blur-sm border-slate-600/40 text-white placeholder:text-slate-500 focus:border-purple-500 rounded-xl"
         />
         {searchQuery && (
           <button
@@ -189,9 +191,9 @@ export function SearchBar({
               onSubmit('')
             }}
             aria-label="Clear search"
-            className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white z-10"
+            className="absolute right-3 sm:right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white z-10"
           >
-            <X className="h-5 w-5" />
+            <X className="h-4 w-4 sm:h-5 sm:w-5" />
           </button>
         )}
       </div>

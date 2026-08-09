@@ -193,7 +193,7 @@ export function ExplorerClient() {
   return (
     <div className="min-h-screen bg-gradient-to-b from-black via-slate-950 to-black pt-0 pb-44 sm:pb-28">
       {/* ─── Hero Section ─── */}
-      <section className="relative overflow-hidden pt-32 pb-16 px-4 sm:px-6 lg:px-8">
+      <section className="relative overflow-hidden pt-28 sm:pt-32 pb-10 sm:pb-16 px-4 sm:px-6 lg:px-8">
         <div
           className="absolute inset-0"
           style={{
@@ -215,11 +215,11 @@ export function ExplorerClient() {
         </div>
 
         <div className="relative max-w-7xl mx-auto z-10">
-          <div className="text-center mb-10">
-            <h1 className="font-display text-4xl md:text-6xl font-bold mb-4 tracking-tight">
+          <div className="text-center mb-6 sm:mb-10">
+            <h1 className="font-display text-3xl sm:text-4xl md:text-6xl font-bold mb-3 sm:mb-4 tracking-tight">
               <span className="gradient-heading">Data Explorer</span>
             </h1>
-            <p className="text-sm md:text-lg text-slate-300 mb-2 max-w-3xl mx-auto leading-relaxed">
+            <p className="text-xs sm:text-sm md:text-lg text-slate-300 mb-2 max-w-3xl mx-auto leading-relaxed">
               Search and explore environmental data recorded immutably on the BSV blockchain.
             </p>
             <p className="hidden md:block text-base text-slate-400 max-w-4xl mx-auto">
