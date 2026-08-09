@@ -49,8 +49,38 @@ if (process.env.NODE_ENV !== 'production') {
   dotenv.config({ path: path.join(repoRoot, '.env.local'), override: true })
 }
 
-import { query } from '../lib/db'
+import { attachClientErrorHandler, dbPool, query } from '../lib/db'
 import { confirmReading } from '../lib/overlay-explorer-repository'
+
+/**
+ * Run a statement on a held client with an explicit timeout.
+ * Needed for pooler transaction mode (session SET does not stick across
+ * checkouts) and for the pre-index era where keyset pages can take >15s.
+ */
+async function queryWithTimeout<T extends Record<string, unknown> = any>(
+  text: string,
+  params: unknown[] | undefined,
+  timeoutMs: number,
+): Promise<{ rows: T[]; rowCount: number }> {
+  const client = await dbPool.connect()
+  attachClientErrorHandler(client)
+  try {
+    await client.query('BEGIN')
+    await client.query(`SET LOCAL statement_timeout = ${Math.max(1000, timeoutMs)}`)
+    const res = await client.query<T>(text, params)
+    await client.query('COMMIT')
+    return { rows: res.rows || [], rowCount: res.rowCount ?? 0 }
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK')
+    } catch {
+      // ignore
+    }
+    throw err
+  } finally {
+    client.release()
+  }
+}
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -77,6 +107,8 @@ const CONCURRENCY = Math.max(1, Number(argValue('--concurrency', '16')))
  * 60 ms this targets ~16/s; raise if you see sustained 429s.
  */
 const REQ_INTERVAL_MS = Math.max(0, Number(argValue('--req-interval-ms', '60')))
+/** Per-page DB fetch timeout (ms). Raise only if the partial index is missing. */
+const FETCH_TIMEOUT_MS = Math.max(5_000, Number(argValue('--fetch-timeout-ms', '120000')))
 const BITAILS_BASE = (process.env.BSV_BITAILS_API_BASE || 'https://api.bitails.io').replace(/\/$/, '')
 
 interface Candidate {
@@ -111,12 +143,20 @@ async function countStale(): Promise<number> {
   return Number(res.rows[0]?.c || '0')
 }
 
+function asReadingTsText(value: unknown): string {
+  if (value instanceof Date) return value.toISOString()
+  return String(value ?? '')
+}
+
 async function fetchBatch(afterTs: string | null, afterTxid: string | null, limit: number): Promise<Candidate[]> {
   // Keyset pagination on (reading_ts ASC, txid ASC) so we never re-scan the
   // same page when rows flip to confirmed mid-run.
+  // Prefer oer_unconfirmed_ts_txid_idx (partial WHERE confirmed = false).
+  // Keep reading_ts as timestamptz in SQL — casting to text in SELECT made
+  // plans sort on ((reading_ts)::text) and defeated the btree.
   if (afterTs == null) {
-    const res = await query<Candidate>(
-      `SELECT txid, reading_ts::text
+    const res = await queryWithTimeout<{ txid: string; reading_ts: Date | string }>(
+      `SELECT txid, reading_ts
          FROM overlay_explorer_readings
         WHERE confirmed = false
           AND reading_ts < now() - ($1::bigint * interval '1 day')
@@ -124,22 +164,33 @@ async function fetchBatch(afterTs: string | null, afterTxid: string | null, limi
         ORDER BY reading_ts ASC, txid ASC
         LIMIT $3`,
       [OLDER_THAN_DAYS, NEWER_THAN_DAYS, limit],
+      FETCH_TIMEOUT_MS,
     )
-    return res.rows || []
+    return (res.rows || []).map((row) => ({
+      txid: row.txid,
+      reading_ts: asReadingTsText(row.reading_ts),
+    }))
   }
 
-  const res = await query<Candidate>(
-    `SELECT txid, reading_ts::text
+  const res = await queryWithTimeout<{ txid: string; reading_ts: Date | string }>(
+    `SELECT txid, reading_ts
        FROM overlay_explorer_readings
       WHERE confirmed = false
         AND reading_ts < now() - ($1::bigint * interval '1 day')
         AND ($2::bigint = 0 OR reading_ts > now() - ($2::bigint * interval '1 day'))
-        AND (reading_ts, txid) > ($3::timestamptz, $4::text)
+        AND (
+          reading_ts > $3::timestamptz
+          OR (reading_ts = $3::timestamptz AND txid > $4::text)
+        )
       ORDER BY reading_ts ASC, txid ASC
       LIMIT $5`,
     [OLDER_THAN_DAYS, NEWER_THAN_DAYS, afterTs, afterTxid, limit],
+    FETCH_TIMEOUT_MS,
   )
-  return res.rows || []
+  return (res.rows || []).map((row) => ({
+    txid: row.txid,
+    reading_ts: asReadingTsText(row.reading_ts),
+  }))
 }
 
 /**
@@ -496,7 +547,7 @@ async function main(): Promise<void> {
     `  mode=${APPLY ? 'APPLY' : 'DRY-RUN'} olderThanDays=${OLDER_THAN_DAYS} ` +
       `newerThanDays=${NEWER_THAN_DAYS || 'none'} limit=${LIMIT} batch=${BATCH_SIZE} ` +
       `concurrency=${CONCURRENCY} reqIntervalMs=${REQ_INTERVAL_MS} ` +
-      `loop=${LOOP} source=bitails-status`,
+      `fetchTimeoutMs=${FETCH_TIMEOUT_MS} loop=${LOOP} source=bitails-status`,
   )
 
   let staleHint: number | null = null

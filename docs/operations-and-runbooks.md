@@ -85,8 +85,13 @@ one-shot backfill. Safe while workers are running:
 
 ```bash
 cd /opt/gaialog
-# dry-run sample (still counts — expensive on multi-million tables)
-npx tsx scripts/backfill-explorer-confirmations.ts
+# Required once: partial index so each LIMIT 200 page is an index range scan
+# instead of a 15–18s sequential scan (57014 statement_timeout in Supabase).
+# CREATE INDEX CONCURRENTLY needs session/direct Postgres (not transaction pooler).
+PG_FORCE_SESSION_MODE=true npm run db:migrate
+
+# dry-run sample (avoid --count on multi-million tables)
+npx tsx scripts/backfill-explorer-confirmations.ts --limit 200
 
 # production backfill: concurrent Bitails /status lookups + batched UPDATEs.
 # --loop keeps going until the window is empty or Bitails rate-limits.
@@ -101,6 +106,16 @@ Uses Bitails `/tx/{txid}/status` (not WhatsOnChain) so it does not steal the
 confirmation worker's WoC quota. Idempotent — already-confirmed rows are skipped.
 Expect roughly 10–20 lookups/second on the free Bitails tier; if you see sustained
 429s, lower `--concurrency` or raise `--req-interval-ms`.
+
+If Supabase shows `Parallel Seq Scan on overlay_explorer_readings` with
+`duration: 15–18s` on the backfill SELECT, migration `0023` is missing — stop the
+backfill, run `npm run db:migrate`, then resume. CREATE TABLE IF NOT EXISTS spam
+for `worker_queue` / `*_onchain` during that load is usually worker process churn
+under DB pressure, not a separate schema bug; restart workers after the index lands:
+
+```bash
+pm2 restart gaialog-workers --update-env
+```
 
 ### Explorer 500: `timeout exceeded when trying to connect`
 

@@ -20,6 +20,8 @@ function migrationOpensOwnTransaction(sql: string): boolean {
 /** Each file is a single CREATE INDEX CONCURRENTLY (cannot batch multiple in one transaction). */
 const CONCURRENT_INDEX_MIGRATIONS = new Set([
   '0017_overlay_utxo_inventory_idx_concurrent.sql',
+  '0019_overlay_utxo_acquirable_at_idx_concurrent.sql',
+  '0023_oer_unconfirmed_backfill_idx_concurrent.sql',
 ])
 
 function isConcurrentIndexMigration(file: string): boolean {
