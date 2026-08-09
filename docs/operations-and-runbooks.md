@@ -85,14 +85,22 @@ one-shot backfill. Safe while workers are running:
 
 ```bash
 cd /opt/gaialog
+# dry-run sample (still counts — expensive on multi-million tables)
 npx tsx scripts/backfill-explorer-confirmations.ts
-npx tsx scripts/backfill-explorer-confirmations.ts --apply --limit 2000
-# re-run until remaining ≈ 0
-npx tsx scripts/backfill-explorer-confirmations.ts --apply --limit 5000
+
+# production backfill: concurrent Bitails /status lookups + batched UPDATEs.
+# --loop keeps going until the window is empty or Bitails rate-limits.
+npx tsx scripts/backfill-explorer-confirmations.ts --apply \
+  --older-than-days 1 --limit 50000 --concurrency 20 --req-interval-ms 50 --loop
+
+# optional: seed ETA / print remaining (runs COUNT(*) — skip on huge tables)
+npx tsx scripts/backfill-explorer-confirmations.ts --apply --count --limit 5000
 ```
 
-Uses Bitails (not WhatsOnChain) so it does not steal the confirmation worker's
-WoC quota. Idempotent — already-confirmed rows are skipped.
+Uses Bitails `/tx/{txid}/status` (not WhatsOnChain) so it does not steal the
+confirmation worker's WoC quota. Idempotent — already-confirmed rows are skipped.
+Expect roughly 10–20 lookups/second on the free Bitails tier; if you see sustained
+429s, lower `--concurrency` or raise `--req-interval-ms`.
 
 ### Explorer 500: `timeout exceeded when trying to connect`
 

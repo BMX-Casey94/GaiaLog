@@ -5,30 +5,39 @@
  * Why
  * ---
  * The live confirmation worker only chases a recent window (default 72h) plus
- * a short catch-up (historically 30 days). Rows that sat at confirmed=false
- * for months — worker downtime, WoC 429s, or pre-worker history — never get
- * revisited. The explorer then shows "Unconfirmed" forever even though the
- * TX mined long ago.
+ * a short catch-up. Rows that sat at confirmed=false for months never get
+ * revisited, so the explorer shows "Unconfirmed" forever even though the TX
+ * mined long ago.
  *
- * This script walks oldest-first unconfirmed explorer rows, looks up each
- * txid on Bitails (not WhatsOnChain — avoids competing with the live worker's
- * WoC quota), and applies the same idempotent confirmReading / UTXO / tx_log
+ * This script walks oldest-first unconfirmed explorer rows, looks them up on
+ * Bitails (not WhatsOnChain — avoids competing with the live worker's WoC
+ * quota), and applies the same idempotent confirmReading / UTXO / tx_log
  * updates the worker uses.
+ *
+ * Performance
+ * -----------
+ * The original path issued one Bitails request and three Supabase round-trips
+ * per row, with a 200 ms sleep between each. At ~5 requests/second a multi-
+ * million-row backlog takes weeks. This version:
+ *   - looks up many txids concurrently against the lightweight /status endpoint
+ *   - writes confirmations in a single batched UPDATE per chunk
+ *   - skips the expensive COUNT(*) unless asked
+ *   - can loop until the window is empty
  *
  * Safety
  * ------
  *   - Default is DRY-RUN (counts + samples only). Pass --apply to mutate.
  *   - Safe to run while gaialog-workers is online (idempotent UPDATEs).
- *   - Self-throttled Bitails requests; backs off on 429/5xx.
+ *   - Self-throttled; backs off on 429/5xx.
  *   - Bounded by --limit and --batch-size.
  *
  * Usage
  * -----
  *   cd /opt/gaialog
  *   npx tsx scripts/backfill-explorer-confirmations.ts
- *   npx tsx scripts/backfill-explorer-confirmations.ts --apply --limit 500
+ *   npx tsx scripts/backfill-explorer-confirmations.ts --apply --limit 5000
  *   npx tsx scripts/backfill-explorer-confirmations.ts --apply \
- *           --older-than-days 2 --limit 5000 --req-interval-ms 250
+ *           --older-than-days 1 --limit 50000 --concurrency 20 --loop
  */
 
 import dotenv from 'dotenv'
@@ -52,14 +61,22 @@ function argValue(name: string, fallback: string): string {
 }
 
 const APPLY = process.argv.includes('--apply')
+const LOOP = process.argv.includes('--loop')
+const COUNT = process.argv.includes('--count')
 const OLDER_THAN_DAYS = Math.max(0, Number(argValue('--older-than-days', '1')))
 const NEWER_THAN_DAYS = Math.max(
   0,
   Number(argValue('--newer-than-days', '0')), // 0 = no lower bound (include all history)
 )
-const LIMIT = Math.max(1, Number(argValue('--limit', '2000')))
-const BATCH_SIZE = Math.max(1, Number(argValue('--batch-size', '100')))
-const REQ_INTERVAL_MS = Math.max(50, Number(argValue('--req-interval-ms', '200')))
+const LIMIT = Math.max(1, Number(argValue('--limit', '20000')))
+const BATCH_SIZE = Math.max(1, Number(argValue('--batch-size', '200')))
+/** Concurrent Bitails /status lookups. Bitails free tier is roughly 10 RPS. */
+const CONCURRENCY = Math.max(1, Number(argValue('--concurrency', '16')))
+/**
+ * Minimum gap between *starting* Bitails requests. With concurrency=16 and
+ * 60 ms this targets ~16/s; raise if you see sustained 429s.
+ */
+const REQ_INTERVAL_MS = Math.max(0, Number(argValue('--req-interval-ms', '60')))
 const BITAILS_BASE = (process.env.BSV_BITAILS_API_BASE || 'https://api.bitails.io').replace(/\/$/, '')
 
 interface Candidate {
@@ -68,13 +85,17 @@ interface Candidate {
 }
 
 interface LookupResult {
+  txid: string
   mined: boolean
   blockHeight: number
   blockTime: Date | null
   rateLimited?: boolean
+  missing?: boolean
+  error?: string
 }
 
 async function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return
   await new Promise((r) => setTimeout(r, ms))
 }
 
@@ -121,65 +142,349 @@ async function fetchBatch(afterTs: string | null, afterTxid: string | null, limi
   return res.rows || []
 }
 
-async function lookupBitails(txid: string): Promise<LookupResult> {
-  const res = await fetch(`${BITAILS_BASE}/tx/${txid}`, {
-    headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(12_000),
-  })
-  if (res.status === 429 || res.status === 503) {
-    return { mined: false, blockHeight: 0, blockTime: null, rateLimited: true }
-  }
-  if (res.status === 404) {
-    return { mined: false, blockHeight: 0, blockTime: null }
-  }
-  if (!res.ok) {
-    throw new Error(`Bitails ${res.status} for ${txid}: ${(await res.text()).slice(0, 160)}`)
-  }
-  const body = (await res.json()) as {
-    blockheight?: number
-    blockHeight?: number
-    confirmations?: number
-    time?: number
-    blocktime?: number
-  }
-  const blockHeightRaw =
-    typeof body.blockheight === 'number' ? body.blockheight :
-    typeof body.blockHeight === 'number' ? body.blockHeight :
-    0
-  const confirmations = typeof body.confirmations === 'number' ? body.confirmations : 0
-  const mined = blockHeightRaw > 0 || confirmations >= 1
-  const timeRaw =
-    typeof body.blocktime === 'number' ? body.blocktime :
-    typeof body.time === 'number' ? body.time :
-    null
-  return {
-    mined,
-    blockHeight: blockHeightRaw > 0 ? blockHeightRaw : 0,
-    blockTime: timeRaw ? new Date(timeRaw * 1000) : null,
+/**
+ * Lightweight status lookup. Prefer /status over the full /tx body — same
+ * confirmation fields, far less JSON to download for OP_RETURN-heavy rows.
+ */
+async function lookupBitailsStatus(txid: string): Promise<LookupResult> {
+  try {
+    const res = await fetch(`${BITAILS_BASE}/tx/${txid}/status`, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(12_000),
+    })
+    if (res.status === 429 || res.status === 503) {
+      return { txid, mined: false, blockHeight: 0, blockTime: null, rateLimited: true }
+    }
+    if (res.status === 404) {
+      return { txid, mined: false, blockHeight: 0, blockTime: null, missing: true }
+    }
+    if (!res.ok) {
+      return {
+        txid,
+        mined: false,
+        blockHeight: 0,
+        blockTime: null,
+        error: `Bitails ${res.status}: ${(await res.text()).slice(0, 120)}`,
+      }
+    }
+    const body = (await res.json()) as {
+      status?: string
+      blockheight?: number
+      blockHeight?: number
+      confirmations?: number
+      blocktime?: number
+      time?: number
+    }
+    const status = String(body.status ?? '').toLowerCase()
+    const blockHeightRaw =
+      typeof body.blockheight === 'number' ? body.blockheight :
+      typeof body.blockHeight === 'number' ? body.blockHeight :
+      0
+    const confirmations = typeof body.confirmations === 'number' ? body.confirmations : 0
+    const mined =
+      status === 'confirmed'
+      || blockHeightRaw > 0
+      || confirmations >= 1
+    const timeRaw =
+      typeof body.blocktime === 'number' ? body.blocktime :
+      typeof body.time === 'number' ? body.time :
+      null
+    return {
+      txid,
+      mined,
+      blockHeight: blockHeightRaw > 0 ? blockHeightRaw : 0,
+      blockTime: timeRaw ? new Date(timeRaw * 1000) : null,
+      missing: status === 'not found' || status === 'not_found',
+    }
+  } catch (err) {
+    return {
+      txid,
+      mined: false,
+      blockHeight: 0,
+      blockTime: null,
+      error: err instanceof Error ? err.message : String(err),
+    }
   }
 }
 
-async function applyConfirmation(txid: string, blockHeight: number, blockTime: Date | null): Promise<void> {
-  await confirmReading(txid, blockHeight, blockTime)
+/**
+ * Token-bucket worker pool: up to CONCURRENCY in flight, with at most one new
+ * request started every REQ_INTERVAL_MS. Keeps Bitails busy without stampeding.
+ */
+async function lookupMany(txids: string[]): Promise<LookupResult[]> {
+  if (txids.length === 0) return []
+
+  const results: LookupResult[] = new Array(txids.length)
+  let cursor = 0
+  let lastStart = 0
+  let rateLimited = false
+
+  const workers = Array.from({ length: Math.min(CONCURRENCY, txids.length) }, async () => {
+    while (true) {
+      if (rateLimited) return
+      const idx = cursor++
+      if (idx >= txids.length) return
+
+      const gap = REQ_INTERVAL_MS - (Date.now() - lastStart)
+      if (gap > 0) await sleep(gap)
+      lastStart = Date.now()
+
+      const result = await lookupBitailsStatus(txids[idx]!)
+      results[idx] = result
+      if (result.rateLimited) rateLimited = true
+    }
+  })
+
+  await Promise.all(workers)
+
+  for (let i = 0; i < results.length; i++) {
+    if (!results[i]) {
+      results[i] = {
+        txid: txids[i]!,
+        mined: false,
+        blockHeight: 0,
+        blockTime: null,
+        rateLimited: true,
+      }
+    }
+  }
+  return results
+}
+
+/**
+ * One UPDATE for the whole mined chunk, then best-effort UTXO / tx_log flips.
+ * Far cheaper than confirmReading() × N over the Supabase pooler.
+ */
+async function applyConfirmationsBatch(
+  mined: Array<{ txid: string; blockHeight: number; blockTime: Date | null }>,
+): Promise<number> {
+  if (mined.length === 0) return 0
+
+  // Fall back to the repository helper for tiny leftovers so behaviour stays
+  // identical on the edges; the batched path is for the bulk of the work.
+  if (mined.length === 1) {
+    const row = mined[0]!
+    await confirmReading(row.txid, row.blockHeight, row.blockTime)
+    await query(
+      `UPDATE overlay_admitted_utxos
+          SET confirmed = true
+        WHERE txid = $1
+          AND confirmed = false`,
+      [row.txid],
+    )
+    try {
+      await query(
+        `UPDATE tx_log
+            SET status = 'confirmed',
+                onchain_at = COALESCE(onchain_at, $2)
+          WHERE txid = $1
+            AND status IS DISTINCT FROM 'confirmed'`,
+        [row.txid, row.blockTime ?? new Date()],
+      )
+    } catch {
+      // Best effort — explorer row is the source of truth for UI.
+    }
+    return 1
+  }
+
+  const values: unknown[] = []
+  const placeholders: string[] = []
+  for (let i = 0; i < mined.length; i++) {
+    const row = mined[i]!
+    const base = i * 3
+    placeholders.push(`($${base + 1}::text, $${base + 2}::int, $${base + 3}::timestamptz)`)
+    values.push(row.txid, row.blockHeight, row.blockTime)
+  }
+
+  const updated = await query(
+    `UPDATE overlay_explorer_readings AS r
+        SET confirmed = true,
+            block_height = CASE
+              WHEN v.block_height > 0
+                THEN GREATEST(COALESCE(r.block_height, 0), v.block_height)
+              ELSE COALESCE(r.block_height, 0)
+            END,
+            block_time = COALESCE(v.block_time, r.block_time)
+       FROM (VALUES ${placeholders.join(',')}) AS v(txid, block_height, block_time)
+      WHERE r.txid = v.txid
+        AND (
+          NOT r.confirmed
+          OR (v.block_height > 0 AND COALESCE(r.block_height, 0) < v.block_height)
+        )`,
+    values,
+  )
+
+  const txids = mined.map((row) => row.txid)
   await query(
     `UPDATE overlay_admitted_utxos
         SET confirmed = true
-      WHERE txid = $1
+      WHERE txid = ANY($1::text[])
         AND confirmed = false`,
-    [txid],
-  )
+    [txids],
+  ).catch(() => {})
+
   try {
-    // tx_log has no block_height column — only flip status / onchain_at.
     await query(
-      `UPDATE tx_log
+      `UPDATE tx_log AS t
           SET status = 'confirmed',
-              onchain_at = COALESCE(onchain_at, $2)
-        WHERE txid = $1
-          AND status IS DISTINCT FROM 'confirmed'`,
-      [txid, blockTime ?? new Date()],
+              onchain_at = COALESCE(t.onchain_at, v.block_time, now())
+         FROM (VALUES ${placeholders.join(',')}) AS v(txid, block_height, block_time)
+        WHERE t.txid = v.txid
+          AND t.status IS DISTINCT FROM 'confirmed'`,
+      values,
     )
   } catch {
     // Best effort — explorer row is the source of truth for UI.
+  }
+
+  return updated.rowCount ?? mined.length
+}
+
+function formatRate(n: number, elapsedMs: number): string {
+  if (elapsedMs <= 0) return '0/s'
+  return `${(n / (elapsedMs / 1000)).toFixed(1)}/s`
+}
+
+function estimateRemaining(processed: number, elapsedMs: number, remainingHint: number | null): string {
+  if (processed <= 0 || elapsedMs <= 0 || remainingHint == null || remainingHint <= 0) return 'n/a'
+  const rate = processed / (elapsedMs / 1000)
+  if (rate <= 0) return 'n/a'
+  const seconds = remainingHint / rate
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} min`
+  return `${(seconds / 3600).toFixed(1)} h`
+}
+
+async function runOnce(staleHint: number | null): Promise<{
+  processed: number
+  confirmed: number
+  stillMempoolOrMissing: number
+  errors: number
+  rateLimited: boolean
+  emptied: boolean
+}> {
+  let processed = 0
+  let confirmed = 0
+  let stillMempoolOrMissing = 0
+  let errors = 0
+  let rateLimited = false
+  let afterTs: string | null = null
+  let afterTxid: string | null = null
+  const startedAt = Date.now()
+
+  while (processed < LIMIT) {
+    const need = Math.min(BATCH_SIZE, LIMIT - processed)
+    const batch = await fetchBatch(afterTs, afterTxid, need)
+    if (batch.length === 0) {
+      return {
+        processed,
+        confirmed,
+        stillMempoolOrMissing,
+        errors,
+        rateLimited,
+        emptied: true,
+      }
+    }
+
+    const last = batch[batch.length - 1]!
+    afterTs = last.reading_ts
+    afterTxid = last.txid
+
+    if (!APPLY) {
+      for (const row of batch) {
+        processed++
+        if (processed <= 10) {
+          console.log(`  (dry-run) would check ${row.txid}  reading_ts=${row.reading_ts}`)
+        }
+      }
+      if (processed >= Math.min(BATCH_SIZE, LIMIT)) {
+        console.log(
+          `  (dry-run) sampled ${processed} row(s); pass --apply to mutate up to --limit ${LIMIT}.`,
+        )
+        break
+      }
+      continue
+    }
+
+    const lookups = await lookupMany(batch.map((row) => row.txid))
+    if (lookups.some((row) => row.rateLimited)) {
+      rateLimited = true
+      console.warn('  ⏳ rate-limited — backing off 60s, then this pass stops so you can re-run')
+      await sleep(60_000)
+      // Process whatever we already got before the 429, then exit the pass.
+    }
+
+    const mined: Array<{ txid: string; blockHeight: number; blockTime: Date | null }> = []
+    for (const result of lookups) {
+      processed++
+      if (result.rateLimited && !result.mined) continue
+      if (result.error) {
+        errors++
+        if (errors <= 10) {
+          console.warn(`  ⚠️  ${result.txid.slice(0, 12)}…: ${result.error}`)
+        }
+        continue
+      }
+      if (!result.mined) {
+        stillMempoolOrMissing++
+        continue
+      }
+      mined.push({
+        txid: result.txid,
+        blockHeight: result.blockHeight,
+        blockTime: result.blockTime,
+      })
+    }
+
+    if (mined.length > 0) {
+      try {
+        const wrote = await applyConfirmationsBatch(mined)
+        confirmed += wrote
+        const lastMined = mined[mined.length - 1]!
+        console.log(
+          `  ✅ confirmed +${wrote.toLocaleString()} ` +
+            `(total ${confirmed.toLocaleString()}) ` +
+            `last ${lastMined.txid.slice(0, 12)}… height=${lastMined.blockHeight || '?'} ` +
+            `rate=${formatRate(processed, Date.now() - startedAt)} ` +
+            `eta=${estimateRemaining(processed, Date.now() - startedAt, staleHint == null ? null : Math.max(0, staleHint - processed))}`,
+        )
+      } catch (err) {
+        errors++
+        console.warn(
+          `  ⚠️  batch write failed (${mined.length} txids): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        )
+        // Fall back to one-by-one so a single bad row cannot stall the whole pass.
+        for (const row of mined) {
+          try {
+            await confirmReading(row.txid, row.blockHeight, row.blockTime)
+            confirmed++
+          } catch (inner) {
+            errors++
+            console.warn(
+              `  ⚠️  ${row.txid.slice(0, 12)}…: ` +
+                `${inner instanceof Error ? inner.message : String(inner)}`,
+            )
+          }
+        }
+      }
+    } else if (processed % 1000 < batch.length) {
+      console.log(
+        `  … processed ${processed.toLocaleString()} ` +
+          `(confirmed ${confirmed.toLocaleString()}, missing/mempool ${stillMempoolOrMissing.toLocaleString()}) ` +
+          `rate=${formatRate(processed, Date.now() - startedAt)}`,
+      )
+    }
+
+    if (rateLimited || errors >= 50) break
+  }
+
+  return {
+    processed,
+    confirmed,
+    stillMempoolOrMissing,
+    errors,
+    rateLimited,
+    emptied: false,
   }
 }
 
@@ -187,97 +492,86 @@ async function main(): Promise<void> {
   console.log('═══════════════════════════════════════════════════════════════')
   console.log('  Explorer confirmation backfill')
   console.log('═══════════════════════════════════════════════════════════════')
-  console.log(`  mode=${APPLY ? 'APPLY' : 'DRY-RUN'} olderThanDays=${OLDER_THAN_DAYS} ` +
-    `newerThanDays=${NEWER_THAN_DAYS || 'none'} limit=${LIMIT} batch=${BATCH_SIZE} ` +
-    `reqIntervalMs=${REQ_INTERVAL_MS} source=bitails`)
+  console.log(
+    `  mode=${APPLY ? 'APPLY' : 'DRY-RUN'} olderThanDays=${OLDER_THAN_DAYS} ` +
+      `newerThanDays=${NEWER_THAN_DAYS || 'none'} limit=${LIMIT} batch=${BATCH_SIZE} ` +
+      `concurrency=${CONCURRENCY} reqIntervalMs=${REQ_INTERVAL_MS} ` +
+      `loop=${LOOP} source=bitails-status`,
+  )
 
-  const total = await countStale()
-  console.log(`  stale unconfirmed rows in window: ${total.toLocaleString()}`)
-  if (total === 0) {
-    console.log('  Nothing to do.')
-    return
+  let staleHint: number | null = null
+  if (COUNT || !APPLY) {
+    console.log('  counting stale rows (expensive on multi-million tables)…')
+    staleHint = await countStale()
+    console.log(`  stale unconfirmed rows in window: ${staleHint.toLocaleString()}`)
+    if (staleHint === 0) {
+      console.log('  Nothing to do.')
+      return
+    }
+  } else {
+    console.log('  skipping COUNT(*) — pass --count if you want a remaining total / ETA seed')
   }
 
-  let processed = 0
-  let confirmed = 0
-  let stillMempoolOrMissing = 0
-  let errors = 0
-  let afterTs: string | null = null
-  let afterTxid: string | null = null
+  let pass = 0
+  let grandProcessed = 0
+  let grandConfirmed = 0
+  let grandMissing = 0
+  let grandErrors = 0
+  const wallStart = Date.now()
 
-  while (processed < LIMIT) {
-    const need = Math.min(BATCH_SIZE, LIMIT - processed)
-    const batch = await fetchBatch(afterTs, afterTxid, need)
-    if (batch.length === 0) break
-
-    for (const row of batch) {
-      processed++
-      afterTs = row.reading_ts
-      afterTxid = row.txid
-
-      if (!APPLY) {
-        if (processed <= 10) {
-          console.log(`  (dry-run) would check ${row.txid}  reading_ts=${row.reading_ts}`)
-        }
-        continue
-      }
-
-      try {
-        await sleep(REQ_INTERVAL_MS)
-        let status = await lookupBitails(row.txid)
-        if (status.rateLimited) {
-          console.warn(`  ⏳ rate-limited at ${row.txid} — sleeping 60s`)
-          await sleep(60_000)
-          status = await lookupBitails(row.txid)
-          if (status.rateLimited) {
-            console.error('  ⛔ still rate-limited — stopping. Re-run later.')
-            processed--
-            break
-          }
-        }
-
-        if (!status.mined) {
-          stillMempoolOrMissing++
-          continue
-        }
-
-        await applyConfirmation(row.txid, status.blockHeight, status.blockTime)
-        confirmed++
-        if (confirmed % 25 === 0 || confirmed <= 5) {
-          console.log(
-            `  ✅ confirmed ${confirmed.toLocaleString()} ` +
-              `(last ${row.txid.slice(0, 12)}… height=${status.blockHeight || '?'})`,
-          )
-        }
-      } catch (err) {
-        errors++
-        console.warn(
-          `  ⚠️  ${row.txid.slice(0, 12)}…: ${err instanceof Error ? err.message : String(err)}`,
-        )
-        if (errors >= 20) {
-          console.error('  ⛔ too many errors — stopping.')
-          break
-        }
-      }
+  do {
+    pass++
+    if (LOOP && pass > 1) {
+      console.log(`\n── pass ${pass} ──`)
     }
 
-    if (!APPLY && processed >= Math.min(10, LIMIT)) {
-      console.log(`  (dry-run) sampled ${processed} row(s); pass --apply to mutate up to --limit ${LIMIT}.`)
+    const result = await runOnce(staleHint)
+    grandProcessed += result.processed
+    grandConfirmed += result.confirmed
+    grandMissing += result.stillMempoolOrMissing
+    grandErrors += result.errors
+
+    console.log('')
+    console.log('───────────────────────────────────────────────────────────────')
+    console.log(
+      `  pass=${pass} processed=${result.processed.toLocaleString()} ` +
+        `confirmed=${result.confirmed.toLocaleString()} ` +
+        `notMinedOrMissing=${result.stillMempoolOrMissing.toLocaleString()} ` +
+        `errors=${result.errors}`,
+    )
+    console.log(
+      `  cumulative: processed=${grandProcessed.toLocaleString()} ` +
+        `confirmed=${grandConfirmed.toLocaleString()} ` +
+        `rate=${formatRate(grandProcessed, Date.now() - wallStart)}`,
+    )
+
+    if (!APPLY) {
+      console.log('  Dry-run only. Re-run with --apply to write confirmations.')
       break
     }
-    if (errors >= 20) break
-  }
+    if (result.rateLimited) {
+      console.log('  Stopped on rate-limit. Re-run shortly; lower --concurrency if it persists.')
+      break
+    }
+    if (result.errors >= 50) {
+      console.log('  Stopped after too many errors.')
+      break
+    }
+    if (result.emptied || result.processed === 0) {
+      console.log('  Window empty — backlog cleared for this filter.')
+      break
+    }
+    if (!LOOP) {
+      console.log(`  Re-run with the same flags (or add --loop) to continue (next --limit ${LIMIT}).`)
+      break
+    }
+    // Soft pause between loop passes so a runaway cannot hammer Bitails.
+    await sleep(1_000)
+  } while (LOOP)
 
-  const remaining = await countStale()
-  console.log('')
-  console.log('───────────────────────────────────────────────────────────────')
-  console.log(`  processed=${processed.toLocaleString()} confirmed=${confirmed.toLocaleString()} ` +
-    `notMinedOrMissing=${stillMempoolOrMissing.toLocaleString()} errors=${errors}`)
-  console.log(`  remaining stale unconfirmed in window: ${remaining.toLocaleString()}`)
-  if (!APPLY) {
-    console.log('  Dry-run only. Re-run with --apply to write confirmations.')
-  } else if (remaining > 0) {
-    console.log(`  Re-run with the same flags to continue (next --limit ${LIMIT}).`)
+  if (COUNT && APPLY) {
+    const remaining = await countStale()
+    console.log(`  remaining stale unconfirmed in window: ${remaining.toLocaleString()}`)
   }
   console.log('Done.')
 }
