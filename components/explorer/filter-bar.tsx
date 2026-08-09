@@ -50,11 +50,6 @@ export function FilterBar({
     return (typeCounts[key] ?? 0) > 0
   })
 
-  const SelectedIcon =
-    selectedType && DATA_TYPE_CONFIG[selectedType]
-      ? DATA_TYPE_CONFIG[selectedType].icon
-      : Layers
-
   const dateRangePanel = showFilters ? (
     <div className="flex flex-wrap justify-center gap-3 sm:gap-4 mb-6 animate-in fade-in slide-in-from-top-2 duration-200">
       <div className="flex flex-wrap items-center justify-center gap-2 bg-black/30 backdrop-blur-sm border border-slate-600/30 rounded-lg px-3 py-2 sm:px-4 w-full sm:w-auto max-w-lg">
@@ -102,12 +97,10 @@ export function FilterBar({
         >
           <SelectTrigger
             aria-label="Data type filter"
-            className="h-11 w-full rounded-xl border-slate-600/50 bg-black/40 text-slate-100 backdrop-blur-sm focus:ring-purple-500/40 focus:ring-offset-0"
+            className="h-11 w-full rounded-xl border-slate-600/50 bg-black/40 text-slate-100 backdrop-blur-sm focus:ring-purple-500/40 focus:ring-offset-0 [&>span]:flex [&>span]:min-w-0 [&>span]:flex-1 [&>span]:items-center [&>span]:gap-2 [&>span]:text-left"
           >
-            <span className="flex min-w-0 flex-1 items-center gap-2 text-left">
-              <SelectedIcon className="h-4 w-4 shrink-0 text-purple-300" />
-              <SelectValue placeholder="All Types" />
-            </span>
+            {/* Icon comes from the selected SelectItem text — do not add a second icon here. */}
+            <SelectValue placeholder="All Types" />
           </SelectTrigger>
           <SelectContent
             position="popper"
