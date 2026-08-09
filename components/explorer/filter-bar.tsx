@@ -14,6 +14,12 @@ interface FilterBarProps {
   setDateTo: (d: string) => void
   showFilters: boolean
   setShowFilters: (v: boolean) => void
+  /**
+   * Live per-family counts from /api/explorer/stats.
+   * - null/undefined: counts not loaded yet — show all tabs (avoid empty flash)
+   * - object: hide families with count <= 0 so empty filters never appear
+   */
+  typeCounts?: Record<string, number> | null
 }
 
 const inactiveClasses = "border-slate-600/50 text-slate-300 hover:bg-slate-800/40 bg-transparent backdrop-blur-sm"
@@ -27,7 +33,13 @@ export function FilterBar({
   setDateTo,
   showFilters,
   setShowFilters,
+  typeCounts = null,
 }: FilterBarProps) {
+  const typeEntries = Object.entries(DATA_TYPE_CONFIG).filter(([key]) => {
+    if (typeCounts == null) return true
+    return (typeCounts[key] ?? 0) > 0
+  })
+
   return (
     <>
       <div className="flex flex-wrap justify-center gap-3 mb-6">
@@ -40,7 +52,7 @@ export function FilterBar({
           <Layers className="h-4 w-4 mr-1.5" />
           All Types
         </Button>
-        {Object.entries(DATA_TYPE_CONFIG).map(([key, config]) => {
+        {typeEntries.map(([key, config]) => {
           const Icon = config.icon
           return (
             <Button

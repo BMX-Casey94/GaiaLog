@@ -42,6 +42,7 @@ export function ExplorerClient() {
     totalReadings: 0,
     uniqueLocations: null,
     network: 'mainnet',
+    byType: null,
   })
 
   const handleSearch = useCallback(async (
@@ -62,9 +63,23 @@ export function ExplorerClient() {
       params.set('pageSize', '24')
 
       const res = await fetch(`/api/explorer/search?${params}`)
-      const data = await res.json()
+      const text = await res.text()
+      let data: any = null
+      try {
+        data = text ? JSON.parse(text) : null
+      } catch {
+        data = null
+      }
 
-      if (data.success) {
+      if (!res.ok) {
+        setError(
+          (data && typeof data.error === 'string' && data.error) ||
+            `Search failed (HTTP ${res.status})`,
+        )
+        return
+      }
+
+      if (data?.success) {
         setResults(data.data)
         setPage(pageNum)
         // Reuse the search total for the stats bar — avoids a second round-trip.
@@ -73,7 +88,7 @@ export function ExplorerClient() {
           setStats((prev) => ({ ...prev, totalReadings: fastTotal }))
         }
       } else {
-        setError(data.error || 'Search failed')
+        setError(data?.error || 'Search failed')
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Search failed')
@@ -90,8 +105,23 @@ export function ExplorerClient() {
     async function fetchStats() {
       try {
         const res = await fetch('/api/explorer/stats')
-        const data = await res.json()
-        if (cancelled || !data.success) return
+        const text = await res.text()
+        let data: any = null
+        try {
+          data = text ? JSON.parse(text) : null
+        } catch {
+          data = null
+        }
+        if (cancelled) return
+        if (!res.ok || !data?.success) {
+          console.error('Failed to fetch stats:', res.status, data?.error || text.slice(0, 200))
+          return
+        }
+        const byTypeRaw = data.data?.aggregates?.byType
+        const byType =
+          byTypeRaw && typeof byTypeRaw === 'object' && !Array.isArray(byTypeRaw)
+            ? (byTypeRaw as Record<string, number>)
+            : {}
         setStats((prev) => ({
           ...prev,
           network: data.data?.network || prev.network,
@@ -99,6 +129,7 @@ export function ExplorerClient() {
             typeof data.data?.uniqueLocations === 'number'
               ? data.data.uniqueLocations
               : prev.uniqueLocations,
+          byType,
           // Keep the fast UI value if the stats endpoint returns a fallback zero.
           totalReadings:
             prev.totalReadings > 0 && (data.data?.totalReadings ?? 0) === 0
@@ -113,6 +144,13 @@ export function ExplorerClient() {
     fetchStats()
     return () => { cancelled = true }
   }, [])
+
+  // Drop a selected type if stats say that family has no live rows.
+  useEffect(() => {
+    if (!selectedType || stats.byType == null) return
+    if ((stats.byType[selectedType] ?? 0) > 0) return
+    setSelectedType(null)
+  }, [selectedType, stats.byType])
 
   // Initial search on mount
   const mountedRef = useRef(false)
@@ -208,6 +246,7 @@ export function ExplorerClient() {
             setDateTo={setDateTo}
             showFilters={showFilters}
             setShowFilters={setShowFilters}
+            typeCounts={stats.byType}
           />
 
           {/* Results summary */}

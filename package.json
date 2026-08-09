@@ -25,6 +25,7 @@
     "explorer:sync": "tsx scripts/run-explorer-sync.ts",
     "explorer:geocode-backfill": "tsx scripts/backfill-geocode.ts",
     "explorer:addresses": "tsx scripts/show-wallet-addresses.ts",
+    "explorer:check-apis": "tsx scripts/check-explorer-apis.ts",
     "sync:env": "tsx scripts/sync-env-from-template.ts",
     "sync:env:dry-run": "tsx scripts/sync-env-from-template.ts --dry-run"
   },

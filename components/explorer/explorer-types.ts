@@ -50,6 +50,8 @@ export interface ExplorerStats {
   totalReadings: number
   uniqueLocations: number | null
   network: string
+  /** Live reading counts per data_family (from overlay family rollups). */
+  byType: Record<string, number> | null
 }
 
 const FAMILY_ICON_MAP: Record<string, React.ElementType> = {
