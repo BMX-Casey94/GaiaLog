@@ -485,20 +485,24 @@ export async function getInventoryDiagnostic(walletIndex: number): Promise<Inven
       total_live_sats: string
       confirmed_live_sats: string
     }>(
+      // Restrict to live rows in WHERE — scanning removed history for every
+      // funding-monitor tick was a major contributor to Supabase CPU exhaustion
+      // once overlay_admitted_utxos grew large.
       `SELECT
-         COUNT(*) FILTER (WHERE removed = false)::text AS total_live,
-         COUNT(*) FILTER (WHERE removed = false AND confirmed = true)::text AS confirmed_live,
-         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'reserve')::text AS reserve_live,
-         COUNT(*) FILTER (WHERE removed = false AND utxo_role = 'reserve' AND confirmed = true)::text AS confirmed_reserve,
-         COALESCE(MAX(satoshis) FILTER (WHERE removed = false), 0)::text AS largest_sats,
-         COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text AS largest_confirmed_sats,
-         COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true AND utxo_role = 'reserve'), 0)::text AS largest_confirmed_reserve_sats,
-         COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND utxo_role = 'pool'), 0)::text AS largest_pool_sats,
-         COALESCE(MAX(satoshis) FILTER (WHERE removed = false AND confirmed = true AND utxo_role = 'pool'), 0)::text AS largest_confirmed_pool_sats,
-         COALESCE(SUM(satoshis) FILTER (WHERE removed = false), 0)::text AS total_live_sats,
-         COALESCE(SUM(satoshis) FILTER (WHERE removed = false AND confirmed = true), 0)::text AS confirmed_live_sats
+         COUNT(*)::text AS total_live,
+         COUNT(*) FILTER (WHERE confirmed = true)::text AS confirmed_live,
+         COUNT(*) FILTER (WHERE utxo_role = 'reserve')::text AS reserve_live,
+         COUNT(*) FILTER (WHERE utxo_role = 'reserve' AND confirmed = true)::text AS confirmed_reserve,
+         COALESCE(MAX(satoshis), 0)::text AS largest_sats,
+         COALESCE(MAX(satoshis) FILTER (WHERE confirmed = true), 0)::text AS largest_confirmed_sats,
+         COALESCE(MAX(satoshis) FILTER (WHERE confirmed = true AND utxo_role = 'reserve'), 0)::text AS largest_confirmed_reserve_sats,
+         COALESCE(MAX(satoshis) FILTER (WHERE utxo_role = 'pool'), 0)::text AS largest_pool_sats,
+         COALESCE(MAX(satoshis) FILTER (WHERE confirmed = true AND utxo_role = 'pool'), 0)::text AS largest_confirmed_pool_sats,
+         COALESCE(SUM(satoshis), 0)::text AS total_live_sats,
+         COALESCE(SUM(satoshis) FILTER (WHERE confirmed = true), 0)::text AS confirmed_live_sats
        FROM overlay_admitted_utxos
-       WHERE wallet_index = $1`,
+       WHERE wallet_index = $1
+         AND removed = false`,
       [walletIndex],
     )
     const row = res.rows[0]

@@ -95,8 +95,12 @@ npx tsx scripts/backfill-explorer-confirmations.ts --limit 200
 
 # production backfill: concurrent Bitails /status lookups + batched UPDATEs.
 # --loop keeps going until the window is empty or Bitails rate-limits.
+# Gentle production pace (preferred while Supabase compute is elevated).
+# Pause the live confirmation catch-up first if CPU is pegged:
+#   BSV_CONFIRMATION_CATCHUP_DAYS=7  (or disable worker briefly)
 npx tsx scripts/backfill-explorer-confirmations.ts --apply \
-  --older-than-days 1 --limit 50000 --concurrency 20 --req-interval-ms 50 --loop
+  --older-than-days 1 --limit 20000 --concurrency 6 --req-interval-ms 120 \
+  --batch-size 100 --batch-pause-ms 750 --loop
 
 # optional: seed ETA / print remaining (runs COUNT(*) — skip on huge tables)
 npx tsx scripts/backfill-explorer-confirmations.ts --apply --count --limit 5000

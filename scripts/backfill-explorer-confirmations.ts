@@ -99,14 +99,15 @@ const NEWER_THAN_DAYS = Math.max(
   Number(argValue('--newer-than-days', '0')), // 0 = no lower bound (include all history)
 )
 const LIMIT = Math.max(1, Number(argValue('--limit', '20000')))
-const BATCH_SIZE = Math.max(1, Number(argValue('--batch-size', '200')))
-/** Concurrent Bitails /status lookups. Bitails free tier is roughly 10 RPS. */
-const CONCURRENCY = Math.max(1, Number(argValue('--concurrency', '16')))
+const BATCH_SIZE = Math.max(1, Number(argValue('--batch-size', '100')))
+/** Concurrent Bitails /status lookups. Keep modest so DB writes stay ahead. */
+const CONCURRENCY = Math.max(1, Number(argValue('--concurrency', '8')))
 /**
- * Minimum gap between *starting* Bitails requests. With concurrency=16 and
- * 60 ms this targets ~16/s; raise if you see sustained 429s.
+ * Minimum gap between *starting* Bitails requests. Raise if you see sustained 429s.
  */
-const REQ_INTERVAL_MS = Math.max(0, Number(argValue('--req-interval-ms', '60')))
+const REQ_INTERVAL_MS = Math.max(0, Number(argValue('--req-interval-ms', '100')))
+/** Pause after each DB write batch so workers/broadcasts can breathe. */
+const BATCH_PAUSE_MS = Math.max(0, Number(argValue('--batch-pause-ms', '500')))
 /** Per-page DB fetch timeout (ms). Raise only if the partial index is missing. */
 const FETCH_TIMEOUT_MS = Math.max(5_000, Number(argValue('--fetch-timeout-ms', '120000')))
 const BITAILS_BASE = (process.env.BSV_BITAILS_API_BASE || 'https://api.bitails.io').replace(/\/$/, '')
@@ -577,6 +578,8 @@ async function runOnce(staleHint: number | null): Promise<{
       )
     }
 
+    if (BATCH_PAUSE_MS > 0) await sleep(BATCH_PAUSE_MS)
+
     if (rateLimited || errors >= 50) break
   }
 
@@ -598,7 +601,8 @@ async function main(): Promise<void> {
     `  mode=${APPLY ? 'APPLY' : 'DRY-RUN'} olderThanDays=${OLDER_THAN_DAYS} ` +
       `newerThanDays=${NEWER_THAN_DAYS || 'none'} limit=${LIMIT} batch=${BATCH_SIZE} ` +
       `concurrency=${CONCURRENCY} reqIntervalMs=${REQ_INTERVAL_MS} ` +
-      `fetchTimeoutMs=${FETCH_TIMEOUT_MS} loop=${LOOP} source=bitails-status`,
+      `batchPauseMs=${BATCH_PAUSE_MS} fetchTimeoutMs=${FETCH_TIMEOUT_MS} ` +
+      `loop=${LOOP} source=bitails-status`,
   )
 
   let staleHint: number | null = null

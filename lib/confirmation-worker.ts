@@ -32,7 +32,8 @@
  *   BSV_CONFIRMATION_BATCH_SIZE=30            - txids per cycle
  *   BSV_CONFIRMATION_MIN_AGE_SECONDS=60       - skip txids younger than this
  *   BSV_CONFIRMATION_MAX_AGE_HOURS=72         - primary chase window
- *   BSV_CONFIRMATION_CATCHUP_DAYS=400         - residual catch-up for stale rows
+ *   BSV_CONFIRMATION_CATCHUP_DAYS=14          - residual catch-up for stale rows
+ *                                               (long tail: scripts/backfill-explorer-confirmations.ts)
  *   BSV_CONFIRMATION_REQ_INTERVAL_MS=400      - per-request throttle
  *   BSV_CONFIRMATION_BACKOFF_MS=120000        - cool-down on rate limit
  */
@@ -54,7 +55,10 @@ const MAX_AGE_HOURS = envInt('BSV_CONFIRMATION_MAX_AGE_HOURS', 72, 1)
 // Residual catch-up for rows that aged out of the primary window while still
 // unconfirmed (worker downtime / WoC 429s). Default ~13 months so months-old
 // explorer "Unconfirmed" badges eventually clear without a manual backfill.
-const CATCHUP_DAYS = envInt('BSV_CONFIRMATION_CATCHUP_DAYS', 400, 30)
+// Keep live catch-up short. Multi-month backlogs belong to the Bitails
+// backfill script — a 400-day residual scan competed with that work and
+// helped peg Supabase compute at ~100%.
+const CATCHUP_DAYS = envInt('BSV_CONFIRMATION_CATCHUP_DAYS', 14, 1)
 const REQ_INTERVAL_MS = envInt('BSV_CONFIRMATION_REQ_INTERVAL_MS', 400, 200)
 const BACKOFF_MS = envInt('BSV_CONFIRMATION_BACKOFF_MS', 120_000, 5_000)
 
