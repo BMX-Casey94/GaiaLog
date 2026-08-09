@@ -131,6 +131,14 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((r) => setTimeout(r, ms))
 }
 
+/** Supabase/pooler kills and brief network blips — retry, do not burn the error budget. */
+function isTransientDbError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /terminating connection|Connection terminated|ECONNRESET|EPIPE|ECHECKOUTTIMEOUT|administrator command|connection.*closed|server closed the connection|timeout exceeded when trying to connect|DbHandler exited/i.test(
+    msg,
+  )
+}
+
 async function countStale(): Promise<number> {
   const res = await query<{ c: string }>(
     `SELECT COUNT(*)::text AS c
@@ -487,34 +495,77 @@ async function runOnce(staleHint: number | null): Promise<{
     }
 
     if (mined.length > 0) {
-      try {
-        const wrote = await applyConfirmationsBatch(mined)
-        confirmed += wrote
-        const lastMined = mined[mined.length - 1]!
+      const logConfirmed = (wrote: number, lastTxid: string, height: number) => {
         console.log(
           `  ✅ confirmed +${wrote.toLocaleString()} ` +
             `(total ${confirmed.toLocaleString()}) ` +
-            `last ${lastMined.txid.slice(0, 12)}… height=${lastMined.blockHeight || '?'} ` +
+            `last ${lastTxid.slice(0, 12)}… height=${height || '?'} ` +
             `rate=${formatRate(processed, Date.now() - startedAt)} ` +
             `eta=${estimateRemaining(processed, Date.now() - startedAt, staleHint == null ? null : Math.max(0, staleHint - processed))}`,
         )
+      }
+
+      let wroteOk = false
+      try {
+        const wrote = await applyConfirmationsBatch(mined)
+        confirmed += wrote
+        wroteOk = true
+        const lastMined = mined[mined.length - 1]!
+        logConfirmed(wrote, lastMined.txid, lastMined.blockHeight)
       } catch (err) {
-        errors++
         console.warn(
           `  ⚠️  batch write failed (${mined.length} txids): ` +
             `${err instanceof Error ? err.message : String(err)}`,
         )
-        // Fall back to one-by-one so a single bad row cannot stall the whole pass.
-        for (const row of mined) {
+
+        // Pooler/admin disconnects: cool down and retry the whole batch once.
+        // Do NOT fall straight into one-by-one — that burns the error budget
+        // (50) on the same dead connection and aborts a healthy run.
+        if (isTransientDbError(err)) {
+          console.warn('  ⏳ transient DB disconnect — cooling 15s, retrying batch')
+          await sleep(15_000)
           try {
-            await confirmReading(row.txid, row.blockHeight, row.blockTime)
-            confirmed++
-          } catch (inner) {
-            errors++
+            const wrote = await applyConfirmationsBatch(mined)
+            confirmed += wrote
+            wroteOk = true
+            const lastMined = mined[mined.length - 1]!
+            logConfirmed(wrote, lastMined.txid, lastMined.blockHeight)
+          } catch (retryErr) {
             console.warn(
-              `  ⚠️  ${row.txid.slice(0, 12)}…: ` +
-                `${inner instanceof Error ? inner.message : String(inner)}`,
+              `  ⚠️  batch retry failed: ` +
+                `${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
             )
+          }
+        }
+
+        if (!wroteOk) {
+          errors++
+          let transientHits = 0
+          for (const row of mined) {
+            try {
+              await confirmReading(row.txid, row.blockHeight, row.blockTime)
+              confirmed++
+            } catch (inner) {
+              if (isTransientDbError(inner)) {
+                transientHits++
+                if (transientHits >= 3) {
+                  console.warn(
+                    '  ⏳ DB connection storm during row fallback — cooling 30s, skipping rest of batch',
+                  )
+                  await sleep(30_000)
+                  break
+                }
+                await sleep(1_000)
+                continue
+              }
+              errors++
+              if (errors <= 15) {
+                console.warn(
+                  `  ⚠️  ${row.txid.slice(0, 12)}…: ` +
+                    `${inner instanceof Error ? inner.message : String(inner)}`,
+                )
+              }
+            }
           }
         }
       }
