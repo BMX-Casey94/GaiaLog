@@ -2,7 +2,14 @@
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { Calendar, ChevronDown, Filter, X, Layers } from "lucide-react"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Calendar, Filter, X, Layers } from "lucide-react"
 import { DATA_TYPE_CONFIG } from "./explorer-types"
 
 interface FilterBarProps {
@@ -25,9 +32,7 @@ interface FilterBarProps {
 const inactiveClasses =
   "border-slate-600/50 text-slate-300 hover:bg-slate-800/40 bg-transparent backdrop-blur-sm"
 
-const selectClasses =
-  "w-full appearance-none rounded-lg border border-slate-600/50 bg-black/40 backdrop-blur-sm " +
-  "px-3 py-2.5 pr-10 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-purple-500/40"
+const ALL_TYPES_VALUE = "all"
 
 export function FilterBar({
   selectedType,
@@ -45,10 +50,10 @@ export function FilterBar({
     return (typeCounts[key] ?? 0) > 0
   })
 
-  const selectedLabel =
-    selectedType == null
-      ? "All Types"
-      : DATA_TYPE_CONFIG[selectedType]?.label || selectedType
+  const SelectedIcon =
+    selectedType && DATA_TYPE_CONFIG[selectedType]
+      ? DATA_TYPE_CONFIG[selectedType].icon
+      : Layers
 
   const dateRangePanel = showFilters ? (
     <div className="flex flex-wrap justify-center gap-3 sm:gap-4 mb-6 animate-in fade-in slide-in-from-top-2 duration-200">
@@ -87,28 +92,54 @@ export function FilterBar({
 
   return (
     <>
-      {/* Mobile: compact type select + date toggle (avoids a wall of chips) */}
+      {/* Mobile: custom dark type menu + date toggle */}
       <div className="md:hidden flex flex-col gap-3 mb-4 max-w-lg mx-auto w-full">
-        <div className="relative">
-          <label htmlFor="explorer-type-select" className="sr-only">
-            Data type
-          </label>
-          <select
-            id="explorer-type-select"
-            value={selectedType ?? ""}
-            onChange={(e) => setSelectedType(e.target.value || null)}
-            className={selectClasses}
-            aria-label={`Data type filter, currently ${selectedLabel}`}
+        <Select
+          value={selectedType ?? ALL_TYPES_VALUE}
+          onValueChange={(value) =>
+            setSelectedType(value === ALL_TYPES_VALUE ? null : value)
+          }
+        >
+          <SelectTrigger
+            aria-label="Data type filter"
+            className="h-11 w-full rounded-xl border-slate-600/50 bg-black/40 text-slate-100 backdrop-blur-sm focus:ring-purple-500/40 focus:ring-offset-0"
           >
-            <option value="">All Types</option>
-            {typeEntries.map(([key, config]) => (
-              <option key={key} value={key}>
-                {config.label}
-              </option>
-            ))}
-          </select>
-          <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-        </div>
+            <span className="flex min-w-0 flex-1 items-center gap-2 text-left">
+              <SelectedIcon className="h-4 w-4 shrink-0 text-purple-300" />
+              <SelectValue placeholder="All Types" />
+            </span>
+          </SelectTrigger>
+          <SelectContent
+            position="popper"
+            className="z-[10000] max-h-[min(24rem,60vh)] w-[var(--radix-select-trigger-width)] overflow-hidden rounded-xl border-slate-700/70 bg-slate-950/95 text-slate-100 shadow-2xl shadow-purple-950/40 backdrop-blur-md [&_[data-radix-select-viewport]]:h-auto [&_[data-radix-select-viewport]]:max-h-[min(22rem,55vh)]"
+          >
+            <SelectItem
+              value={ALL_TYPES_VALUE}
+              className="cursor-pointer rounded-lg py-2.5 pl-8 pr-3 text-slate-100 focus:bg-purple-600/30 focus:text-white data-[highlighted]:bg-purple-600/30 data-[highlighted]:text-white"
+            >
+              <span className="inline-flex items-center gap-2">
+                <Layers className="h-4 w-4 text-purple-300" />
+                All Types
+              </span>
+            </SelectItem>
+            {typeEntries.map(([key, config]) => {
+              const Icon = config.icon
+              return (
+                <SelectItem
+                  key={key}
+                  value={key}
+                  className="cursor-pointer rounded-lg py-2.5 pl-8 pr-3 text-slate-100 focus:bg-purple-600/30 focus:text-white data-[highlighted]:bg-purple-600/30 data-[highlighted]:text-white"
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <Icon className="h-4 w-4 text-slate-300" />
+                    {config.label}
+                  </span>
+                </SelectItem>
+              )
+            })}
+          </SelectContent>
+        </Select>
+
         <Button
           variant={showFilters ? "purple" : "outline"}
           size="sm"
