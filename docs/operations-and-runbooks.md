@@ -109,13 +109,23 @@ Expect roughly 10–20 lookups/second on the free Bitails tier; if you see susta
 
 If Supabase shows `Parallel Seq Scan on overlay_explorer_readings` with
 `duration: 15–18s` on the backfill SELECT, migration `0023` is missing — stop the
-backfill, run `npm run db:migrate`, then resume. CREATE TABLE IF NOT EXISTS spam
-for `worker_queue` / `*_onchain` during that load is usually worker process churn
-under DB pressure, not a separate schema bug; restart workers after the index lands:
+backfill, run `npm run db:migrate`, then resume.
+
+### CREATE TABLE IF NOT EXISTS spam (`worker_queue` / `*_onchain` / `utxo_locks`)
+
+Those tables are owned by migration `0024`. App code probes `to_regclass` and
+skips DDL when they already exist. If logs still show CREATE TABLE storms,
+workers are on a pre-probe build — pull, migrate, restart:
 
 ```bash
-pm2 restart gaialog-workers --update-env
+cd /opt/gaialog
+git pull origin master
+npm run db:migrate
+pm2 restart gaialog-web gaialog-overlay gaialog-workers --update-env
 ```
+
+Keep `PGPOOL_MAX × PM2 apps ≲ Supavisor pool size` (e.g. pooler 35 →
+`PGPOOL_MAX=5`–`8`, not `15`).
 
 ### Explorer 500: `timeout exceeded when trying to connect`
 

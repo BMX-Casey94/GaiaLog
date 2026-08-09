@@ -1,4 +1,5 @@
 import { query } from '@/lib/db'
+import { ensureRelationsExist } from '@/lib/ensure-relation'
 import { createHash } from 'crypto'
 import { stringifyCanonical } from './utils'
 
@@ -414,42 +415,48 @@ export async function upsertTxLog(entry: {
 }
 
 
-// On-chain per-transaction copies (non-destructive; created lazily).
-// Assign the Promise synchronously before awaiting so concurrent first
-// callers share one CREATE instead of racing dozens of identical DDL
-// statements (visible as CREATE TABLE spam in Supabase logs).
+// On-chain per-transaction copies (non-destructive). Prefer migration 0024;
+// runtime path only probes existence and creates on a truly fresh DB.
+const ONCHAIN_TABLES_DDL = `
+  CREATE TABLE IF NOT EXISTS air_quality_onchain (
+    txid text PRIMARY KEY,
+    provider text,
+    collected_at timestamptz,
+    payload jsonb
+  );
+  CREATE TABLE IF NOT EXISTS water_levels_onchain (
+    txid text PRIMARY KEY,
+    provider text,
+    collected_at timestamptz,
+    payload jsonb
+  );
+  CREATE TABLE IF NOT EXISTS seismic_onchain (
+    txid text PRIMARY KEY,
+    provider text,
+    collected_at timestamptz,
+    payload jsonb
+  );
+  CREATE TABLE IF NOT EXISTS advanced_metrics_onchain (
+    txid text PRIMARY KEY,
+    provider text,
+    collected_at timestamptz,
+    payload jsonb
+  );
+`
+
 let _onchainTablesReady: Promise<void> | null = null
 
 function ensureOnchainTables(): Promise<void> {
   if (!_onchainTablesReady) {
-    _onchainTablesReady = (async () => {
-      await query(`
-        CREATE TABLE IF NOT EXISTS air_quality_onchain (
-          txid text PRIMARY KEY,
-          provider text,
-          collected_at timestamptz,
-          payload jsonb
-        );
-        CREATE TABLE IF NOT EXISTS water_levels_onchain (
-          txid text PRIMARY KEY,
-          provider text,
-          collected_at timestamptz,
-          payload jsonb
-        );
-        CREATE TABLE IF NOT EXISTS seismic_onchain (
-          txid text PRIMARY KEY,
-          provider text,
-          collected_at timestamptz,
-          payload jsonb
-        );
-        CREATE TABLE IF NOT EXISTS advanced_metrics_onchain (
-          txid text PRIMARY KEY,
-          provider text,
-          collected_at timestamptz,
-          payload jsonb
-        );
-      `)
-    })().catch((err) => {
+    _onchainTablesReady = ensureRelationsExist(
+      [
+        'public.air_quality_onchain',
+        'public.water_levels_onchain',
+        'public.seismic_onchain',
+        'public.advanced_metrics_onchain',
+      ],
+      ONCHAIN_TABLES_DDL,
+    ).catch((err) => {
       _onchainTablesReady = null
       throw err
     })

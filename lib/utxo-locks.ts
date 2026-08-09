@@ -1,4 +1,5 @@
 import { query } from '@/lib/db'
+import { ensureRelationExists } from '@/lib/ensure-relation'
 
 export interface UtxoLockMetrics {
   pruneRuns: number
@@ -27,20 +28,22 @@ export function getLockOwnerId(): string {
   return PROCESS_OWNER_ID
 }
 
+const UTXO_LOCKS_DDL = `
+  CREATE TABLE IF NOT EXISTS utxo_locks (
+    utxo_key text PRIMARY KEY,
+    reserved_by text NOT NULL,
+    reserved_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS utxo_locks_expires_idx ON utxo_locks(expires_at);
+`
+
 let _locksTableReady: Promise<void> | null = null
 
 export function ensureUtxoLocksTable(): Promise<void> {
   if (!_locksTableReady) {
-    _locksTableReady = query(`
-      CREATE TABLE IF NOT EXISTS utxo_locks (
-        utxo_key text PRIMARY KEY,
-        reserved_by text NOT NULL,
-        reserved_at timestamptz NOT NULL DEFAULT now(),
-        created_at timestamptz NOT NULL DEFAULT now(),
-        expires_at timestamptz NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS utxo_locks_expires_idx ON utxo_locks(expires_at);
-    `).then(() => {}).catch((err) => {
+    _locksTableReady = ensureRelationExists('public.utxo_locks', UTXO_LOCKS_DDL).catch((err) => {
       _locksTableReady = null
       throw err
     })
