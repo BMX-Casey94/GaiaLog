@@ -20,6 +20,13 @@ export interface QueueItem {
   timestamp: number
   retryCount: number
   maxRetries: number
+  /**
+   * True when this row is already owned by this worker in the database, so the
+   * batch must not try to claim it again. Hydration claims on the way in;
+   * anything added directly by addToQueue is not yet owned and is claimed at
+   * process time.
+   */
+  dbClaimed?: boolean
 }
 
 export interface QueueStats {
@@ -55,7 +62,18 @@ export class WorkerQueue {
   private highPriorityQueue: QueueItem[] = []
   private normalPriorityQueue: QueueItem[] = []
   private processingQueue: QueueItem[] = []
-  private completedItems: QueueItem[] = []
+  /**
+   * Count of completed items, not a list of them.
+   *
+   * This was a `QueueItem[]` that nothing ever pruned, so every successful
+   * broadcast retained its full payload for the lifetime of the process. At the
+   * measured collection rate (~158k readings/day) that is hundreds of MB per
+   * day, which matches the heap-pressure backoff the worker already implements
+   * and the "runs for a few days then stalls" pattern reported in production.
+   * Only the count is ever read (getQueueStats, getQueueStatus), so the retained
+   * payloads served no purpose.
+   */
+  private completedCount = 0
   private failedItems: QueueItem[] = []
   private lastServedHighLane: 'throughput' | 'coverage' = 'coverage'
   private lastServedNormalLane: 'throughput' | 'coverage' = 'coverage'
@@ -177,7 +195,7 @@ export class WorkerQueue {
       })
       return null
     }
-    const id = this.generateItemId()
+    const id = this.generateItemId(data)
     const item: QueueItem = {
       id,
       priority,
@@ -185,7 +203,9 @@ export class WorkerQueue {
       data,
       timestamp: Date.now(),
       retryCount: 0,
-      maxRetries: bsvConfig.transaction.maxRetries
+      maxRetries: bsvConfig.transaction.maxRetries,
+      // Not yet owned in the DB; processQueue claims it before it is used.
+      dbClaimed: false,
     }
 
     if (priority === 'high') {
@@ -223,9 +243,10 @@ export class WorkerQueue {
       ? this.stats.totalProcessed / ((now - this.stats.startTime) / 1000)
       : 0
 
-    const averageWaitTime = this.completedItems.length > 0
-      ? this.completedItems.reduce((sum, item) => sum + (item.timestamp - item.timestamp), 0) / this.completedItems.length
-      : 0
+    // Wait time was previously computed as `item.timestamp - item.timestamp`,
+    // which is always zero. Nothing records enqueue time on the item, so this
+    // stays zero rather than presenting a fabricated measurement.
+    const averageWaitTime = 0
 
     const errorRate = this.stats.totalProcessed > 0
       ? this.stats.totalFailed / this.stats.totalProcessed
@@ -238,7 +259,7 @@ export class WorkerQueue {
       throughputLaneItems,
       coverageLaneItems,
       processingItems: this.processingQueue.length,
-      completedItems: this.completedItems.length,
+      completedItems: this.completedCount,
       failedItems: this.failedItems.length,
       processingRate,
       averageWaitTime,
@@ -257,7 +278,7 @@ export class WorkerQueue {
       highPriority: this.highPriorityQueue.length,
       normalPriority: this.normalPriorityQueue.length,
       processing: this.processingQueue.length,
-      completed: this.completedItems.length,
+      completed: this.completedCount,
       failed: this.failedItems.length
     }
   }
@@ -300,6 +321,8 @@ export class WorkerQueue {
           timestamp: Number(r.timestamp) || Date.now(),
           retryCount: Number(r.retry_count) || 0,
           maxRetries: Number(r.max_retries) || bsvConfig.transaction.maxRetries,
+          // claimPendingQueueItems has already moved these rows to processing.
+          dbClaimed: true,
         }
         if (q.priority === 'high') this.highPriorityQueue.push(q)
         else this.normalPriorityQueue.push(q)
@@ -421,25 +444,55 @@ export class WorkerQueue {
 
       if (batch.length === 0) return
 
-      // Set-based transition: one statement for the whole batch rather than one
-      // per item. See markQueueItemsProcessing for the measured cost of the
-      // per-item form (48,997,412 calls at a 4.2 ms mean).
-      markQueueItemsProcessing(batch.map(item => item.id)).catch(() => {})
+      // Rows hydrated in from the DB are already claimed. Anything pushed
+      // straight into memory by addToQueue is not, so claim it here. The UPDATE
+      // only matches rows still in 'queued', so if two workers collected the same
+      // reading independently, exactly one of them takes it. Without this the
+      // on-chain check downstream was the only thing preventing a duplicate
+      // broadcast, and that check cannot see a concurrent broadcast in flight.
+      const unclaimed = batch.filter(item => !item.dbClaimed)
+      if (unclaimed.length > 0) {
+        let ownedIds: string[]
+        try {
+          ownedIds = await markQueueItemsProcessing(unclaimed.map(item => item.id))
+        } catch (e) {
+          // Fail closed: put them back rather than risk processing without a claim.
+          console.warn('Queue claim failed; returning the batch to the queue:', e)
+          for (const item of unclaimed) {
+            if (item.priority === 'high') this.highPriorityQueue.unshift(item)
+            else this.normalPriorityQueue.unshift(item)
+          }
+          return
+        }
+        const owned = new Set(ownedIds)
+        for (const item of unclaimed) {
+          if (owned.has(item.id)) item.dbClaimed = true
+        }
+      }
+
+      // A row another worker already claimed, or one that has already left the
+      // queue, must not be processed here.
+      const runnable = batch.filter(item => item.dbClaimed)
+      const skipped = batch.length - runnable.length
+      if (skipped > 0 && bsvConfig.logging.level === 'debug') {
+        console.log(`⏭️  Skipped ${skipped} item(s) already claimed or gone`)
+      }
+      if (runnable.length === 0) return
 
       const batchStartTime = Date.now()
       let itemIndex = 0
       const workers = Array.from(
-        { length: Math.min(concurrency, batch.length) },
+        { length: Math.min(concurrency, runnable.length) },
         async () => {
           while (true) {
             const idx = itemIndex++
-            if (idx >= batch.length) break
-            await this.processItem(batch[idx])
+            if (idx >= runnable.length) break
+            await this.processItem(runnable[idx])
           }
         },
       )
       await Promise.all(workers)
-      const processedCount = batch.length
+      const processedCount = runnable.length
 
       const batchDuration = Date.now() - batchStartTime
       const minBatchDuration = (1000 / bsvConfig.queue.maxTxPerSecond) * processedCount
@@ -490,7 +543,7 @@ export class WorkerQueue {
             if (bsvConfig.logging.level === 'debug') {
               console.log(`⏭️  Skipping already-on-chain item ${item.id} for stream ${stream}`)
             }
-            this.completedItems.push(item)
+            this.completedCount++
             this.stats.totalProcessed++
             markQueueItemCompleted(item.id).catch(() => {})
             return
@@ -532,7 +585,7 @@ export class WorkerQueue {
 
       if (resultTxid && wasBroadcast) {
         // Success - move to completed
-        this.completedItems.push(item)
+        this.completedCount++
         this.stats.totalProcessed++
         this.processedCountSinceLastSample++
         if (bsvConfig.logging.level === 'debug') {
@@ -739,7 +792,7 @@ export class WorkerQueue {
       } else if (errorUpper.includes('ALREADY_KNOWN')) {
         // Transaction already in mempool/blockchain - don't retry
         console.log(`ℹ️  Transaction ${item.id} already known to network - marking as completed`)
-        this.completedItems.push(item)
+        this.completedCount++
         this.stats.totalProcessed++
         markQueueItemCompleted(item.id).catch(() => {})
         return
@@ -831,10 +884,35 @@ export class WorkerQueue {
     return { ...this.lastGateInfo }
   }
 
-  private generateItemId(): string {
-    const timestamp = Date.now()
+  /**
+   * Derive the queue id from the reading's own identity, not from the clock.
+   *
+   * The previous `${Date.now()}_${random}` form was unique by construction, so
+   * `ON CONFLICT (id) DO NOTHING` in enqueueQueueItem could never fire. The only
+   * gates before an enqueue were the in-memory dedupe store and the on-chain
+   * check, and every restart empties the in-memory store, so each restart
+   * re-enqueued every reading not yet written on-chain as a brand new row. That
+   * is what grew worker_queue to 3.1M rows / 3.3 GB, and a sampled backlog was
+   * 87% duplicate payloads (138,952 rows, 18,637 distinct).
+   *
+   * `source_hash` is the content identity the reading tables already key on
+   * (`ON CONFLICT (source_hash)`) and the value checked against the chain before
+   * enqueue, so it is the natural key here too. Namespacing by `type` stops two
+   * readings of different families that happened to hash alike from colliding.
+   *
+   * Retries are unaffected: requeueQueueItem updates the existing row in place,
+   * so the id is stable for the whole retry lifecycle.
+   */
+  private generateItemId(data: BSVTransactionData): string {
+    const sourceHash = typeof data.source_hash === 'string' ? data.source_hash.trim() : ''
+    if (sourceHash) {
+      const namespace = data.type || data.family || 'unknown'
+      return `${namespace}:${sourceHash}`
+    }
+    // No content identity: fall back to the previous scheme rather than let many
+    // unrelated readings collapse onto a single key.
     const random = Math.random().toString(36).substring(2, 15)
-    return `${timestamp}_${random}`
+    return `${Date.now()}_${random}`
   }
 
   public stop(): void {
@@ -854,7 +932,7 @@ export class WorkerQueue {
     this.highPriorityQueue = []
     this.normalPriorityQueue = []
     this.processingQueue = []
-    this.completedItems = []
+    this.completedCount = 0
     this.failedItems = []
     console.log('🧹 All queues cleared')
   }

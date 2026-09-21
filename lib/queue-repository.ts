@@ -147,7 +147,8 @@ export async function markQueueItemProcessing(id: string): Promise<void> {
 }
 
 /**
- * Batch variant of {@link markQueueItemProcessing}.
+ * Batch claim: move a set of items to `processing`, and report which ones this
+ * caller actually took.
  *
  * `processQueue()` transitions an entire batch in a single loop, so issuing one
  * UPDATE per item turned one logical operation into up to `batchSize` separate
@@ -155,14 +156,27 @@ export async function markQueueItemProcessing(id: string): Promise<void> {
  * form had accumulated 48,997,412 calls at a 4.2 ms mean. Doing the same work
  * set-based collapses it to one round trip — and one index-maintenance pass —
  * per batch.
+ *
+ * The `status = 'queued'` predicate is what makes this a claim rather than a
+ * label change. If two workers collected the same reading, both will try to
+ * claim it; the first commits, and the second's UPDATE re-evaluates once the row
+ * lock is released, finds the status no longer 'queued', and returns no id for
+ * it. Only ids returned here may be broadcast, so a reading cannot be sent twice
+ * on the addToQueue path. Rows hydrated by claimPendingQueueItems are already
+ * 'processing' and are not passed to this function.
  */
-export async function markQueueItemsProcessing(ids: string[]): Promise<void> {
-  if (ids.length === 0) return
+export async function markQueueItemsProcessing(ids: string[]): Promise<string[]> {
+  if (ids.length === 0) return []
   await ensureQueueTable()
-  await query(
-    `UPDATE worker_queue SET status='processing', updated_at=now() WHERE id = ANY($1::text[])`,
+  const res = await query(
+    `UPDATE worker_queue
+        SET status='processing', updated_at=now()
+      WHERE id = ANY($1::text[])
+        AND status = 'queued'
+     RETURNING id`,
     [ids]
   )
+  return (((res as any).rows || []) as Array<{ id: string }>).map((r) => r.id)
 }
 
 export async function markQueueItemCompleted(id: string): Promise<void> {

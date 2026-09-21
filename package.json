@@ -21,6 +21,7 @@
     "load:test": "tsx scripts/load-test.ts",
     "test:auto-init": "tsx scripts/test-auto-init.ts",
     "verify:auto-init": "tsx scripts/verify-auto-init-setup.ts",
+    "verify:queue-dedupe": "tsx scripts/verify-queue-dedupe.ts",
     "validate:opreturn": "tsx scripts/validate-opreturn.ts",
     "explorer:sync": "tsx scripts/run-explorer-sync.ts",
     "explorer:geocode-backfill": "tsx scripts/backfill-geocode.ts",
