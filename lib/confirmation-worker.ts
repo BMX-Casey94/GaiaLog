@@ -89,8 +89,24 @@ interface CandidateTxid {
  * Pull a small batch of unconfirmed txids that are old enough to plausibly
  * have been mined but young enough to still be worth chasing.  We sample
  * from overlay_explorer_readings as the canonical source — every broadcast
- * we care about ends up there, and the index on (confirmed, reading_ts) makes
- * this cheap.
+ * we care about ends up there, and the partial index
+ * oer_unconfirmed_admitted_idx on (admitted_at) WHERE confirmed = false
+ * makes this cheap.
+ *
+ * The window is keyed on `admitted_at` (when WE broadcast and inserted the
+ * row), not `reading_ts` (the sensor's own reading timestamp). The two are
+ * not interchangeable:
+ *
+ *   - `reading_ts` can lag `admitted_at` by hours when historical readings
+ *     are ingested in a burst. A row broadcast at 17:03 carrying
+ *     reading_ts=07:18 was already 9.7h "old" at insert time, so it fell
+ *     outside the 2h primary window and short of the 72h catch-up floor —
+ *     invisible to BOTH, and therefore never chased or confirmed.
+ *   - Some rows carry a sentinel reading_ts entirely (observed: 2007-11-07).
+ *
+ * Keying on `admitted_at` makes every row reachable exactly once, in the
+ * window that matches its real age. Rows that never mine simply age out,
+ * so the window cannot be permanently clogged by dead txids.
  */
 async function fetchCandidates(): Promise<CandidateTxid[]> {
   const minAge = `${MIN_AGE_SECONDS} seconds`
@@ -100,9 +116,9 @@ async function fetchCandidates(): Promise<CandidateTxid[]> {
     `SELECT txid
        FROM overlay_explorer_readings
       WHERE confirmed = false
-        AND reading_ts < now() - $1::interval
-        AND reading_ts > now() - $2::interval
-      ORDER BY reading_ts ASC
+        AND admitted_at < now() - $1::interval
+        AND admitted_at > now() - $2::interval
+      ORDER BY admitted_at ASC
       LIMIT $3`,
     [minAge, maxAge, BATCH_SIZE],
   )
@@ -119,9 +135,9 @@ async function fetchCandidates(): Promise<CandidateTxid[]> {
     `SELECT txid
        FROM overlay_explorer_readings
       WHERE confirmed = false
-        AND reading_ts <= now() - $1::interval
-        AND reading_ts > now() - $2::interval
-      ORDER BY reading_ts DESC
+        AND admitted_at <= now() - $1::interval
+        AND admitted_at > now() - $2::interval
+      ORDER BY admitted_at DESC
       LIMIT $3`,
     [maxAge, catchup, residual],
   )
