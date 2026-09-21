@@ -1311,15 +1311,29 @@ export class BlockchainService {
         if (availableForFee < explicitFee + DUST_LIMIT) {
           throw new Error(`Selected inputs do not cover explicit fee + 1 sat change: input=${inputSats} explicitFee=${explicitFee} (need at least ${explicitFee + opReturnOutputSats + DUST_LIMIT})`)
         }
-        // BSV has no dust limit; always emit a change output so fee = explicitFee deterministically.
+        // Change below minInputSatoshis can never be acquired for another write, so
+        // emitting it admits a permanently stranded row to the inventory. Every split
+        // output previously decayed into exactly one such row (500 -> 404 -> 308 -> 212
+        // -> 116 stranded), which is how the wallets accumulated 179,437 sub-floor UTXOs
+        // holding 4.46M unusable sats. Below the floor we pay the remainder as fee
+        // instead; the transaction then has no change output and leaves nothing behind.
+        const projectedChange = inputSats - opReturnOutputSats - explicitFee
+        const emitChange = projectedChange >= minInputSatoshis
+
         const tx = new (bsv as any).Transaction()
           .from(bitcoreUtxos)
           .addOutput(new bsv.Transaction.Output({
             script: opReturnScript,
             satoshis: opReturnOutputSats,
           }))
-          .fee(explicitFee)
-          .change(address)
+        if (emitChange) {
+          // BSV has no dust limit; emit change so fee = explicitFee deterministically.
+          tx.fee(explicitFee).change(address)
+        } else {
+          // No change output: the fee is implicitly the whole remainder, which raises the
+          // effective sat/byte rate. That is always above ARC's policy floor, never below.
+          tx.fee(availableForFee)
+        }
         const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
         tx.sign(signingKey)
         const serialized = tx.serialize()
