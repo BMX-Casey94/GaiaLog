@@ -3,7 +3,7 @@ import { blockchainService } from './blockchain'
 import { bsvConfig } from './bsv-config'
 import { walletManager } from './wallet-manager'
 import { setAdvancedTxId, setAirQualityTxId, setSeismicTxId, setWaterLevelTxId, hasAirQualityTxId, hasWaterLevelTxId, hasSeismicTxId, hasAdvancedTxId } from './repositories'
-import { ensureQueueTable, enqueueQueueItem, iteratePendingQueueItems, reclaimStuckQueueItems, markQueueItemCompleted, markQueueItemFailed, markQueueItemsProcessing, requeueQueueItem, cleanupOldFailedItems } from './queue-repository'
+import { ensureQueueTable, enqueueQueueItem, claimPendingQueueItems, reclaimStuckQueueItems, markQueueItemCompleted, markQueueItemFailed, markQueueItemsProcessing, requeueQueueItem, cleanupOldFailedItems } from './queue-repository'
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getOverlayFallbackConfig } from './overlay-config'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet } from './spend-source'
@@ -143,6 +143,31 @@ export class WorkerQueue {
   }
 
   public addToQueue(data: BSVTransactionData, priority: 'high' | 'normal' = 'normal'): string | null {
+    // Global queue ceiling. bsvConfig.queue.maxQueueSize was parsed from
+    // BSV_MAX_QUEUE_SIZE but never enforced anywhere, which is how a funding
+    // outage grew worker_queue without bound — it reached 3.1M rows / 3.3 GB
+    // with nothing able to drain it, and once the backlog dominated the table
+    // the hydration and retention statements could no longer complete at all.
+    // Bounding the in-memory queues bounds the table, because every enqueue
+    // persists a row, and it costs no extra query on this hot path.
+    const queuedTotal =
+      this.highPriorityQueue.length +
+      this.normalPriorityQueue.length +
+      this.processingQueue.length
+    if (queuedTotal >= bsvConfig.queue.maxQueueSize) {
+      if (this.shouldLogQueueSkip('maxQueueSize')) {
+        console.warn(
+          `⏸️ Queue at capacity (${queuedTotal}/${bsvConfig.queue.maxQueueSize}); rejecting enqueue`,
+        )
+      }
+      throughputObservability.recordQueueBackpressured({
+        family: data.family,
+        providerId: data.providerId,
+        datasetId: data.datasetId,
+        queueLane: data.queueLane,
+      })
+      return null
+    }
     if (!this.canAcceptItem(data)) {
       throughputObservability.recordQueueBackpressured({
         family: data.family,
@@ -248,37 +273,50 @@ export class WorkerQueue {
     this.isProcessing = true
     console.log('🔄 Starting worker queue processing...')
 
-    // Reclaim items abandoned by a previous run, then hydrate the in-memory
-    // queues from the DB in bounded pages. Hydration previously issued one
-    // 10,000-row query that could not complete on a large backlog (see
-    // iteratePendingQueueItems for the measured plan), which left the in-memory
-    // queues empty and stopped all processing after a restart.
+    // Reclaim items abandoned by a previous run, then atomically claim work for
+    // this worker. Claiming rather than reading means two workers can never load
+    // the same item; see claimPendingQueueItems for why the predicate is a single
+    // status and why the old form could not complete.
+    const hydrate = async (): Promise<boolean> => {
+      const reclaimed = await reclaimStuckQueueItems()
+      if (reclaimed > 0) {
+        console.log(`♻️  Reclaimed ${reclaimed} stuck processing item(s)`)
+      }
+      // Claiming while writes are paused would park rows in `processing` that
+      // this worker will not act on, and a later worker start would reclaim and
+      // double-hold them. Wait for funding instead.
+      if (isWritePausedForFunding()) {
+        console.warn('⏸️  Deferring queue claim: writes paused (wallet funding dry)')
+        return false
+      }
+      const claimed = await claimPendingQueueItems()
+      // The DB returns them oldest-first; push preserving priority per row.
+      for (const r of claimed) {
+        const q: QueueItem = {
+          id: r.id,
+          priority: (r.priority === 'high' ? 'high' : 'normal'),
+          lane: ((r.data as any)?.queueLane === 'throughput' ? 'throughput' : 'coverage'),
+          data: r.data as any,
+          timestamp: Number(r.timestamp) || Date.now(),
+          retryCount: Number(r.retry_count) || 0,
+          maxRetries: Number(r.max_retries) || bsvConfig.transaction.maxRetries,
+        }
+        if (q.priority === 'high') this.highPriorityQueue.push(q)
+        else this.normalPriorityQueue.push(q)
+      }
+      console.log(`💾 Claimed ${claimed.length} queued item(s) from DB`)
+      return true
+    }
+
     ensureQueueTable().then(async () => {
       try {
-        const reclaimed = await reclaimStuckQueueItems()
-        if (reclaimed > 0) {
-          console.log(`♻️  Reclaimed ${reclaimed} stuck processing item(s)`)
-        }
-
-        let hydrated = 0
-        for await (const page of iteratePendingQueueItems()) {
-          // Keep order by timestamp; push into normal queue (preserve priority per row)
-          for (const r of page) {
-            const q: QueueItem = {
-              id: r.id,
-              priority: (r.priority === 'high' ? 'high' : 'normal'),
-              lane: ((r.data as any)?.queueLane === 'throughput' ? 'throughput' : 'coverage'),
-              data: r.data as any,
-              timestamp: Number(r.timestamp) || Date.now(),
-              retryCount: Number(r.retry_count) || 0,
-              maxRetries: Number(r.max_retries) || bsvConfig.transaction.maxRetries,
-            }
-            if (q.priority === 'high') this.highPriorityQueue.push(q)
-            else this.normalPriorityQueue.push(q)
-          }
-          hydrated += page.length
-        }
-        console.log(`💾 Hydrated ${hydrated} queued item(s) from DB`)
+        if (await hydrate()) return
+        // Funding outage: retry until the wallet holds spendable inventory again.
+        const retry = setInterval(() => {
+          hydrate()
+            .then((done) => { if (done) clearInterval(retry) })
+            .catch((e) => console.warn('Queue claim error:', e))
+        }, 60_000)
       } catch (e) {
         console.warn('Queue hydration error:', e)
       }

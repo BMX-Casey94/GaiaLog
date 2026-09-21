@@ -56,8 +56,8 @@ export async function enqueueQueueItem(row: Omit<QueueRow, 'status' | 'last_erro
 /**
  * Reclaim `processing` rows abandoned by a worker that died mid-batch.
  *
- * Split out from hydration because it is a write, and hydration now runs as
- * many small reads. 2 minutes is the threshold the original combined function
+ * Split out from hydration because it is a write, and claiming is done by a
+ * separate statement. 2 minutes is the threshold the original combined function
  * used; it remains comfortably longer than any single item's processing time.
  */
 export async function reclaimStuckQueueItems(): Promise<number> {
@@ -71,136 +71,75 @@ export async function reclaimStuckQueueItems(): Promise<number> {
   return (res as any).rowCount || 0
 }
 
-const HYDRATE_MAX_ITEMS = Math.max(
+const CLAIM_MAX_ITEMS = Math.max(
   1,
   Number(process.env.BSV_QUEUE_HYDRATE_MAX_ITEMS || 10000),
 )
-const HYDRATE_PAGE_SIZE = Math.min(
-  1000,
-  Math.max(
-    1,
-    Number(process.env.BSV_QUEUE_HYDRATE_PAGE_SIZE || 200),
-  ),
-)
 
 /**
- * One page of pending items, oldest-first, using keyset pagination.
+ * Atomically claim a batch of pending queue items for this worker.
  *
- * ## Why this is written as two UNION ALL branches
+ * ## Why this claims rather than reads
  *
- * The previous single-statement form was:
+ * Hydration used to read rows and leave their status untouched
+ * (`WHERE status IN ('queued','processing')`), so every worker process that
+ * started loaded the same rows into its own memory. With more than one worker
+ * the same item could therefore be processed twice, and the only thing standing
+ * between that and a duplicate broadcast was the on-chain dedup check
+ * downstream. A queue that claims its work removes the duplicate at source.
  *
- *   WHERE status IN ('queued','processing') ORDER BY timestamp ASC LIMIT $1
+ * ## Why the predicate is a single status
  *
- * A btree on `(status, timestamp)` cannot satisfy that ordering. A single index
- * scan returns rows grouped by status — all `processing` then all `queued` (or
- * the reverse) — so the result is not globally timestamp-ordered, and
- * PostgreSQL will not synthesise a MergeAppend over the ScalarArrayOp. With
- * `worker_queue(status)` alone, or with 91% of the table matching the `IN`
- * list, the planner instead chose a **parallel sequential scan plus a full
- * sort**. Measured on production:
+ * A btree on `(status, timestamp)` cannot satisfy `status IN (...)` with
+ * `ORDER BY timestamp`. One index scan returns rows grouped by status rather
+ * than in global timestamp order, and the planner does not synthesise a
+ * MergeAppend over the ScalarArrayOp. Measured on production:
  *
- *   status = 'queued'                          -> Index Scan, cost 0.43..361.67
- *   status = ANY('{queued,processing}')        -> Parallel Seq Scan + Sort,
+ *   WHERE status = 'queued'                    -> Index Scan, cost 0.43..361.67
+ *   WHERE status IN ('queued','processing')    -> Parallel Seq Scan + Sort,
  *                                                 cost 411,162.78 for LIMIT 200
  *
- * The `IN` form therefore scanned the whole 2.6 GB heap to return the first 200
- * rows, and a 10,000-row hydration did not complete at all (confirmed:
- * `EXPLAIN ANALYZE` cancelled at 150 s, and a live worker sat in the statement
- * for 121 s). Splitting the predicate into one branch per status lets each
- * branch use the index in timestamp order and stop after `LIMIT`, and the outer
- * sort then operates on at most 2 x LIMIT rows rather than millions.
+ * The `IN` form scanned the whole heap to return the first page, and a
+ * 10,000-row hydration never completed (cancelled at 150 s; a live worker was
+ * observed sitting in it for 121 s), which left the in-memory queues empty and
+ * stopped all processing. Claiming only ever takes `queued` rows, so every
+ * statement is a plain index scan in timestamp order that stops after LIMIT.
  *
- * ## Keyset correctness
+ * ## Atomicity
  *
- * The tuple comparison `(timestamp, id) > (lastTimestamp, lastId)` is a strict
- * total order, so no row is returned twice and none is skipped — including
- * across rows that share a millisecond timestamp, which is common at this
- * write volume. Ordering the outer query by `(timestamp, id)` matches that
- * comparison. A first page is expressed as `timestamp >= 0, id > ''` rather
- * than NULLs, so the predicate needs no special case.
+ * `FOR UPDATE SKIP LOCKED` locks the chosen rows for the remainder of the
+ * statement and skips any row another worker is already claiming, so two
+ * workers cannot receive the same item. The claim and the move to `processing`
+ * happen in one statement. A worker that dies mid-batch leaves rows in
+ * `processing`, which {@link reclaimStuckQueueItems} returns to `queued` after
+ * two minutes.
+ *
+ * `(timestamp, id)` is a strict total order, so the oldest-first selection is
+ * deterministic and does not depend on physical row order.
  */
-const PENDING_PAGE_SQL = `
-  SELECT page.id,
-         page.priority,
-         page.data,
-         page.timestamp,
-         page.retry_count,
-         page.max_retries,
-         page.status,
-         page.last_error,
-         to_char(page.updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
-    FROM (
-      (SELECT id, priority, data, timestamp, retry_count, max_retries, status, last_error, updated_at
-         FROM worker_queue
-        WHERE status = 'queued'
-          AND timestamp >= $1::bigint
-          AND (timestamp > $1::bigint OR id > $2::text)
-        ORDER BY timestamp ASC
-        LIMIT $3::int)
-      UNION ALL
-      (SELECT id, priority, data, timestamp, retry_count, max_retries, status, last_error, updated_at
-         FROM worker_queue
-        WHERE status = 'processing'
-          AND timestamp >= $1::bigint
-          AND (timestamp > $1::bigint OR id > $2::text)
-        ORDER BY timestamp ASC
-        LIMIT $3::int)
-    ) AS page
-   ORDER BY page.timestamp ASC, page.id ASC
-   LIMIT $3::int
+const CLAIM_SQL = `
+  WITH claimed AS (
+    SELECT id
+      FROM worker_queue
+     WHERE status = 'queued'
+     ORDER BY timestamp ASC, id ASC
+     LIMIT $1
+     FOR UPDATE SKIP LOCKED
+  )
+  UPDATE worker_queue AS u
+     SET status = 'processing', updated_at = now()
+    FROM claimed AS c
+   WHERE u.id = c.id
+  RETURNING u.id, u.priority, u.data, u.timestamp, u.retry_count, u.max_retries,
+            u.status, u.last_error,
+            to_char(u.updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
 `
 
-export interface PendingHydrationOptions {
-  /** Hard cap on rows yielded across all pages. Default 10000. */
-  maxItems?: number
-  /** Rows per page. Default 200, clamped to 1..1000. */
-  pageSize?: number
-}
-
-/**
- * Yield pending queue items oldest-first in bounded pages.
- *
- * Yielding page-by-page lets the caller populate its in-memory queues as rows
- * arrive, so a large catch-up does not have to materialise a single huge result
- * set. Every page is a bounded, index-ordered query, so no single statement can
- * run long enough to hit the server-side timeout - the failure mode that left
- * the in-memory queue empty and stopped all processing.
- *
- * Retains the previous behaviour of hydrating both `queued` and `processing`
- * rows: a `processing` row belongs to a worker that may have died, and
- * `reclaimStuckQueueItems` is what returns it to `queued`.
- */
-export async function* iteratePendingQueueItems(
-  options: PendingHydrationOptions = {},
-): AsyncGenerator<QueueRow[], void, void> {
+export async function claimPendingQueueItems(limit: number = CLAIM_MAX_ITEMS): Promise<QueueRow[]> {
   await ensureQueueTable()
-  const maxItems = Math.max(1, Math.floor(options.maxItems ?? HYDRATE_MAX_ITEMS))
-  const pageSize = Math.min(
-    1000,
-    Math.max(1, Math.floor(options.pageSize ?? HYDRATE_PAGE_SIZE)),
-  )
-
-  let loaded = 0
-  let lastTimestamp = 0
-  let lastId = ''
-
-  while (loaded < maxItems) {
-    const take = Math.min(pageSize, maxItems - loaded)
-    const res = await query<QueueRow>(PENDING_PAGE_SQL, [lastTimestamp, lastId, take])
-    const rows = (((res as any).rows || []) as QueueRow[])
-    if (rows.length === 0) return
-
-    yield rows
-    loaded += rows.length
-
-    const tail = rows[rows.length - 1]
-    lastTimestamp = Number(tail.timestamp)
-    lastId = tail.id
-
-    // A short page means the eligible set is exhausted.
-    if (rows.length < take) return
-  }
+  const claimSize = Math.min(CLAIM_MAX_ITEMS, Math.max(1, Math.floor(limit)))
+  const res = await query<QueueRow>(CLAIM_SQL, [claimSize])
+  return (((res as any).rows || []) as QueueRow[])
 }
 
 export async function markQueueItemProcessing(id: string): Promise<void> {
@@ -307,8 +246,3 @@ export async function cleanupOldFailedItems(hoursToRetain: number = 24): Promise
 
   return deleted
 }
-
-
-
-
-
