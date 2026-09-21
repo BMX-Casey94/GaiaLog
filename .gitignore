@@ -56,3 +56,8 @@ next-env.d.ts
 city.list.json
 city.list.json.gz
 *.csv
+
+# ARC callback probe captures — record request headers verbatim, so they contain
+# the callback bearer token in plaintext.
+arc-callback-probe*.jsonl
+probe-selftest*.jsonl
