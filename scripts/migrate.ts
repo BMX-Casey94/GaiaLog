@@ -17,7 +17,21 @@ function migrationOpensOwnTransaction(sql: string): boolean {
   return false
 }
 
-/** Each file is a single CREATE INDEX CONCURRENTLY (cannot batch multiple in one transaction). */
+/**
+ * Migrations that must run OUTSIDE a transaction block.
+ *
+ * Postgres rejects CREATE/DROP INDEX CONCURRENTLY inside an explicit
+ * transaction with SQLSTATE 25001 ("cannot run inside a transaction block"),
+ * so these files are sent on their own instead of inside BEGIN/COMMIT.
+ *
+ * Convention: a file listed here (or matching the content test) must contain a
+ * single statement — CONCURRENTLY is the only reason to bypass the wrapper, and
+ * a multi-statement file would then lose atomicity without gaining anything.
+ *
+ * Detection is deliberately by content as well as by name. The name list alone
+ * is a trap: any new *_concurrent.sql file that is not also added here fails at
+ * deploy time with 25001, which is exactly how 0031 failed.
+ */
 const CONCURRENT_INDEX_MIGRATIONS = new Set([
   '0017_overlay_utxo_inventory_idx_concurrent.sql',
   '0019_overlay_utxo_acquirable_at_idx_concurrent.sql',
@@ -26,10 +40,12 @@ const CONCURRENT_INDEX_MIGRATIONS = new Set([
   '0026_worker_queue_status_timestamp_idx_concurrent.sql',
   '0028_drop_oer_family_ts_idx_concurrent.sql',
   '0029_drop_overlay_topic_removed_idx_concurrent.sql',
+  '0031_oer_unconfirmed_admitted_idx_concurrent.sql',
 ])
 
-function isConcurrentIndexMigration(file: string): boolean {
-  return CONCURRENT_INDEX_MIGRATIONS.has(file)
+function isConcurrentIndexMigration(file: string, sql = ''): boolean {
+  if (CONCURRENT_INDEX_MIGRATIONS.has(file)) return true
+  return /\b(?:CREATE|DROP)\s+INDEX\s+CONCURRENTLY\b/i.test(sql)
 }
 
 async function run() {
@@ -58,7 +74,7 @@ async function run() {
       const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8')
       console.log(`Applying migration: ${file}`)
 
-      if (isConcurrentIndexMigration(file)) {
+      if (isConcurrentIndexMigration(file, sql)) {
         await client.query(sql)
         await client.query('INSERT INTO _migrations(filename) VALUES($1)', [file])
         continue
