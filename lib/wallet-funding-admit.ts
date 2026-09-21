@@ -240,14 +240,20 @@ async function discoverFundingViaHistory(address: string): Promise<BitailsUnspen
 
   let histories: HistoryRow[] = []
   if (Array.isArray(raw)) {
-    // Shape A: [ { address, histories: [...] } ]  or  [ { txid, outputSatoshis, ... } ]
-    if (raw.length > 0 && raw[0] && typeof raw[0] === 'object' && 'histories' in (raw[0] as object)) {
-      histories = ((raw[0] as { histories?: HistoryRow[] }).histories || []) as HistoryRow[]
-    } else {
-      histories = raw as HistoryRow[]
-    }
-  } else if (raw && typeof raw === 'object' && Array.isArray((raw as { histories?: HistoryRow[] }).histories)) {
-    histories = (raw as { histories: HistoryRow[] }).histories
+    // Shape A: [ { address, history: [...] } ]  or  [ { txid, outputSatoshis, ... } ]
+    const first = raw[0] as { history?: unknown; histories?: unknown } | undefined
+    const nested = Array.isArray(first?.history) ? first?.history : first?.histories
+    histories = Array.isArray(nested) ? (nested as HistoryRow[]) : (raw as HistoryRow[])
+  } else if (raw && typeof raw === 'object') {
+    // Live Bitails shape: { address, scripthash, history: [...], pgkey, __meta }.
+    // The key is `history` (SINGULAR). Reading only `histories` here matched
+    // nothing, so this function returned [] on every cycle: the fast path was
+    // dead and each top-up was only discoverable by paging the whole unspent
+    // set — which never completed, because the offset cursor resets on PM2's
+    // 30-minute cron_restart before reaching outputs minted at the tail.
+    const obj = raw as { history?: unknown; histories?: unknown }
+    const nested = Array.isArray(obj.history) ? obj.history : obj.histories
+    if (Array.isArray(nested)) histories = nested as HistoryRow[]
   }
 
   const received = histories.filter((h) => {
