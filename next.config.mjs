@@ -14,21 +14,61 @@ const nextConfig = {
     unoptimized: true,
   },
   async headers() {
-    return [
+    // WhatsOnChain renders decoder webhooks inside an iframe on its transaction
+    // pages. Sending `X-Frame-Options: SAMEORIGIN` on those paths makes the
+    // browser refuse to display them (ERR_BLOCKED_BY_RESPONSE — "refused to
+    // connect"), so the framing policy is expressed with CSP instead.
+    const baseSecurityHeaders = [
       {
-        source: '/:path*',
+        key: 'Strict-Transport-Security',
+        value: 'max-age=63072000; includeSubDomains; preload',
+      },
+      { key: 'X-Content-Type-Options', value: 'nosniff' },
+      { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+      {
+        key: 'Permissions-Policy',
+        value: 'camera=(), microphone=(), geolocation=()',
+      },
+    ]
+
+    // Mainnet, testnet and STN all sit under the whatsonchain.com domain, so the
+    // wildcard covers every network without allowing third-party framing.
+    const wocFrameAncestors =
+      "frame-ancestors 'self' https://whatsonchain.com https://*.whatsonchain.com"
+
+    return [
+      // The published WoC entry advertises the site root as the plugin's
+      // `website`, and WoC's plugin preview frames that root. Keep the decoder
+      // endpoints and the root frameable by WhatsOnChain only.
+      {
+        source: '/',
         headers: [
-          {
-            key: 'Strict-Transport-Security',
-            value: 'max-age=63072000; includeSubDomains; preload',
-          },
-          { key: 'X-Content-Type-Options', value: 'nosniff' },
-          { key: 'X-Frame-Options', value: 'SAMEORIGIN' },
-          { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
-          {
-            key: 'Permissions-Policy',
-            value: 'camera=(), microphone=(), geolocation=()',
-          },
+          ...baseSecurityHeaders,
+          { key: 'Content-Security-Policy', value: wocFrameAncestors },
+        ],
+      },
+      // WoC plugin decoder endpoints — frameable by WhatsOnChain only.
+      {
+        source: '/data-decode/:path*',
+        headers: [
+          ...baseSecurityHeaders,
+          { key: 'Content-Security-Policy', value: wocFrameAncestors },
+        ],
+      },
+      {
+        source: '/api/woc/plugins/:path*',
+        headers: [
+          ...baseSecurityHeaders,
+          { key: 'Content-Security-Policy', value: wocFrameAncestors },
+        ],
+      },
+      // Everything else — same-origin framing only. X-Frame-Options cannot
+      // express a per-path exemption, so the policy lives in CSP.
+      {
+        source: '/:path((?!$)(?!data-decode/|api/woc/plugins/).*)',
+        headers: [
+          ...baseSecurityHeaders,
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'self'" },
         ],
       },
     ]
