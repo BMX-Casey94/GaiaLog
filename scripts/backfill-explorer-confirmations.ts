@@ -99,6 +99,31 @@ const NEWER_THAN_DAYS = Math.max(
   Number(argValue('--newer-than-days', '0')), // 0 = no lower bound (include all history)
 )
 const LIMIT = Math.max(1, Number(argValue('--limit', '20000')))
+/**
+ * Skip rows whose transaction tx_log already records as `failed` (default on).
+ *
+ * A reading row is written the moment a broadcast is *attempted*
+ * (lib/blockchain.ts), with blockHeight 0, so it starts out unconfirmed. If the
+ * broadcast then fails, tx_log is stamped `failed` — but the matching explorer
+ * row is only removed by cleanUpFailedTx(), which is driven off an in-memory
+ * map and therefore loses its work on every process restart. That divergence is
+ * permanent: 2.25M explorer rows sit at confirmed = false for transactions that
+ * tx_log already knows never landed.
+ *
+ * No amount of block-explorer polling can confirm those rows, so without this
+ * filter a backfill spends two thirds of its requests rediscovering 404s.
+ * Pass --skip-failed=false to include them anyway.
+ */
+const SKIP_FAILED = argValue('--skip-failed', 'true') !== 'false'
+/**
+ * Before looking anything up, promote rows that tx_log already records as
+ * `confirmed`. This is a pure in-database UPDATE — 577k rows resolve with zero
+ * API calls, because the broadcast layer confirmed them but never propagated
+ * the result to the explorer table.
+ */
+const PROMOTE_CONFIRMED = process.argv.includes('--promote-confirmed')
+/** Rows per promote-KNOWN-confirmed UPDATE statement. */
+const PROMOTE_BATCH = Math.max(100, Number(argValue('--promote-batch-size', '5000')))
 const BATCH_SIZE = Math.max(1, Number(argValue('--batch-size', '100')))
 /** Concurrent Bitails /status lookups. Keep modest so DB writes stay ahead. */
 const CONCURRENCY = Math.max(1, Number(argValue('--concurrency', '8')))
@@ -146,7 +171,8 @@ async function countStale(): Promise<number> {
        FROM overlay_explorer_readings
       WHERE confirmed = false
         AND reading_ts < now() - ($1::bigint * interval '1 day')
-        AND ($2::bigint = 0 OR reading_ts > now() - ($2::bigint * interval '1 day'))`,
+        AND ($2::bigint = 0 OR reading_ts > now() - ($2::bigint * interval '1 day'))
+        ${NOT_FAILED_SQL}`,
     [OLDER_THAN_DAYS, NEWER_THAN_DAYS],
   )
   return Number(res.rows[0]?.c || '0')
@@ -155,6 +181,66 @@ async function countStale(): Promise<number> {
 function asReadingTsText(value: unknown): string {
   if (value instanceof Date) return value.toISOString()
   return String(value ?? '')
+}
+
+/**
+ * Correlated anti-join against tx_log. tx_log_pkey is UNIQUE(txid), so this
+ * costs one index probe per candidate row — far cheaper than the /status
+ * round-trip it avoids. Referenced with the table's full name because the
+ * queries below do not alias overlay_explorer_readings.
+ */
+const NOT_FAILED_SQL = SKIP_FAILED
+  ? `AND NOT EXISTS (
+       SELECT 1
+         FROM tx_log l
+        WHERE l.txid = overlay_explorer_readings.txid
+          AND l.status = 'failed'
+     )`
+  : ''
+
+/**
+ * Propagate confirmations the broadcast layer already knows about.
+ *
+ * confirmReading() normally drives this from a chain lookup, but tx_log
+ * already holds the answer for these rows: the transaction was confirmed at
+ * broadcast time and the subscription to overlay_explorer_readings was simply
+ * lost. tx_log has no block_height column, so height stays 0 — which is
+ * already a state the confirmation worker produces (WoC reports
+ * confirmations >= 1 before blockheight is populated) and which every read
+ * path treats as confirmed via (confirmed OR block_height > 0).
+ *
+ * Batched by ctid so no single statement holds a long transaction against a
+ * multi-million-row table.
+ */
+async function promoteKnownConfirmed(): Promise<number> {
+  let total = 0
+  for (let pass = 0; pass < 500; pass++) {
+    const res = await queryWithTimeout<{ one: number }>(
+      `UPDATE overlay_explorer_readings r
+          SET confirmed = true,
+              block_time = COALESCE(r.block_time, k.onchain_at)
+         FROM (
+           SELECT r2.ctid AS rid, l2.onchain_at
+             FROM overlay_explorer_readings r2
+             JOIN tx_log l2 ON l2.txid = r2.txid
+            WHERE r2.confirmed = false
+              AND l2.status = 'confirmed'
+            LIMIT $1
+         ) AS k
+        WHERE r.ctid = k.rid
+        RETURNING 1 AS one`,
+      [PROMOTE_BATCH],
+      FETCH_TIMEOUT_MS,
+    )
+    const wrote = res.rowCount ?? 0
+    total += wrote
+    if (wrote > 0 && (pass % 10 === 0 || wrote < PROMOTE_BATCH)) {
+      console.log(`  ✅ promoted ${total.toLocaleString()} known-confirmed row(s) from tx_log…`)
+    }
+    if (wrote < PROMOTE_BATCH) break
+    await sleep(50)
+  }
+  return total
 }
 
 async function fetchBatch(afterTs: string | null, afterTxid: string | null, limit: number): Promise<Candidate[]> {
@@ -170,6 +256,7 @@ async function fetchBatch(afterTs: string | null, afterTxid: string | null, limi
         WHERE confirmed = false
           AND reading_ts < now() - ($1::bigint * interval '1 day')
           AND ($2::bigint = 0 OR reading_ts > now() - ($2::bigint * interval '1 day'))
+          ${NOT_FAILED_SQL}
         ORDER BY reading_ts ASC, txid ASC
         LIMIT $3`,
       [OLDER_THAN_DAYS, NEWER_THAN_DAYS, limit],
@@ -182,17 +269,18 @@ async function fetchBatch(afterTs: string | null, afterTxid: string | null, limi
   }
 
   const res = await queryWithTimeout<{ txid: string; reading_ts: Date | string }>(
-    `SELECT txid, reading_ts
-       FROM overlay_explorer_readings
-      WHERE confirmed = false
-        AND reading_ts < now() - ($1::bigint * interval '1 day')
-        AND ($2::bigint = 0 OR reading_ts > now() - ($2::bigint * interval '1 day'))
-        AND (
-          reading_ts > $3::timestamptz
-          OR (reading_ts = $3::timestamptz AND txid > $4::text)
-        )
-      ORDER BY reading_ts ASC, txid ASC
-      LIMIT $5`,
+      `SELECT txid, reading_ts
+         FROM overlay_explorer_readings
+        WHERE confirmed = false
+          AND reading_ts < now() - ($1::bigint * interval '1 day')
+          AND ($2::bigint = 0 OR reading_ts > now() - ($2::bigint * interval '1 day'))
+          ${NOT_FAILED_SQL}
+          AND (
+            reading_ts > $3::timestamptz
+            OR (reading_ts = $3::timestamptz AND txid > $4::text)
+          )
+        ORDER BY reading_ts ASC, txid ASC
+        LIMIT $5`,
     [OLDER_THAN_DAYS, NEWER_THAN_DAYS, afterTs, afterTxid, limit],
     FETCH_TIMEOUT_MS,
   )
@@ -602,8 +690,19 @@ async function main(): Promise<void> {
       `newerThanDays=${NEWER_THAN_DAYS || 'none'} limit=${LIMIT} batch=${BATCH_SIZE} ` +
       `concurrency=${CONCURRENCY} reqIntervalMs=${REQ_INTERVAL_MS} ` +
       `batchPauseMs=${BATCH_PAUSE_MS} fetchTimeoutMs=${FETCH_TIMEOUT_MS} ` +
-      `loop=${LOOP} source=bitails-status`,
+      `loop=${LOOP} skipFailed=${SKIP_FAILED} promoteConfirmed=${PROMOTE_CONFIRMED} ` +
+      `source=bitails-status`,
   )
+
+  if (PROMOTE_CONFIRMED) {
+    if (!APPLY) {
+      console.log('  --promote-confirmed needs --apply to mutate; skipping.')
+    } else {
+      console.log('  promoting rows tx_log already records as confirmed (no API calls)…')
+      const promoted = await promoteKnownConfirmed()
+      console.log(`  promoted ${promoted.toLocaleString()} row(s) from tx_log.`)
+    }
+  }
 
   let staleHint: number | null = null
   if (COUNT || !APPLY) {
