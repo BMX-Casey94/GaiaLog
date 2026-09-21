@@ -3,7 +3,7 @@ import { blockchainService } from './blockchain'
 import { bsvConfig } from './bsv-config'
 import { walletManager } from './wallet-manager'
 import { setAdvancedTxId, setAirQualityTxId, setSeismicTxId, setWaterLevelTxId, hasAirQualityTxId, hasWaterLevelTxId, hasSeismicTxId, hasAdvancedTxId } from './repositories'
-import { ensureQueueTable, enqueueQueueItem, loadPendingQueueItems, markQueueItemCompleted, markQueueItemFailed, markQueueItemProcessing, requeueQueueItem, cleanupOldFailedItems } from './queue-repository'
+import { ensureQueueTable, enqueueQueueItem, iteratePendingQueueItems, reclaimStuckQueueItems, markQueueItemCompleted, markQueueItemFailed, markQueueItemsProcessing, requeueQueueItem, cleanupOldFailedItems } from './queue-repository'
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getOverlayFallbackConfig } from './overlay-config'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet } from './spend-source'
@@ -248,25 +248,37 @@ export class WorkerQueue {
     this.isProcessing = true
     console.log('🔄 Starting worker queue processing...')
 
-    // Hydrate in-memory queues from DB on start
+    // Reclaim items abandoned by a previous run, then hydrate the in-memory
+    // queues from the DB in bounded pages. Hydration previously issued one
+    // 10,000-row query that could not complete on a large backlog (see
+    // iteratePendingQueueItems for the measured plan), which left the in-memory
+    // queues empty and stopped all processing after a restart.
     ensureQueueTable().then(async () => {
       try {
-        const rows = await loadPendingQueueItems(10000)
-        // Keep order by timestamp; push into normal queue (preserve priority per row)
-        for (const r of rows) {
-          const q: QueueItem = {
-            id: r.id,
-            priority: (r.priority === 'high' ? 'high' : 'normal'),
-            lane: ((r.data as any)?.queueLane === 'throughput' ? 'throughput' : 'coverage'),
-            data: r.data as any,
-            timestamp: Number(r.timestamp) || Date.now(),
-            retryCount: Number(r.retry_count) || 0,
-            maxRetries: Number(r.max_retries) || bsvConfig.transaction.maxRetries,
-          }
-          if (q.priority === 'high') this.highPriorityQueue.push(q)
-          else this.normalPriorityQueue.push(q)
+        const reclaimed = await reclaimStuckQueueItems()
+        if (reclaimed > 0) {
+          console.log(`♻️  Reclaimed ${reclaimed} stuck processing item(s)`)
         }
-        console.log(`💾 Hydrated ${rows.length} queued item(s) from DB`)
+
+        let hydrated = 0
+        for await (const page of iteratePendingQueueItems()) {
+          // Keep order by timestamp; push into normal queue (preserve priority per row)
+          for (const r of page) {
+            const q: QueueItem = {
+              id: r.id,
+              priority: (r.priority === 'high' ? 'high' : 'normal'),
+              lane: ((r.data as any)?.queueLane === 'throughput' ? 'throughput' : 'coverage'),
+              data: r.data as any,
+              timestamp: Number(r.timestamp) || Date.now(),
+              retryCount: Number(r.retry_count) || 0,
+              maxRetries: Number(r.max_retries) || bsvConfig.transaction.maxRetries,
+            }
+            if (q.priority === 'high') this.highPriorityQueue.push(q)
+            else this.normalPriorityQueue.push(q)
+          }
+          hydrated += page.length
+        }
+        console.log(`💾 Hydrated ${hydrated} queued item(s) from DB`)
       } catch (e) {
         console.warn('Queue hydration error:', e)
       }
@@ -371,9 +383,10 @@ export class WorkerQueue {
 
       if (batch.length === 0) return
 
-      for (const item of batch) {
-        markQueueItemProcessing(item.id).catch(() => {})
-      }
+      // Set-based transition: one statement for the whole batch rather than one
+      // per item. See markQueueItemsProcessing for the measured cost of the
+      // per-item form (48,997,412 calls at a 4.2 ms mean).
+      markQueueItemsProcessing(batch.map(item => item.id)).catch(() => {})
 
       const batchStartTime = Date.now()
       let itemIndex = 0

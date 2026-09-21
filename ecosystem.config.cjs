@@ -34,7 +34,7 @@
  *
  *   Queue items persist across restarts (worker_queue DB table); any items marked
  *   'processing' at kill-time are automatically reclaimed as 'queued' after 2 minutes
- *   by loadPendingQueueItems(). On-chain dedup checks (hasAirQualityTxId etc.) prevent
+ *   by reclaimStuckQueueItems(). On-chain dedup checks (hasAirQualityTxId etc.) prevent
  *   re-broadcasting records that were already confirmed before the restart.
  *
  *   kill_timeout gives the SIGINT handler 8 seconds to drain gracefully before SIGKILL.

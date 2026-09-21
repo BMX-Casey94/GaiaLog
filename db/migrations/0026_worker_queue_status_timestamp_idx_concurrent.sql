@@ -1,0 +1,51 @@
+-- CREATE INDEX CONCURRENTLY must run outside an explicit transaction
+-- (one statement per migrate round-trip).
+--
+-- Serves the queue hydration and retention paths in lib/queue-repository.ts.
+-- The index is on (status, timestamp) because every hot predicate filters on
+-- status and orders or ranges on timestamp.
+--
+-- ## What this index fixes
+--
+-- 1. The retention delete, which previously had no supporting index and fell
+--    back to an unbounded full scan:
+--
+--      DELETE FROM worker_queue
+--       WHERE status='failed' AND updated_at < now() - interval '24 hours'
+--
+--    Measured over 1,730 calls: 11,843,012 rows deleted at a 23,578 ms mean and
+--    a 117 s maximum - long enough to be cancelled by the server-side timeout
+--    and to hold a pool connection for the duration. That statement now ages
+--    rows on `timestamp` and deletes in bounded batches, so the index is used
+--    and no single statement can run long enough to be cancelled.
+--
+-- 2. Each per-status branch of the paged hydration query. A single
+--    `status = 'queued' ORDER BY timestamp LIMIT n` is served directly:
+--    EXPLAIN gives an Index Scan at cost 0.43..361.67 for LIMIT 200, against a
+--    Parallel Seq Scan + Sort at cost 411,162.78 without it.
+--
+-- ## What this index does NOT fix (measured, not assumed)
+--
+-- A predicate matching multiple statuses cannot be ordered by this index:
+--
+--      WHERE status IN ('queued','processing') ORDER BY timestamp LIMIT 200
+--
+-- One index scan returns rows grouped by status rather than in global timestamp
+-- order, and the planner does not synthesise a MergeAppend over the
+-- ScalarArrayOp. It chooses a parallel sequential scan plus a full sort over
+-- the whole 2.6 GB heap - cost 411,162.78 to return the first 200 rows. Because
+-- ~2.79M of ~3.08M rows were pending, no index could have made that form
+-- selective; the statement did not complete at all (cancelled at 150 s, with a
+-- live worker observed sitting in it for 121 s). Hydration therefore issues one
+-- UNION ALL branch per status, which forces the MergeAppend that the `IN` form
+-- does not produce.
+--
+-- Reported incident codes attributed to these statements:
+--
+--   57014  canceling statement due to statement timeout
+--   08006  connection to client lost   (client/pooler gives up on the slow query)
+--
+-- Non-destructive: index creation only, no data is modified.
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS worker_queue_status_timestamp_idx
+  ON worker_queue(status, timestamp);

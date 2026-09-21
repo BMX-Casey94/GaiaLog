@@ -22,6 +22,8 @@ const CONCURRENT_INDEX_MIGRATIONS = new Set([
   '0017_overlay_utxo_inventory_idx_concurrent.sql',
   '0019_overlay_utxo_acquirable_at_idx_concurrent.sql',
   '0023_oer_unconfirmed_backfill_idx_concurrent.sql',
+  '0025_seismic_event_id_idx_concurrent.sql',
+  '0026_worker_queue_status_timestamp_idx_concurrent.sql',
 ])
 
 function isConcurrentIndexMigration(file: string): boolean {
