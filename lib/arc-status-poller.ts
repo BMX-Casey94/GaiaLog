@@ -1,9 +1,12 @@
 /**
  * ARC broadcast status poller
  *
- * Advances `arc_broadcast_status.phase` for open rows accepted via TAAL or
- * GorillaPool ARC by GETting `/v1/tx/{txid}`. Applies inventory / explorer
- * follow-ups from `arcFollowUp` without deleting explorer rows.
+ * Advances `arc_broadcast_status.phase` for open and reorg rows accepted via
+ * TAAL or GorillaPool ARC by GETting `/v1/tx/{txid}`. Reorg stays in the
+ * batch so a later MINED can confirm it again. Applies inventory / explorer
+ * follow-ups from `arcFollowUp` without deleting explorer rows. The phase
+ * row is updated only after the follow-up succeeds, so a failed update
+ * stays in the batch and is retried.
  *
  * Opt out: BSV_ARC_STATUS_POLL_DISABLED=true
  * Interval: BSV_ARC_STATUS_POLL_INTERVAL_MS (default 15000, min 5000)
@@ -139,22 +142,23 @@ async function applyReorg(txid: string): Promise<void> {
 }
 
 async function applyRelease(txid: string): Promise<void> {
-  const spentLater = await query<{ ok: number }>(
-    `SELECT 1 AS ok
-       FROM overlay_admitted_utxos
-      WHERE txid = $1
-        AND removed = true
-      LIMIT 1`,
-    [txid],
-  )
-  if ((spentLater.rows || []).length > 0) {
-    console.warn(
-      `[arc-status-poller] release skipped for ${txid.substring(0, 12)}…: change already spent by a later tx`,
-    )
-    return
-  }
-
+  let skipped = false
   await withOverlayTransaction(async (client) => {
+    // Lock this tx's outputs and the inputs it consumed before deciding.
+    // A check outside the transaction can miss a spend that lands in between.
+    const locked = await client.query<{ txid: string; removed: boolean }>(
+      `SELECT txid, removed
+         FROM overlay_admitted_utxos
+        WHERE txid = $1
+           OR spending_txid = $1
+        FOR UPDATE`,
+      [txid],
+    )
+    if ((locked.rows || []).some((row) => row.txid === txid && row.removed === true)) {
+      skipped = true
+      return
+    }
+
     const removed = await client.query<{ topic: string }>(
       `UPDATE overlay_admitted_utxos
           SET removed = true,
@@ -191,6 +195,13 @@ async function applyRelease(txid: string): Promise<void> {
       if (delta !== 0) await refreshTopicCounts(client, topic, delta)
     }
   })
+
+  if (skipped) {
+    console.warn(
+      `[arc-status-poller] release skipped for ${txid.substring(0, 12)}…: change already spent by a later tx`,
+    )
+    return
+  }
 
   try {
     await query(
@@ -263,7 +274,9 @@ async function getArcTxStatus(acceptedVia: string, txid: string): Promise<GetRes
         : null
     if (txStatus == null) return { kind: 'transport' }
 
-    const rawHeight = (body as { blockHeight?: unknown }).blockHeight
+    const rawHeight =
+      (body as { blockHeight?: unknown }).blockHeight ??
+      (body as { blockheight?: unknown }).blockheight
     const blockHeight =
       typeof rawHeight === 'number' && Number.isFinite(rawHeight) && rawHeight > 0
         ? rawHeight
@@ -282,7 +295,7 @@ async function fetchOpenBatch(): Promise<OpenBroadcastRow[] | null> {
     const result = await query<OpenBroadcastRow>(
       `SELECT txid, phase, accepted_via
          FROM arc_broadcast_status
-        WHERE phase IN ('orphan', 'pending', 'seen')
+        WHERE phase IN ('orphan', 'pending', 'seen', 'reorg')
           AND accepted_via IN ('taal_arc', 'gorillapool_arc')
         ORDER BY updated_at ASC
         LIMIT $1`,
@@ -346,18 +359,25 @@ async function runCycle(): Promise<void> {
           continue
         }
 
+        await applyFollowUp(arcFollowUp(next), row.txid, result.blockHeight)
         await upsertArcBroadcastStatus({
           txid: row.txid,
           txStatus: result.txStatus,
           acceptedVia: row.accepted_via,
         })
-        await applyFollowUp(arcFollowUp(next), row.txid, result.blockHeight)
       } catch (err) {
         console.warn(
           `[arc-status-poller] apply(${row.txid.substring(0, 12)}… → ${next}) failed: ${
             err instanceof Error ? err.message : err
           }`,
         )
+        // Keep the old phase, but rotate the row so one failure cannot
+        // sit at the head of every batch.
+        try {
+          await bumpUpdatedAt(row.txid)
+        } catch {
+          // next cycle will try this txid again
+        }
       }
     }
   } catch (err) {
