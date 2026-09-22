@@ -6,6 +6,8 @@
  * Split / maintainer path accepts SEEN_IN_ORPHAN_MEMPOOL as OK (same as legacy maintainer behaviour).
  */
 
+import { upsertArcBroadcastStatus } from './arc-broadcast-status'
+
 const NET = process.env.BSV_NETWORK === 'mainnet' ? 'main' : 'test'
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY || ''
 const GORILLAPOOL_ARC_ENDPOINT = (process.env.BSV_GORILLAPOOL_ARC_ENDPOINT || 'https://arc.gorillapool.io').replace(
@@ -32,7 +34,10 @@ const ARC_REJECT_STATUSES = new Set([
   'EVICTED',
 ])
 
-function parseArcResponse(responseText: string, providerLabel: string): string | null {
+function parseArcResponse(
+  responseText: string,
+  providerLabel: string,
+): { txid: string; txStatus: string } | null {
   try {
     const parsed = JSON.parse(responseText || '{}')
     const txid = typeof parsed.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(parsed.txid)
@@ -45,14 +50,14 @@ function parseArcResponse(responseText: string, providerLabel: string): string |
       console.warn(`⚠️  ARC (${providerLabel}): TX rejected — txStatus=${status}${extra}`)
       return null
     }
-    if (txid && (ARC_OK_STATUSES.has(status) || !status)) return txid
+    if (txid && (ARC_OK_STATUSES.has(status) || !status)) return { txid, txStatus: status }
     if (txid) {
       console.warn(`⚠️  ARC (${providerLabel}): Unknown txStatus="${status}" — accepting cautiously`)
-      return txid
+      return { txid, txStatus: status }
     }
   } catch {}
   const plain = (responseText || '').replace(/"/g, '').trim()
-  if (/^[0-9a-fA-F]{64}$/.test(plain)) return plain
+  if (/^[0-9a-fA-F]{64}$/.test(plain)) return { txid: plain, txStatus: '' }
   return null
 }
 
@@ -76,8 +81,15 @@ export async function broadcastSplitTransactionRaw(rawHex: string): Promise<stri
     })
     const text = await res.text().catch(() => '')
     if (res.ok) {
-      const txid = parseArcResponse(text, 'TAAL')
-      if (txid) return txid
+      const parsed = parseArcResponse(text, 'TAAL')
+      if (parsed) {
+        await upsertArcBroadcastStatus({
+          txid: parsed.txid,
+          txStatus: parsed.txStatus,
+          acceptedVia: 'taal_arc',
+        })
+        return parsed.txid
+      }
       errors.push(`TAAL ARC: rejected — ${text.substring(0, 200)}`)
     } else {
       errors.push(`TAAL ARC ${res.status}: ${text.substring(0, 200)}`)
@@ -97,8 +109,15 @@ export async function broadcastSplitTransactionRaw(rawHex: string): Promise<stri
     })
     const text = await res.text().catch(() => '')
     if (res.ok) {
-      const txid = parseArcResponse(text, 'GorillaPool')
-      if (txid) return txid
+      const parsed = parseArcResponse(text, 'GorillaPool')
+      if (parsed) {
+        await upsertArcBroadcastStatus({
+          txid: parsed.txid,
+          txStatus: parsed.txStatus,
+          acceptedVia: 'gorillapool_arc',
+        })
+        return parsed.txid
+      }
       errors.push(`GorillaPool ARC: rejected — ${text.substring(0, 200)}`)
     } else {
       errors.push(`GorillaPool ARC ${res.status}: ${text.substring(0, 200)}`)
@@ -118,7 +137,14 @@ export async function broadcastSplitTransactionRaw(rawHex: string): Promise<stri
     const text = await res.text().catch(() => '')
     if (res.ok) {
       const txid = text.replace(/"/g, '').trim()
-      if (/^[0-9a-fA-F]{64}$/.test(txid)) return txid
+      if (/^[0-9a-fA-F]{64}$/.test(txid)) {
+        await upsertArcBroadcastStatus({
+          txid,
+          txStatus: '',
+          acceptedVia: 'whatsonchain',
+        })
+        return txid
+      }
       errors.push(`WoC returned unexpected body: ${text.substring(0, 200)}`)
     } else {
       errors.push(`WoC broadcast ${res.status}: ${text.substring(0, 200)}`)

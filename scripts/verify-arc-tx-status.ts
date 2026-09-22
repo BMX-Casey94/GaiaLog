@@ -12,6 +12,7 @@ import {
   explorerBadge,
   type ArcPhase,
 } from '../lib/arc-tx-status'
+import { buildArcStatusRow } from '../lib/arc-broadcast-status'
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -109,6 +110,28 @@ assertBadge('reorg', {
   label: 'Reorg',
   title: 'This transaction was mined in a block that is no longer canonical.',
 })
+
+{
+  const row = buildArcStatusRow(null, null)
+  assert(row.txStatus === '', `buildArcStatusRow(null) txStatus expected '', got ${JSON.stringify(row.txStatus)}`)
+  assert(row.phase === 'pending', `buildArcStatusRow(null) phase expected pending, got ${row.phase}`)
+}
+{
+  const row = buildArcStatusRow('SEEN_IN_ORPHAN_MEMPOOL', 'taal_arc')
+  assert(row.phase === 'orphan', `buildArcStatusRow(SEEN_IN_ORPHAN_MEMPOOL) expected orphan, got ${row.phase}`)
+}
+{
+  const row = buildArcStatusRow('SEEN_ON_NETWORK', 'taal_arc')
+  assert(row.phase === 'seen', `buildArcStatusRow(SEEN_ON_NETWORK) expected seen, got ${row.phase}`)
+}
+{
+  const row = buildArcStatusRow('MINED', 'taal_arc')
+  assert(row.phase === 'mined', `buildArcStatusRow(MINED) expected mined, got ${row.phase}`)
+}
+{
+  const row = buildArcStatusRow('MINED_IN_STALE_BLOCK', 'taal_arc')
+  assert(row.phase === 'reorg', `buildArcStatusRow(MINED_IN_STALE_BLOCK) expected reorg, got ${row.phase}`)
+}
 
 console.log('arc-tx-status: ok')
 process.exit(0)

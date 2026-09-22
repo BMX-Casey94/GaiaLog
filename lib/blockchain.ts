@@ -25,6 +25,7 @@ import {
 } from './utxo-overlay-monitor'
 import { QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
+import { upsertArcBroadcastStatus } from './arc-broadcast-status'
 
 // Types
 export interface BlockchainData {
@@ -1387,16 +1388,21 @@ export class BlockchainService {
         changeOutput = builtTx.changeOutput
         txBuildMs = Date.now() - buildStartedAt
         const broadcastStartedAt = Date.now()
-        let broadcastResult: { txid: string; acceptedVia: string } | null = null
+        let broadcastResult: { txid: string; acceptedVia: string; txStatus: string } | null = null
         try {
           broadcastResult = await this.broadcastTransaction(normalHex, prevoutsForArc, traceId)
         } finally {
           broadcastMs = Date.now() - broadcastStartedAt
         }
         if (!broadcastResult) throw new Error('Broadcast result missing')
-        const { txid, acceptedVia: acceptedViaResult } = broadcastResult
+        const { txid, acceptedVia: acceptedViaResult, txStatus } = broadcastResult
         acceptedVia = acceptedViaResult
         acceptedTxid = txid
+        await upsertArcBroadcastStatus({
+          txid,
+          txStatus,
+          acceptedVia: acceptedViaResult,
+        })
       } catch (innerErr) {
         if (inventoryBacked) {
           // Cooldown so a UTXO whose broadcast just failed (commonly ARC 460
@@ -2101,11 +2107,14 @@ export class BlockchainService {
   ])
 
   /**
-   * Parse an ARC response and return the txid ONLY if the TX was genuinely accepted.
+   * Parse an ARC response and return the txid + txStatus ONLY if the TX was genuinely accepted.
    * ARC returns HTTP 200 + a valid txid even for DOUBLE_SPEND_ATTEMPTED — we must
    * inspect the txStatus field to avoid logging a rejected TX as "successful".
    */
-  private parseArcResponse(responseText: string, providerLabel: string): string | null {
+  private parseArcResponse(
+    responseText: string,
+    providerLabel: string,
+  ): { txid: string; txStatus: string } | null {
     try {
       const parsed = JSON.parse(responseText || '{}')
       const txid = typeof parsed.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(parsed.txid)
@@ -2136,7 +2145,7 @@ export class BlockchainService {
               `(parents not visible to all relays; set BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=false to reject)`,
           )
         }
-        return txid
+        return { txid, txStatus: status }
       }
 
       // Accept if status is known-good or if no status field was returned (legacy ARC)
@@ -2144,19 +2153,19 @@ export class BlockchainService {
         if (bsvConfig.logging.level === 'debug') {
           console.log(`📡 ARC (${providerLabel}): txStatus=${status || 'N/A'} txid=${txid.substring(0, 12)}...`)
         }
-        return txid
+        return { txid, txStatus: status }
       }
 
       // Unknown status with a txid — log but accept cautiously
       if (txid) {
         console.warn(`⚠️  ARC (${providerLabel}): Unknown txStatus="${status}" — accepting txid=${txid.substring(0, 12)}... cautiously`)
-        return txid
+        return { txid, txStatus: status }
       }
     } catch {}
 
     // Fallback: some ARC deployments return plain string txid (no JSON)
     const plain = (responseText || '').replace(/"/g, '').trim()
-    if (/^[0-9a-fA-F]{64}$/.test(plain)) return plain
+    if (/^[0-9a-fA-F]{64}$/.test(plain)) return { txid: plain, txStatus: '' }
     return null
   }
 
@@ -2164,7 +2173,7 @@ export class BlockchainService {
     serializedTx: string,
     prevouts?: Array<{ lockingScript: string; satoshis: number }>,
     traceId?: string
-  ): Promise<{ txid: string; acceptedVia: string }> {
+  ): Promise<{ txid: string; acceptedVia: string; txStatus: string }> {
     const errors: string[] = []
 
     // Build ARC request bodies:
@@ -2205,11 +2214,11 @@ export class BlockchainService {
       })
       const arcText = await arcRes.text().catch(() => '')
       if (arcRes.ok) {
-        const txid = this.parseArcResponse(arcText, 'TAAL')
-        if (txid) {
-          this.logBroadcastStep(traceId, 'taal_arc', 'accepted', Date.now() - taalStartedAt, `txid=${this.shortenToken(txid, 12)}`)
+        const parsed = this.parseArcResponse(arcText, 'TAAL')
+        if (parsed) {
+          this.logBroadcastStep(traceId, 'taal_arc', 'accepted', Date.now() - taalStartedAt, `txid=${this.shortenToken(parsed.txid, 12)}`)
           this.clearBroadcastChannelBackoff('taal_arc')
-          return { txid, acceptedVia: 'taal_arc' }
+          return { txid: parsed.txid, acceptedVia: 'taal_arc', txStatus: parsed.txStatus }
         }
         this.logBroadcastStep(traceId, 'taal_arc', 'rejected', Date.now() - taalStartedAt, 'ok-without-accepted-txid')
         errors.push(`TAAL ARC: rejected or unexpected response: ${arcText.substring(0, 200)}`)
@@ -2239,14 +2248,14 @@ export class BlockchainService {
             })
             const taalCompatText = await taalCompatRes.text().catch(() => '')
             if (taalCompatRes.ok) {
-              const txid = this.parseArcResponse(taalCompatText, 'TAAL')
-              if (txid) {
-                this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'accepted', Date.now() - taalCompatStartedAt, `txid=${this.shortenToken(txid, 12)}`)
+              const parsed = this.parseArcResponse(taalCompatText, 'TAAL')
+              if (parsed) {
+                this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'accepted', Date.now() - taalCompatStartedAt, `txid=${this.shortenToken(parsed.txid, 12)}`)
                 if (bsvConfig.logging.level !== 'error') {
                   console.warn('⚠️  ARC (TAAL): accepted after rawTx compatibility retry (460/461)')
                 }
                 this.clearBroadcastChannelBackoff('taal_arc')
-                return { txid, acceptedVia: 'taal_arc' }
+                return { txid: parsed.txid, acceptedVia: 'taal_arc', txStatus: parsed.txStatus }
               }
               this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'rejected', Date.now() - taalCompatStartedAt, 'ok-without-accepted-txid')
               errors.push(`TAAL ARC compatibility retry: unexpected response: ${taalCompatText.substring(0, 200)}`)
@@ -2301,11 +2310,11 @@ export class BlockchainService {
       })
       const gpText = await gpRes.text().catch(() => '')
       if (gpRes.ok) {
-        const txid = this.parseArcResponse(gpText, 'GorillaPool')
-        if (txid) {
-          this.logBroadcastStep(traceId, 'gorillapool_arc', 'accepted', Date.now() - gpStartedAt, `txid=${this.shortenToken(txid, 12)}`)
+        const parsed = this.parseArcResponse(gpText, 'GorillaPool')
+        if (parsed) {
+          this.logBroadcastStep(traceId, 'gorillapool_arc', 'accepted', Date.now() - gpStartedAt, `txid=${this.shortenToken(parsed.txid, 12)}`)
           this.clearBroadcastChannelBackoff('gorillapool_arc')
-          return { txid, acceptedVia: 'gorillapool_arc' }
+          return { txid: parsed.txid, acceptedVia: 'gorillapool_arc', txStatus: parsed.txStatus }
         }
         this.logBroadcastStep(traceId, 'gorillapool_arc', 'rejected', Date.now() - gpStartedAt, 'ok-without-accepted-txid')
         errors.push(`GorillaPool ARC: rejected or unexpected response: ${gpText.substring(0, 200)}`)
@@ -2337,14 +2346,14 @@ export class BlockchainService {
             })
             const gpCompatText = await gpCompatRes.text().catch(() => '')
             if (gpCompatRes.ok) {
-              const txid = this.parseArcResponse(gpCompatText, 'GorillaPool')
-              if (txid) {
-                this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'accepted', Date.now() - gpCompatStartedAt, `txid=${this.shortenToken(txid, 12)}`)
+              const parsed = this.parseArcResponse(gpCompatText, 'GorillaPool')
+              if (parsed) {
+                this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'accepted', Date.now() - gpCompatStartedAt, `txid=${this.shortenToken(parsed.txid, 12)}`)
                 if (bsvConfig.logging.level !== 'error') {
                   console.warn('⚠️  ARC (GorillaPool): accepted after rawTx compatibility retry (460/461 / extended mismatch)')
                 }
                 this.clearBroadcastChannelBackoff('gorillapool_arc')
-                return { txid, acceptedVia: 'gorillapool_arc' }
+                return { txid: parsed.txid, acceptedVia: 'gorillapool_arc', txStatus: parsed.txStatus }
               }
               this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'rejected', Date.now() - gpCompatStartedAt, 'ok-without-accepted-txid')
               errors.push(`GorillaPool ARC compatibility retry: unexpected response: ${gpCompatText.substring(0, 200)}`)
@@ -2403,7 +2412,7 @@ export class BlockchainService {
           this.logBroadcastStep(traceId, 'whatsonchain', 'accepted', Date.now() - wocStartedAt, `txid=${this.shortenToken(txid, 12)}`)
           console.log(`📡 WoC broadcast accepted: txid=${txid.substring(0, 12)}...`)
           this.clearBroadcastChannelBackoff('whatsonchain')
-          return { txid, acceptedVia: 'whatsonchain' }
+          return { txid, acceptedVia: 'whatsonchain', txStatus: '' }
         }
         this.logBroadcastStep(traceId, 'whatsonchain', 'rejected', Date.now() - wocStartedAt, 'ok-without-accepted-txid')
         errors.push(`WoC returned unexpected response: ${wocText.substring(0, 200)}`)
