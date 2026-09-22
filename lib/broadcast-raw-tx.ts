@@ -31,6 +31,7 @@ const ARC_REJECT_STATUSES = new Set([
   'DOUBLE_SPEND_ATTEMPTED',
   'REJECTED',
   'INVALID',
+  'MALFORMED',
   'EVICTED',
 ])
 
