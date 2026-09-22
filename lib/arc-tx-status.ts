@@ -103,3 +103,22 @@ export function explorerBadge(phase: ArcPhase): { label: string; title: string }
       }
   }
 }
+
+/** Badge for explorer cards from stored ARC phase + confirmation flags. */
+export function explorerCardBadge(input: {
+  phase: ArcPhase | null
+  confirmed: boolean
+  blockHeight: number
+}): { label: string; title: string } {
+  const { phase, confirmed, blockHeight } = input
+  if (phase === 'reorg') return explorerBadge('reorg')
+  if (phase === 'rejected') return explorerBadge('rejected')
+  if (confirmed || blockHeight > 0 || phase === 'mined') return explorerBadge('mined')
+  if (phase === 'seen' || phase === 'orphan' || phase === 'pending') {
+    return explorerBadge(phase)
+  }
+  return {
+    label: 'Pending',
+    title: 'Broadcast recorded. Network visibility is unverified.',
+  }
+}

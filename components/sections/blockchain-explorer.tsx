@@ -15,6 +15,7 @@ import {
 import { getBSVExplorerUrl, getBSVAddressUrl, isValidTxId } from "@/lib/utils"
 import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
 import { getKeyMetrics } from "@/lib/family-metrics"
+import { explorerCardBadge, type ArcPhase } from "@/lib/arc-tx-status"
 
 interface TransactionDisplay {
   id: string
@@ -22,7 +23,19 @@ interface TransactionDisplay {
   location: string | null
   timestamp: string
   status: string
+  arcPhase: ArcPhase | null
   metrics: Record<string, unknown>
+}
+
+function homepageBadgeClass(label: string): string {
+  if (label === 'Rejected' || label === 'Reorg') {
+    return 'bg-red-900/50 text-red-400 rounded-sm'
+  }
+  if (label === 'Confirmed') {
+    return 'bg-green-900/50 text-green-400 rounded-sm'
+  }
+  // Pending and In mempool
+  return 'bg-yellow-900/50 text-yellow-400 rounded-sm'
 }
 
 export function BlockchainExplorer() {
@@ -77,6 +90,7 @@ export function BlockchainExplorer() {
               location: r.location ?? null,
               timestamp: formatTimestamp(r.timestamp),
               status: r.status || 'confirmed',
+              arcPhase: (r.arcPhase as ArcPhase | null | undefined) ?? null,
               metrics: r.data?.metrics ?? {},
             })
           })
@@ -142,6 +156,11 @@ export function BlockchainExplorer() {
                 const tx = txByFamily.get(descriptor.id)!
                 const metricsSummary = buildMetricsSummary(descriptor.id, tx.metrics)
                 const description = metricsSummary ?? `${descriptor.label} data recorded`
+                const badge = explorerCardBadge({
+                  phase: tx.arcPhase,
+                  confirmed: tx.status === 'confirmed',
+                  blockHeight: 0,
+                })
 
                 return (
                   <GlowCard key={descriptor.id} glowColor="purple" customSize>
@@ -155,11 +174,10 @@ export function BlockchainExplorer() {
                             <span className="font-medium text-white">{descriptor.label}</span>
                             <Badge
                               variant="secondary"
-                              className={tx.status === 'pending'
-                                ? "bg-yellow-900/50 text-yellow-400 rounded-sm"
-                                : "bg-green-900/50 text-green-400 rounded-sm"}
+                              className={homepageBadgeClass(badge.label)}
+                              title={badge.title}
                             >
-                              {tx.status === 'pending' ? 'Unconfirmed' : 'Confirmed'}
+                              {badge.label}
                             </Badge>
                           </div>
                           <Button

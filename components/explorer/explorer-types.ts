@@ -20,6 +20,7 @@ export interface ExplorerReading {
   provider: string | null
   blockHeight: number
   confirmed?: boolean
+  arcPhase?: 'rejected' | 'orphan' | 'pending' | 'seen' | 'mined' | 'reorg' | null
   wocUrl: string
 }
 

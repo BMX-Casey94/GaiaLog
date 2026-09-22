@@ -13,6 +13,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import { query as dbQuery } from './db'
 import { getDataFamilyFilterValues, normaliseDataFamily } from './stream-registry'
+import type { ArcPhase } from './arc-tx-status'
 
 // ─── Types (same interface as the old explorer-store) ────────────────────────
 
@@ -29,6 +30,8 @@ export interface StoredReading {
   blockTime: number | null
   /** True once mined (1+ confirmation). May be true even if blockHeight is still 0. */
   confirmed?: boolean
+  /** Stored ARC broadcast phase when known; null when no ARC row. */
+  arcPhase?: ArcPhase | null
 }
 
 export interface SearchParams {

@@ -11,6 +11,7 @@ import {
   changeAcquirableAt,
   inputMayBeReleased,
   explorerBadge,
+  explorerCardBadge,
   type ArcPhase,
 } from '../lib/arc-tx-status'
 import { buildArcStatusRow } from '../lib/arc-broadcast-status'
@@ -119,6 +120,47 @@ assertBadge('reorg', {
   label: 'Reorg',
   title: 'This transaction was mined in a block that is no longer canonical.',
 })
+
+{
+  const badge = explorerCardBadge({ phase: null, confirmed: false, blockHeight: 0 })
+  assert(badge.label === 'Pending', `null-phase card badge label expected Pending, got ${badge.label}`)
+  assert(
+    badge.title.toLowerCase().includes('unverified'),
+    `null-phase card badge title should contain unverified, got ${JSON.stringify(badge.title)}`,
+  )
+}
+{
+  const badge = explorerCardBadge({ phase: 'seen', confirmed: false, blockHeight: 0 })
+  assert(badge.label === 'In mempool', `seen card badge expected In mempool, got ${badge.label}`)
+}
+{
+  const badge = explorerCardBadge({ phase: 'pending', confirmed: false, blockHeight: 0 })
+  assert(badge.label === 'Pending', `pending card badge expected Pending, got ${badge.label}`)
+  assert(
+    !badge.title.toLowerCase().includes('unverified'),
+    `pending card badge title must not contain unverified, got ${JSON.stringify(badge.title)}`,
+  )
+}
+{
+  const badge = explorerCardBadge({ phase: 'orphan', confirmed: false, blockHeight: 0 })
+  assert(badge.label === 'Pending', `orphan card badge expected Pending, got ${badge.label}`)
+}
+{
+  const badge = explorerCardBadge({ phase: null, confirmed: true, blockHeight: 0 })
+  assert(badge.label === 'Confirmed', `confirmed null-phase card badge expected Confirmed, got ${badge.label}`)
+}
+{
+  const badge = explorerCardBadge({ phase: 'reorg', confirmed: true, blockHeight: 10 })
+  assert(badge.label === 'Reorg', `reorg card badge expected Reorg, got ${badge.label}`)
+}
+{
+  const badge = explorerCardBadge({ phase: 'rejected', confirmed: false, blockHeight: 0 })
+  assert(badge.label === 'Rejected', `rejected card badge expected Rejected, got ${badge.label}`)
+}
+{
+  const badge = explorerCardBadge({ phase: 'mined', confirmed: false, blockHeight: 0 })
+  assert(badge.label === 'Confirmed', `mined card badge expected Confirmed, got ${badge.label}`)
+}
 
 {
   const row = buildArcStatusRow(null, null)

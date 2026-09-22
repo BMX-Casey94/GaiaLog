@@ -3,6 +3,7 @@
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { MapPin, ExternalLink, Database } from "lucide-react"
 import { getKeyMetrics } from "@/lib/family-metrics"
+import { explorerCardBadge } from "@/lib/arc-tx-status"
 import { DATA_TYPE_CONFIG, formatTimestamp, type ExplorerReading } from "./explorer-types"
 
 export function ReadingCard({ item }: { item: ExplorerReading }) {
@@ -16,6 +17,17 @@ export function ReadingCard({ item }: { item: ExplorerReading }) {
   const Icon = config.icon
   const { date, time } = formatTimestamp(item.timestamp)
   const keyMetrics = getKeyMetrics(item.dataType, item.metrics)
+  const badge = explorerCardBadge({
+    phase: item.arcPhase ?? null,
+    confirmed: Boolean(item.confirmed),
+    blockHeight: item.blockHeight,
+  })
+  const badgeClassName =
+    badge.label === 'Rejected' || badge.label === 'Reorg'
+      ? 'text-red-400'
+      : badge.label === 'Confirmed'
+        ? 'text-emerald-400'
+        : 'text-amber-400'
 
   let displayLocation = item.location
   if (displayLocation && /^Sensor\s+\d+/i.test(displayLocation) && item.lat != null && item.lon != null) {
@@ -69,14 +81,12 @@ export function ReadingCard({ item }: { item: ExplorerReading }) {
           {item.txid.slice(0, 8)}...{item.txid.slice(-6)}
         </span>
         <div className="flex items-center gap-2 shrink-0">
-          {!(item.confirmed || item.blockHeight > 0) && (
-            <span
-              className="text-[10px] uppercase tracking-wide text-slate-500"
-              title="Broadcast accepted; awaiting first block confirmation."
-            >
-              Unconfirmed
-            </span>
-          )}
+          <span
+            className={`text-[10px] uppercase tracking-wide ${badgeClassName}`}
+            title={badge.title}
+          >
+            {badge.label}
+          </span>
           <a
             href={item.wocUrl}
             target="_blank"

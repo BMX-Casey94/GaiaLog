@@ -92,6 +92,7 @@ export async function GET(request: NextRequest) {
       provider: item.provider,
       blockHeight: item.blockHeight,
       confirmed: Boolean(item.confirmed) || item.blockHeight > 0,
+      arcPhase: item.arcPhase ?? null,
       // Default to the OP_RETURN output (GaiaLog writes it as vout 0)
       wocUrl: `${WOC_BASE}/tx/${String(item.txid).toLowerCase()}?voutOffset=0&output=0`,
     }))

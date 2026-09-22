@@ -13,6 +13,45 @@ import { query } from './db'
 import type { OverlayExplorerReading } from './explorer-decoder'
 import { getDataFamilyFilterValues, normaliseDataFamily } from './stream-registry'
 import type { SearchParams, StoredReading, LocationSuggestion } from './supabase-explorer'
+import type { ArcPhase } from './arc-tx-status'
+
+const ARC_PHASES = new Set<ArcPhase>([
+  'rejected',
+  'orphan',
+  'pending',
+  'seen',
+  'mined',
+  'reorg',
+])
+
+function parseArcPhase(value: unknown): ArcPhase | null {
+  if (typeof value !== 'string') return null
+  return ARC_PHASES.has(value as ArcPhase) ? (value as ArcPhase) : null
+}
+
+/**
+ * Look up ARC broadcast phases for a page of txids after the explorer scan.
+ * If the table is not migrated yet, warn and treat every phase as null.
+ */
+async function lookupArcPhasesByTxid(txids: string[]): Promise<Map<string, ArcPhase | null>> {
+  const phases = new Map<string, ArcPhase | null>()
+  if (txids.length === 0) return phases
+  try {
+    const result = await query<{ txid: string; phase: string }>(
+      `SELECT txid, phase FROM arc_broadcast_status WHERE txid = ANY($1::text[])`,
+      [txids],
+    )
+    for (const row of result.rows || []) {
+      phases.set(row.txid, parseArcPhase(row.phase))
+    }
+  } catch (err) {
+    console.warn(
+      'arc_broadcast_status phase lookup failed; explorer will render without ARC phases:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+  return phases
+}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -141,6 +180,10 @@ export async function searchReadings(params: SearchParams): Promise<{
 
   const rows = result.rows || []
   const items: StoredReading[] = rows.map(overlayRowToStoredReading)
+  const phases = await lookupArcPhasesByTxid(items.map((item) => item.txid))
+  for (const item of items) {
+    item.arcPhase = phases.get(item.txid) ?? null
+  }
 
   return { items, total, page, pageSize, hasMore: offset + items.length < total }
 }
@@ -471,6 +514,7 @@ export async function getLatestReadingsWithMetrics(
   metrics_preview: Record<string, unknown>
   block_height: number
   confirmed: boolean
+  arcPhase?: ArcPhase | null
 }>> {
   if (families.length === 0) return []
   const result = await query<{
@@ -493,7 +537,12 @@ export async function getLatestReadingsWithMetrics(
      ORDER BY data_family, (confirmed OR COALESCE(block_height, 0) > 0) DESC, reading_ts DESC`,
     [families],
   )
-  return result.rows || []
+  const rows = result.rows || []
+  const phases = await lookupArcPhasesByTxid(rows.map((row) => row.txid))
+  return rows.map((row) => ({
+    ...row,
+    arcPhase: phases.get(row.txid) ?? null,
+  }))
 }
 
 export async function getRecentReadingsByFamily(
