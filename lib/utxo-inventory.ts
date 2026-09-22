@@ -1,5 +1,7 @@
 import type { PoolClient } from 'pg'
 
+import { getArcBroadcastPhase } from './arc-broadcast-status'
+import { changeAcquirableAt, type ArcPhase } from './arc-tx-status'
 import { getLockOwnerId } from './utxo-locks'
 import {
   refreshTopicCounts,
@@ -27,6 +29,35 @@ function getPropagationGraceMs(): number {
   const raw = Number(process.env.BSV_PROPAGATION_GRACE_MS)
   if (!Number.isFinite(raw) || raw < 0) return 2500
   return Math.floor(raw)
+}
+
+/**
+ * Resolve acquirable_at SQL for a newly admitted change/split output.
+ * Confirmed outputs are always spendable immediately regardless of ARC phase.
+ */
+function resolveAcquirableAtSql(
+  confirmed: boolean | undefined,
+  phase: ArcPhase | null,
+  graceParamIndex: number,
+): { sql: string; graceMs: number | null } {
+  if (confirmed === true) {
+    return { sql: 'now()', graceMs: null }
+  }
+  const mode = changeAcquirableAt(phase)
+  if (mode === 'now') {
+    return { sql: 'now()', graceMs: null }
+  }
+  if (mode === 'infinity') {
+    return { sql: `'infinity'::timestamptz`, graceMs: null }
+  }
+  const graceMs = getPropagationGraceMs()
+  if (graceMs === 0) {
+    return { sql: 'now()', graceMs: null }
+  }
+  return {
+    sql: `now() + ($${graceParamIndex}::bigint * interval '1 millisecond')`,
+    graceMs,
+  }
 }
 
 // Per-transaction statement timeout for UTXO acquisition. The acquire query
@@ -57,6 +88,8 @@ export interface ConsumeAndAdmitChangeInput {
   spentVout: number
   spendingTxid: string
   rawTx: string
+  /** ARC phase for the spending tx; null/omitted keeps the 2.5s grace window. */
+  phase?: ArcPhase | null
   change?: {
     vout: number
     satoshis: number
@@ -330,12 +363,12 @@ export async function consumeAndAdmitChange(input: ConsumeAndAdmitChangeInput): 
 
     if (input.change && input.change.satoshis >= 0) {
       const admittedRole = input.change.utxoRole === 'reserve' ? 'reserve' : 'pool'
-      const graceMs = getPropagationGraceMs()
-      // Confirmed change (rare here — most change starts unconfirmed) bypasses
-      // the grace window: its parent is already in a block and propagated.
-      const acquirableAtSql = (input.change.confirmed === true || graceMs === 0)
-        ? 'now()'
-        : `now() + ($10::bigint * interval '1 millisecond')`
+      const phase = input.phase === undefined ? null : input.phase
+      const { sql: acquirableAtSql, graceMs } = resolveAcquirableAtSql(
+        input.change.confirmed,
+        phase,
+        10,
+      )
       const params: any[] = [
         input.topic,
         input.spendingTxid,
@@ -347,7 +380,7 @@ export async function consumeAndAdmitChange(input: ConsumeAndAdmitChangeInput): 
         input.walletIndex,
         admittedRole,
       ]
-      if (input.change.confirmed !== true && graceMs > 0) params.push(graceMs)
+      if (graceMs !== null) params.push(graceMs)
       await client.query(
         `INSERT INTO overlay_admitted_utxos (
            topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed,
@@ -379,6 +412,7 @@ export async function consumeAndAdmitChange(input: ConsumeAndAdmitChangeInput): 
 }
 
 export async function admitSplitOutputs(input: AdmitSplitOutputsInput): Promise<void> {
+  const phase = await getArcBroadcastPhase(input.spendingTxid)
   await withOverlayTransaction(async (client) => {
     const removed = await client.query(
       `UPDATE overlay_admitted_utxos
@@ -399,12 +433,13 @@ export async function admitSplitOutputs(input: AdmitSplitOutputsInput): Promise<
       throw new Error(`Inventory UTXO ${input.spentTxid}:${input.spentVout} was not available for split admission`)
     }
 
-    const graceMs = getPropagationGraceMs()
     for (const output of input.outputs.filter(candidate => candidate.satoshis >= 0)) {
       const admittedRole = output.utxoRole === 'reserve' ? 'reserve' : 'pool'
-      const acquirableAtSql = (output.confirmed === true || graceMs === 0)
-        ? 'now()'
-        : `now() + ($10::bigint * interval '1 millisecond')`
+      const { sql: acquirableAtSql, graceMs } = resolveAcquirableAtSql(
+        output.confirmed,
+        phase,
+        10,
+      )
       const params: any[] = [
         input.topic,
         input.spendingTxid,
@@ -416,7 +451,7 @@ export async function admitSplitOutputs(input: AdmitSplitOutputsInput): Promise<
         input.walletIndex,
         admittedRole,
       ]
-      if (output.confirmed !== true && graceMs > 0) params.push(graceMs)
+      if (graceMs !== null) params.push(graceMs)
       await client.query(
         `INSERT INTO overlay_admitted_utxos (
            topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed,

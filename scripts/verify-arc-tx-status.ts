@@ -8,6 +8,7 @@
 import {
   classifyArcTxStatus,
   changeIsSpendable,
+  changeAcquirableAt,
   inputMayBeReleased,
   explorerBadge,
   type ArcPhase,
@@ -77,6 +78,14 @@ assert(changeIsSpendable('pending') === false, 'changeIsSpendable(pending) shoul
 assert(changeIsSpendable('rejected') === false, 'changeIsSpendable(rejected) should be false')
 assert(changeIsSpendable('orphan') === false, 'changeIsSpendable(orphan) should be false')
 assert(changeIsSpendable('reorg') === false, 'changeIsSpendable(reorg) should be false')
+
+assert(changeAcquirableAt('seen') === 'now', "changeAcquirableAt(seen) should be 'now'")
+assert(changeAcquirableAt('mined') === 'now', "changeAcquirableAt(mined) should be 'now'")
+assert(changeAcquirableAt('orphan') === 'infinity', "changeAcquirableAt(orphan) should be 'infinity'")
+assert(changeAcquirableAt('pending') === 'infinity', "changeAcquirableAt(pending) should be 'infinity'")
+assert(changeAcquirableAt('reorg') === 'infinity', "changeAcquirableAt(reorg) should be 'infinity'")
+assert(changeAcquirableAt('rejected') === 'infinity', "changeAcquirableAt(rejected) should be 'infinity'")
+assert(changeAcquirableAt(null) === 'grace', "changeAcquirableAt(null) should be 'grace'")
 
 assert(inputMayBeReleased('rejected') === true, 'inputMayBeReleased(rejected) should be true')
 assert(inputMayBeReleased('orphan') === false, 'inputMayBeReleased(orphan) should be false')

@@ -44,3 +44,22 @@ export async function upsertArcBroadcastStatus(input: {
     )
   }
 }
+
+export async function getArcBroadcastPhase(txid: string): Promise<ArcPhase | null> {
+  try {
+    const result = await query<{ phase: ArcPhase }>(
+      `SELECT phase FROM arc_broadcast_status WHERE txid = $1 LIMIT 1`,
+      [txid],
+    )
+    const row = result.rows[0]
+    if (!row) return null
+    return row.phase
+  } catch (error) {
+    console.warn(
+      `⚠️  arc_broadcast_status phase read failed for ${txid}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
+    return null
+  }
+}

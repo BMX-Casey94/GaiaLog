@@ -26,6 +26,7 @@ import {
 import { QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
 import { upsertArcBroadcastStatus } from './arc-broadcast-status'
+import { classifyArcTxStatus } from './arc-tx-status'
 
 // Types
 export interface BlockchainData {
@@ -1086,6 +1087,7 @@ export class BlockchainService {
     let selectedSpendableCount: number | undefined
     let acceptedVia: string | undefined
     let acceptedTxid: string | undefined
+    let acceptedTxStatus: string | undefined
     let fromAddress = '' // hoisted so outer catch can signal per-wallet backoff
     try {
       if (this.shouldTraceTimings()) {
@@ -1398,6 +1400,7 @@ export class BlockchainService {
         const { txid, acceptedVia: acceptedViaResult, txStatus } = broadcastResult
         acceptedVia = acceptedViaResult
         acceptedTxid = txid
+        acceptedTxStatus = txStatus
         await upsertArcBroadcastStatus({
           txid,
           txStatus,
@@ -1431,6 +1434,7 @@ export class BlockchainService {
             spentVout: acquiredUtxo.vout,
             spendingTxid: txid,
             rawTx: normalHex,
+            phase: classifyArcTxStatus(acceptedTxStatus),
             change: changeOutput ? {
               vout: changeOutput.vout,
               satoshis: changeOutput.satoshis,

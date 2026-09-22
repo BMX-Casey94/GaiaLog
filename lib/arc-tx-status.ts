@@ -58,6 +58,12 @@ export function changeIsSpendable(phase: ArcPhase): boolean {
   return phase === 'seen' || phase === 'mined'
 }
 
+export function changeAcquirableAt(phase: ArcPhase | null): 'now' | 'infinity' | 'grace' {
+  if (phase === null) return 'grace'
+  if (phase === 'seen' || phase === 'mined') return 'now'
+  return 'infinity'
+}
+
 export function inputMayBeReleased(phase: ArcPhase): boolean {
   return phase === 'rejected'
 }
