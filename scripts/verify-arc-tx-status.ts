@@ -97,6 +97,8 @@ assert(shouldPersistArcPhase('seen', 'orphan') === false, 'shouldPersist seen→
 assert(shouldPersistArcPhase('reorg', 'pending') === false, 'shouldPersist reorg→pending → false')
 assert(shouldPersistArcPhase('reorg', 'seen') === false, 'shouldPersist reorg→seen → false')
 assert(shouldPersistArcPhase('reorg', 'mined') === true, 'shouldPersist reorg→mined → true')
+assert(shouldPersistArcPhase('reorg', 'reorg') === true, 'shouldPersist reorg→reorg → true')
+assert(shouldPersistArcPhase('reorg', 'rejected') === true, 'shouldPersist reorg→rejected → true')
 assert(shouldPersistArcPhase('pending', 'seen') === true, 'shouldPersist pending→seen → true')
 assert(shouldPersistArcPhase('seen', 'mined') === true, 'shouldPersist seen→mined → true')
 assert(shouldPersistArcPhase('orphan', 'pending') === true, 'shouldPersist orphan→pending → true')

@@ -76,7 +76,7 @@ export function shouldPersistArcPhase(previous: ArcPhase, next: ArcPhase): boole
   if (next === 'rejected' || next === 'reorg') return true
   if (previous === 'mined' && next !== 'mined') return false
   if (previous === 'seen' && (next === 'pending' || next === 'orphan')) return false
-  if (previous === 'reorg' && next !== 'mined' && next !== 'reorg') return false
+  if (previous === 'reorg' && next !== 'mined') return false
   return true
 }
 
