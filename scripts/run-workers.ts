@@ -64,6 +64,7 @@ async function main() {
     const { workerQueue } = await import('../lib/worker-queue')
     const { startUtxoMaintainer } = await import('../lib/utxo-maintainer')
     const { startConfirmationWorker } = await import('../lib/confirmation-worker')
+    const { startArcStatusPoller } = await import('../lib/arc-status-poller')
     const { startWalletFundingMonitor, stopWalletFundingMonitor } = await import('../lib/wallet-funding-monitor')
     const { initializeProviderBudgets, recomputeProviderConfigs } = await import('../lib/provider-registry')
     const { blockchainService } = await import('../lib/blockchain')
@@ -123,6 +124,10 @@ async function main() {
     // requiring confirmations stalls.  Self-throttled, opt-out via
     // BSV_CONFIRMATION_WORKER_DISABLED=true.
     startConfirmationWorker()
+    // ARC status poller: advances arc_broadcast_status for open TAAL /
+    // GorillaPool broadcasts and unlocks / confirms / releases inventory.
+    // Opt-out via BSV_ARC_STATUS_POLL_DISABLED=true.
+    startArcStatusPoller()
     // Wallet funding monitor: low-frequency (5 min) per-wallet runway/days
     // alerting so the operator gets ≥7 days of warning before any wallet
     // exhausts its BSV. Self-throttled CRITICAL alerts; opt-out via
@@ -236,6 +241,10 @@ async function main() {
       try {
         const { stopConfirmationWorker } = await import('../lib/confirmation-worker')
         stopConfirmationWorker()
+      } catch {}
+      try {
+        const { stopArcStatusPoller } = await import('../lib/arc-status-poller')
+        stopArcStatusPoller()
       } catch {}
       try {
         stopWalletFundingMonitor()

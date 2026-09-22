@@ -15,7 +15,6 @@ import { createCredibilityBuilder } from './pipeline-integrity'
 import type { CredibilityMetadata } from './types/credibility'
 // Explorer store – routed through the read-source switcher (legacy / dual / overlay)
 import { addReading, canAttemptExplorerWrite, type StoredReading } from './explorer-read-source'
-import { removeUnconfirmedReading } from './overlay-explorer-repository'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress, type SpendableOutput } from './spend-source'
 import { acquirePoolUtxo, consumeAndAdmitChange, releaseUtxo, type InventoryUtxo } from './utxo-inventory'
 import { getMinSpendConfirmations } from './utxo-spend-policy'
@@ -557,24 +556,10 @@ export class BlockchainService {
     }, CONFIRMATION_SCHEDULER_INTERVAL_MS)
   }
 
-  private enqueueConfirmationCheck(txid: string, streamType: string): void {
-    const existing = this.pendingConfirmationByTxid.get(txid)
-    if (!existing && this.pendingConfirmationByTxid.size >= CONFIRMATION_MAX_TRACKED_TXIDS) {
-      this.txStatusBatch.skipped += 1
-      this.recordOperationalError('confirmation-check', 'queue-capacity-reached')
-      return
-    }
-
-    const next: ConfirmationCheckState = {
-      txid,
-      streamType,
-      attempts: existing?.attempts || 0,
-      nextCheckAt: Date.now() + this.jitterDelay(CONFIRMATION_INITIAL_DELAY_MS),
-      generation: (existing?.generation || 0) + 1,
-      firstScheduledAt: existing?.firstScheduledAt || Date.now(),
-    }
-    this.pendingConfirmationByTxid.set(txid, next)
-    this.pushPendingConfirmation(next)
+  private enqueueConfirmationCheck(_txid: string, _streamType: string): void {
+    // ARC status poller owns post-broadcast phase advancement. Do not enqueue
+    // WhatsOnChain confirmation checks or allow cleanUpFailedTx to delete rows.
+    return
   }
 
   private rescheduleConfirmationCheck(state: ConfirmationCheckState, attempts: number, kind: 'pending' | 'not-found' | 'error'): void {
@@ -640,127 +625,8 @@ export class BlockchainService {
   }
 
   private async processConfirmationChecks(): Promise<void> {
-    if (this.confirmationChecksInFlight >= CONFIRMATION_MAX_CONCURRENCY) return
-    if (this.isBroadcastChannelBackedOff('whatsonchain')) return
-
-    let launched = 0
-    while (launched < CONFIRMATION_MAX_PER_TICK && this.confirmationChecksInFlight < CONFIRMATION_MAX_CONCURRENCY) {
-      const next = this.peekPendingConfirmation()
-      if (!next || next.nextCheckAt > Date.now()) break
-
-      const item = this.popPendingConfirmation()
-      if (!item) break
-
-      const state = this.pendingConfirmationByTxid.get(item.txid)
-      if (!state || state.generation !== item.generation) continue
-
-      this.confirmationChecksInFlight += 1
-      launched += 1
-      void this.runConfirmationCheck(state).finally(() => {
-        this.confirmationChecksInFlight = Math.max(0, this.confirmationChecksInFlight - 1)
-      })
-    }
-  }
-
-  private async runConfirmationCheck(state: ConfirmationCheckState): Promise<void> {
-    const current = this.pendingConfirmationByTxid.get(state.txid)
-    if (!current || current.generation !== state.generation) return
-
-    if (current.attempts >= MAX_CONFIRMATION_CHECK_ATTEMPTS || (Date.now() - current.firstScheduledAt) >= CONFIRMATION_MAX_TRACK_MS) {
-      this.txStatusBatch.retryLimitReached += 1
-      const reason = current.attempts >= MAX_CONFIRMATION_CHECK_ATTEMPTS ? 'max-attempts-reached' : 'max-track-age-reached'
-      this.recordOperationalError('confirmation-check', reason)
-      this.pendingConfirmationByTxid.delete(current.txid)
-
-      void this.cleanUpFailedTx(current.txid, current.streamType, reason)
-      return
-    }
-
-    const attemptNumber = current.attempts + 1
-    const network = WOC_NETWORK
-    const wocUrl = `https://api.whatsonchain.com/v1/bsv/${network}/tx/${current.txid}`
-    const headers = this.buildWhatsOnChainHeaders()
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 10000)
-
-    try {
-      const response = await fetch(wocUrl, { headers, signal: controller.signal })
-      if (response.ok) {
-        const txData = await response.json()
-        const confirmations = txData.confirmations || 0
-
-        if (confirmations > 0) {
-          await upsertTxLog({
-            txid: current.txid,
-            type: current.streamType,
-            provider: 'auto-confirmed',
-            collected_at: new Date(),
-            status: 'confirmed',
-            onchain_at: new Date(),
-            fee_sats: null,
-            wallet_index: null,
-            retries: null,
-            error: null,
-          })
-          throughputObservability.recordConfirmed(current.txid, { family: current.streamType })
-          this.txStatusBatch.confirmed += 1
-          this.pendingConfirmationByTxid.delete(current.txid)
-        } else {
-          this.txStatusBatch.pending += 1
-          this.rescheduleConfirmationCheck(current, attemptNumber, 'pending')
-        }
-        return
-      }
-
-      if (response.status === 404) {
-        this.txStatusBatch.notFound += 1
-        this.rescheduleConfirmationCheck(current, attemptNumber, 'not-found')
-        return
-      }
-
-      if (response.status === 429) {
-        this.noteBroadcastChannelBackoff('whatsonchain', WHATSONCHAIN_API_KEY ? 60000 : 120000, 'confirmation HTTP 429')
-      } else if (response.status >= 500) {
-        this.noteBroadcastChannelBackoff('whatsonchain', 30000, `confirmation HTTP ${response.status}`)
-      }
-      this.recordOperationalError('confirmation-check', `HTTP ${response.status}`)
-      this.rescheduleConfirmationCheck(current, attemptNumber, 'error')
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      if (/fetch failed|ECONN|ENOTFOUND|ETIMEDOUT|ABORT|NETWORK|TIMED OUT/i.test(message.toUpperCase())) {
-        this.noteBroadcastChannelBackoff('whatsonchain', 30000, `confirmation ${message}`)
-      }
-      this.recordOperationalError('confirmation-check', error)
-      this.rescheduleConfirmationCheck(current, attemptNumber, 'error')
-    } finally {
-      clearTimeout(timeoutId)
-    }
-  }
-
-  private async cleanUpFailedTx(txid: string, streamType: string, reason: string): Promise<void> {
-    try {
-      await upsertTxLog({
-        txid,
-        type: streamType,
-        provider: 'confirmation-failed',
-        collected_at: new Date(),
-        status: 'failed',
-        onchain_at: null,
-        fee_sats: null,
-        wallet_index: null,
-        retries: null,
-        error: reason,
-      })
-    } catch {}
-    try {
-      const removed = await removeUnconfirmedReading(txid)
-      if (removed) {
-        console.log(`🗑️ Removed stale unconfirmed reading: ${txid.substring(0, 12)}... (${reason})`)
-      }
-    } catch {}
-
-    const logEntry = this.transactionLog.find((l) => l.txid === txid)
-    if (logEntry) logEntry.status = 'failed'
+    this.pendingConfirmationByTxid.clear()
+    this.pendingConfirmationHeap.length = 0
   }
 
   private appendTransactionLog(entry: TransactionLog): void {

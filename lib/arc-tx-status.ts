@@ -54,6 +54,32 @@ export function classifyArcTxStatus(status: string | null | undefined): ArcPhase
   return 'pending'
 }
 
+export type ArcFollowUp = 'hold' | 'unlock-change' | 'confirm' | 'reorg' | 'release'
+
+export function arcFollowUp(phase: ArcPhase): ArcFollowUp {
+  switch (phase) {
+    case 'orphan':
+    case 'pending':
+      return 'hold'
+    case 'seen':
+      return 'unlock-change'
+    case 'mined':
+      return 'confirm'
+    case 'reorg':
+      return 'reorg'
+    case 'rejected':
+      return 'release'
+  }
+}
+
+export function shouldPersistArcPhase(previous: ArcPhase, next: ArcPhase): boolean {
+  if (next === 'rejected' || next === 'reorg') return true
+  if (previous === 'mined' && next !== 'mined') return false
+  if (previous === 'seen' && (next === 'pending' || next === 'orphan')) return false
+  if (previous === 'reorg' && next !== 'mined' && next !== 'reorg') return false
+  return true
+}
+
 export function changeIsSpendable(phase: ArcPhase): boolean {
   return phase === 'seen' || phase === 'mined'
 }

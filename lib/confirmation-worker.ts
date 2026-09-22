@@ -61,11 +61,21 @@ const MAX_AGE_HOURS = envInt('BSV_CONFIRMATION_MAX_AGE_HOURS', 72, 1)
 const CATCHUP_DAYS = envInt('BSV_CONFIRMATION_CATCHUP_DAYS', 14, 1)
 const REQ_INTERVAL_MS = envInt('BSV_CONFIRMATION_REQ_INTERVAL_MS', 400, 200)
 const BACKOFF_MS = envInt('BSV_CONFIRMATION_BACKOFF_MS', 120_000, 5_000)
+const ARC_STATUS_POLL_DISABLED = envBool('BSV_ARC_STATUS_POLL_DISABLED', false)
+
+const ARC_OWNED_EXCLUSION = `
+        AND NOT EXISTS (
+          SELECT 1 FROM arc_broadcast_status s
+          WHERE s.txid = overlay_explorer_readings.txid
+            AND s.accepted_via IN ('taal_arc', 'gorillapool_arc')
+        )`
 
 let timer: NodeJS.Timeout | null = null
 let running = false
 let cooldownUntil = 0
 let lastWocAt = 0
+/** Remember 42P01 for the process lifetime so we stop appending the ARC exclusion. */
+let arcStatusTableMissing = false
 
 function envInt(name: string, fallback: number, min = 0): number {
   const raw = process.env[name]
@@ -108,9 +118,20 @@ interface CandidateTxid {
  * window that matches its real age. Rows that never mine simply age out,
  * so the window cannot be permanently clogged by dead txids.
  */
-async function fetchCandidates(): Promise<CandidateTxid[]> {
+function isUndefinedTable(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    'code' in err &&
+    (err as { code?: string }).code === '42P01'
+  )
+}
+
+async function fetchCandidatesWithExclusion(excludeArcOwned: boolean): Promise<CandidateTxid[]> {
   const minAge = `${MIN_AGE_SECONDS} seconds`
   const maxAge = `${MAX_AGE_HOURS} hours`
+  const exclusion = excludeArcOwned ? ARC_OWNED_EXCLUSION : ''
+
   // Primary window: recent unconfirmed broadcasts the worker actively chases.
   const primary = await query<CandidateTxid>(
     `SELECT txid
@@ -118,6 +139,7 @@ async function fetchCandidates(): Promise<CandidateTxid[]> {
       WHERE confirmed = false
         AND admitted_at < now() - $1::interval
         AND admitted_at > now() - $2::interval
+        ${exclusion}
       ORDER BY admitted_at ASC
       LIMIT $3`,
     [minAge, maxAge, BATCH_SIZE],
@@ -137,6 +159,7 @@ async function fetchCandidates(): Promise<CandidateTxid[]> {
       WHERE confirmed = false
         AND admitted_at <= now() - $1::interval
         AND admitted_at > now() - $2::interval
+        ${exclusion}
       ORDER BY admitted_at DESC
       LIMIT $3`,
     [maxAge, catchup, residual],
@@ -147,6 +170,22 @@ async function fetchCandidates(): Promise<CandidateTxid[]> {
     if (!seen.has(row.txid)) primaryRows.push(row)
   }
   return primaryRows
+}
+
+async function fetchCandidates(): Promise<CandidateTxid[]> {
+  const excludeArcOwned = !ARC_STATUS_POLL_DISABLED && !arcStatusTableMissing
+  try {
+    return await fetchCandidatesWithExclusion(excludeArcOwned)
+  } catch (err) {
+    if (excludeArcOwned && isUndefinedTable(err)) {
+      arcStatusTableMissing = true
+      console.warn(
+        '[confirmation-worker] arc_broadcast_status missing; continuing without ARC exclusion',
+      )
+      return await fetchCandidatesWithExclusion(false)
+    }
+    throw err
+  }
 }
 
 interface WocTxStatus {

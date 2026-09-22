@@ -12,7 +12,10 @@ import {
   inputMayBeReleased,
   explorerBadge,
   explorerCardBadge,
+  arcFollowUp,
+  shouldPersistArcPhase,
   type ArcPhase,
+  type ArcFollowUp,
 } from '../lib/arc-tx-status'
 import { buildArcStatusRow } from '../lib/arc-broadcast-status'
 
@@ -72,6 +75,31 @@ assertPhase('SENT_TO_NETWORK', 'pending')
 assertPhase('UNKNOWN', 'pending')
 assertPhase('seen_on_network', 'pending')
 assertPhase('SOME_FUTURE_STATUS', 'pending')
+
+function assertFollowUp(phase: ArcPhase, expected: ArcFollowUp): void {
+  const actual = arcFollowUp(phase)
+  assert(actual === expected, `arcFollowUp('${phase}') expected ${expected}, got ${actual}`)
+}
+
+assertFollowUp('orphan', 'hold')
+assertFollowUp('pending', 'hold')
+assertFollowUp('seen', 'unlock-change')
+assertFollowUp('mined', 'confirm')
+assertFollowUp('reorg', 'reorg')
+assertFollowUp('rejected', 'release')
+
+assert(shouldPersistArcPhase('pending', 'rejected') === true, 'shouldPersist rejected → true')
+assert(shouldPersistArcPhase('mined', 'reorg') === true, 'shouldPersist mined→reorg → true')
+assert(shouldPersistArcPhase('mined', 'pending') === false, 'shouldPersist mined→pending → false')
+assert(shouldPersistArcPhase('mined', 'seen') === false, 'shouldPersist mined→seen → false')
+assert(shouldPersistArcPhase('seen', 'pending') === false, 'shouldPersist seen→pending → false')
+assert(shouldPersistArcPhase('seen', 'orphan') === false, 'shouldPersist seen→orphan → false')
+assert(shouldPersistArcPhase('reorg', 'pending') === false, 'shouldPersist reorg→pending → false')
+assert(shouldPersistArcPhase('reorg', 'seen') === false, 'shouldPersist reorg→seen → false')
+assert(shouldPersistArcPhase('reorg', 'mined') === true, 'shouldPersist reorg→mined → true')
+assert(shouldPersistArcPhase('pending', 'seen') === true, 'shouldPersist pending→seen → true')
+assert(shouldPersistArcPhase('seen', 'mined') === true, 'shouldPersist seen→mined → true')
+assert(shouldPersistArcPhase('orphan', 'pending') === true, 'shouldPersist orphan→pending → true')
 
 assert(changeIsSpendable('seen') === true, 'changeIsSpendable(seen) should be true')
 assert(changeIsSpendable('mined') === true, 'changeIsSpendable(mined) should be true')
