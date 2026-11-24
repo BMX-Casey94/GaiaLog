@@ -247,17 +247,26 @@ async function applyReorg(txid: string): Promise<void> {
 
 async function applyRelease(txid: string): Promise<void> {
   const skipped = await withOverlayTransaction(async (client) => {
-    const locked = await client.query<{ txid: string; removed: boolean }>(
-      `SELECT txid, removed
+    await client.query(`SET LOCAL statement_timeout = 15000`)
+    const outputs = await client.query<{ removed: boolean }>(
+      `SELECT removed
          FROM overlay_admitted_utxos
         WHERE txid = $1
-           OR spending_txid = $1
         FOR UPDATE`,
       [txid],
     )
-    if ((locked.rows ?? []).some((row) => row.txid === txid && row.removed === true)) {
+    if ((outputs.rows ?? []).some((row) => row.removed === true)) {
       return true
     }
+
+    await client.query(
+      `SELECT 1
+         FROM overlay_admitted_utxos
+        WHERE spending_txid = $1
+          AND removed = true
+        FOR UPDATE`,
+      [txid],
+    )
 
     await client.query(
       `UPDATE overlay_admitted_utxos

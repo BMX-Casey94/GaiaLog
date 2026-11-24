@@ -41,6 +41,7 @@ const CONCURRENT_INDEX_MIGRATIONS = new Set([
   '0028_drop_oer_family_ts_idx_concurrent.sql',
   '0029_drop_overlay_topic_removed_idx_concurrent.sql',
   '0031_oer_unconfirmed_admitted_idx_concurrent.sql',
+  '0036_overlay_utxo_spending_txid_idx_concurrent.sql',
 ])
 
 function isConcurrentIndexMigration(file: string, sql = ''): boolean {

@@ -256,20 +256,30 @@ async function applyReorg(txid: string): Promise<void> {
 async function applyRelease(txid: string): Promise<void> {
   let skipped = false
   await withOverlayTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = 15000`)
     // Lock this tx's outputs and the inputs it consumed before deciding.
-    // A check outside the transaction can miss a spend that lands in between.
-    const locked = await client.query<{ txid: string; removed: boolean }>(
-      `SELECT txid, removed
+    // Two single-predicate queries keep Postgres on the txid and spending_txid
+    // indexes instead of falling back to a sequential scan on an OR.
+    const outputs = await client.query<{ removed: boolean }>(
+      `SELECT removed
          FROM overlay_admitted_utxos
         WHERE txid = $1
-           OR spending_txid = $1
         FOR UPDATE`,
       [txid],
     )
-    if ((locked.rows || []).some((row) => row.txid === txid && row.removed === true)) {
+    if ((outputs.rows || []).some((row) => row.removed === true)) {
       skipped = true
       return
     }
+
+    await client.query(
+      `SELECT 1
+         FROM overlay_admitted_utxos
+        WHERE spending_txid = $1
+          AND removed = true
+        FOR UPDATE`,
+      [txid],
+    )
 
     const removed = await client.query<{ topic: string }>(
       `UPDATE overlay_admitted_utxos
