@@ -24,7 +24,7 @@ import { cursorStore } from './stores'
 import { blockchainService } from './blockchain'
 import { DataFamily, DatasetId, mapWorkerTypeToFamily, ProviderId, QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
-import { applySensitivityControls } from './sensitivity-controls'
+import { applySensitivityControls, releaseExpiredDelays, reholdDelayedItem } from './sensitivity-controls'
 import { isWritePausedForFunding, recordSuppressedWrites } from './write-dry-mode'
 
 export interface WorkerStats {
@@ -53,6 +53,46 @@ export interface EnvironmentalData {
   eventId?: string
   coordinates?: { lat: number; lon: number }
   stationId?: string
+}
+
+/**
+ * Canonical `source_hash` input for advanced-metrics readings.
+ *
+ * Must be the only place this shape is defined. It was previously written out
+ * twice with different contents: the collector hashed the raw provider response
+ * (including `providerId`, `datasetId`, `coordinates`, and the pre-rounded
+ * `soil_moisture`), while the enqueue path hashed the mapped `measurement`
+ * object. The two never agreed, so `hasAdvancedTxId(hash)` looked up a hash that
+ * had never been stored, `setAdvancedTxId(hash)` updated no row, and the whole
+ * advanced-metrics family was re-broadcast on every cycle after a restart.
+ *
+ * Hashing the measurement that is actually persisted and sent on-chain means
+ * the stored hash describes the reading, not the provider's response envelope.
+ */
+function advancedMetricsSourceHash(input: {
+  measurement: Record<string, unknown>
+  location: string
+  timestampIso: string
+  source: string
+}): string {
+  const m: any = input.measurement || {}
+  return calculateSourceHash({
+    type: 'advanced',
+    a: {
+      uv_index: m.uv_index ?? null,
+      soil_moisture: m.soil_moisture ?? null,
+      wildfire_risk: m.wildfire_risk ?? null,
+      environmental_quality_score: m.environmental_quality_score ?? null,
+      temperature_c: m.temperature_c ?? null,
+      humidity_pct: m.humidity_pct ?? null,
+      pressure_mb: m.pressure_mb ?? null,
+      wind_kph: m.wind_kph ?? null,
+      wind_deg: m.wind_deg ?? null,
+      location: input.location,
+      timestamp: input.timestampIso,
+      source: input.source,
+    },
+  })
 }
 
 export abstract class BaseWorker {
@@ -145,6 +185,9 @@ export abstract class BaseWorker {
       alreadyOnChainDropped: 0,
       backpressured: 0,
       writesSuppressed: 0,
+      delayed: 0,
+      releasedFromDelay: 0,
+      abandonedAfterBackpressure: 0,
     }
     const metaForItem = (item: EnvironmentalData) => ({
       family: item.family || mapWorkerTypeToFamily(item.type),
@@ -154,6 +197,17 @@ export abstract class BaseWorker {
     })
     
     try {
+      // Drain matured hold-buffer entries first, before collecting anything new.
+      //
+      // Readings delayed by the sensitivity policy (currently transport_tracking
+      // at 1h and everything Movebank, at 24h) were previously released to
+      // nobody: shouldDelay returned true, the loop skipped the item, and the
+      // entry sat in a buffer whose only reader returned keys. Every delayed
+      // reading in the system was dropped 100% of the time. Draining here, at
+      // the top of the cycle, means a matured reading is enqueued on the first
+      // tick after its release time rather than waiting on the collector.
+      this.drainDelayedItems(cycleStats)
+
       console.log(`📡 ${this.workerId}: Collecting environmental data...`)
       
       const data = await this.collectData()
@@ -183,7 +237,9 @@ export abstract class BaseWorker {
 
       const itemsToBroadcast: EnvironmentalData[] = writesPaused ? [] : data
 
-      for (const item of itemsToBroadcast) {
+      let abandonedAfterBackpressure = 0
+      for (let itemIndex = 0; itemIndex < itemsToBroadcast.length; itemIndex++) {
+        const item = itemsToBroadcast[itemIndex]!
         const itemMeta = metaForItem(item)
 
         let unifiedHash: string
@@ -322,112 +378,53 @@ export abstract class BaseWorker {
           {
             family: resolvedFamily,
             providerId: resolvedProvider ?? null,
-            dedupeKey: `${resolvedFamily}:${resolvedProvider}:${item.timestamp}`,
+            // Worker-scoped key: it both dedupes within this worker and scopes
+            // the later drain (see delayKeyPrefix) so held readings return to
+            // the worker that collected them.
+            dedupeKey: `${this.delayKeyPrefix()}${resolvedFamily}:${resolvedProvider}:${item.timestamp}`,
             lat: item.coordinates?.lat,
             lon: item.coordinates?.lon,
+            // Hold the whole reading, not a placeholder. This is what
+            // drainDelayedItems re-enqueues when the delay expires; the previous
+            // buffer stored `{}`, so a released entry carried nothing and the
+            // reading was silently dropped.
+            holdValue: (redacted, coordinates) => ({
+              unifiedHash,
+              item: this.buildDelayedItem(item, redacted, coordinates),
+            }),
           },
         )
 
         if (!sensitivityResult.allowed) {
-          if (sensitivityResult.delayed) cycleStats.backpressured++
+          if (sensitivityResult.delayed) {
+            cycleStats.delayed++
+            if (bsvConfig.logging.level === 'debug') {
+              console.log(
+                `⏳ ${this.workerId}: holding ${resolvedFamily} reading until ` +
+                  `${new Date(sensitivityResult.delay?.releaseAt ?? Date.now()).toISOString()} (delay=${sensitivityResult.policy.delayHours}h)`,
+              )
+            }
+          }
           continue
         }
 
-        const policyCoords = sensitivityResult.coordinates
-        const finalCoordinates = item.coordinates
-          ? { lat: policyCoords.lat ?? item.coordinates.lat, lon: policyCoords.lon ?? item.coordinates.lon }
-          : item.coordinates
-
-        const bsvData: BSVTransactionData = {
-          type: item.type,
-          timestamp: item.timestamp,
-          location: item.location,
-          measurement: sensitivityResult.payload,
-          source_hash: unifiedHash,
-          family: resolvedFamily,
-          providerId: resolvedProvider,
-          datasetId: item.datasetId,
-          sourceLabel: resolveSourceLabel(item.providerId, item.datasetId, item.source),
-          queueLane: item.queueLane,
-          maxInFlight: item.maxInFlight,
-          coordinates: finalCoordinates,
-          stationId: item.stationId,
-        }
-
-        // Check if we should bypass queue for direct broadcasting
-        const BYPASS_QUEUE = process.env.BSV_BYPASS_QUEUE === 'true'
-
-        if (BYPASS_QUEUE) {
-          // Direct broadcast - bypass queue to avoid Supabase bottleneck.
-          // Stream must be the canonical data family (same as worker-queue
-          // mapTypeToStream). The previous air/water/seismic/else→advanced
-          // collapse indexed geomagnetism, hydrology, flood, NWS, etc. under
-          // advanced_metrics and left those explorer cards empty.
-          try {
-            const stream = resolvedFamily
-
-            const txid = await blockchainService.writeToChain({
-              stream,
-              timestamp: item.timestamp,
-              family: bsvData.family,
-              providerId: bsvData.providerId,
-              datasetId: bsvData.datasetId,
-              queueLane: bsvData.queueLane,
-              payload: {
-                location: item.location,
-                timestamp: new Date(item.timestamp).toISOString(),
-                source: resolveSourceLabel(bsvData.providerId, bsvData.datasetId, item.source),
-                ...(bsvData.coordinates
-                  ? { latitude: bsvData.coordinates.lat, longitude: bsvData.coordinates.lon }
-                  : {}),
-                ...(bsvData.stationId ? { station_id: bsvData.stationId } : {}),
-                ...bsvData.measurement,
-                source_hash: unifiedHash
-              }
-            })
-            
-            if (bsvConfig.logging.level !== 'error') {
-              console.log(`✅ ${this.workerId}: Direct broadcast ${item.type} (${stream}) - ${txid}`)
-            }
-            this.stats.totalTransactions++
-            cycleStats.submitted++
-          } catch (e) {
-            const eMsg = e instanceof Error ? e.message : String(e)
-            const isTransient = /MEMPOOL_CHAIN_LIMIT|No reservable UTXO|No UTXOs available|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(eMsg)
-            // Reliability guard: never drop a reading on direct-broadcast failure.
-            // Route to queue so retry/backoff/idempotency logic can recover safely.
-            const queueId = workerQueue.addToQueue(bsvData, item.priority)
-            if (queueId) {
-              this.stats.totalTransactions++
-              cycleStats.queued++
-            } else {
-              cycleStats.backpressured++
-            }
-
-            if (isTransient) {
-              if (bsvConfig.logging.level !== 'error') {
-                console.warn(queueId
-                  ? `⏳ ${this.workerId}: direct broadcast transient failure, queued for retry (${queueId}) - ${eMsg.split('\n')[0].substring(0, 140)}`
-                  : `⏸️ ${this.workerId}: direct broadcast transient failure but queue is backpressured for ${bsvData.datasetId || bsvData.providerId || 'source'}`
-                )
-              }
-            } else {
-              if (queueId) console.error(`❌ ${this.workerId}: Direct broadcast failed, queued for retry (${queueId}):`, e)
-              else console.error(`❌ ${this.workerId}: Direct broadcast failed but queue is backpressured:`, e)
-            }
+        const outcome = await this.dispatchToChain(item, unifiedHash, sensitivityResult.payload, sensitivityResult.coordinates, cycleStats)
+        if (outcome === 'backpressured') {
+          // Everything from here to the end of this batch is abandoned.
+          // The loop used to `break` here with no record of how much work that
+          // discarded, so a queue under sustained backpressure dropped readings
+          // silently and the cycle log still read as if collection had
+          // succeeded for every item.
+          abandonedAfterBackpressure = itemsToBroadcast.length - (itemIndex + 1)
+          cycleStats.abandonedAfterBackpressure += abandonedAfterBackpressure
+          if (abandonedAfterBackpressure > 0) {
+            console.warn(
+              `⏸️ ${this.workerId}: queue backpressured at item ${itemIndex + 1}/${itemsToBroadcast.length}; ` +
+                `abandoning ${abandonedAfterBackpressure} unprocessed reading(s) this cycle ` +
+                `(family=${itemMeta.family}, provider=${itemMeta.providerId ?? 'unknown'}, dataset=${itemMeta.datasetId ?? '-'})`,
+            )
           }
-        } else {
-          const queueId = workerQueue.addToQueue(bsvData, item.priority)
-          if (queueId) {
-            this.stats.totalTransactions++
-            cycleStats.queued++
-          } else {
-            cycleStats.backpressured++
-            break
-          }
-          if (queueId && bsvConfig.logging.level === 'debug') {
-            console.log(`📥 ${this.workerId}: Queued ${item.type} data (${item.priority} priority): ${queueId}`)
-          }
+          break
         }
       }
 
@@ -448,6 +445,9 @@ export abstract class BaseWorker {
           `✅ ${this.workerId}: Processed ${data.length} data points in ${processingTime}ms ` +
           `(submitted=${cycleStats.submitted}, queued=${cycleStats.queued}, duplicate=${cycleStats.duplicateDropped}, ` +
           `already_on_chain=${cycleStats.alreadyOnChainDropped}, backpressured=${cycleStats.backpressured}` +
+          `${cycleStats.delayed > 0 ? `, delayed=${cycleStats.delayed}` : ''}` +
+          `${cycleStats.releasedFromDelay > 0 ? `, released_from_delay=${cycleStats.releasedFromDelay}` : ''}` +
+          `${cycleStats.abandonedAfterBackpressure > 0 ? `, abandoned=${cycleStats.abandonedAfterBackpressure}` : ''}` +
           `${cycleStats.writesSuppressed > 0 ? `, writes_suppressed=${cycleStats.writesSuppressed}` : ''}) ` +
           `novel=${novel} nextRunIn=${(nextRunIn / 1000).toFixed(0)}s`
         )
@@ -469,6 +469,226 @@ export abstract class BaseWorker {
     }
   }
 
+  /**
+   * Build the record kept in the hold buffer for a delayed reading.
+   *
+   * Stores the reading itself with its measurement replaced by the redacted
+   * payload, so what is re-enqueued on release is identical to what would have
+   * been enqueued immediately, minus the fields the policy removed.
+   */
+  private buildDelayedItem(
+    item: EnvironmentalData,
+    redactedPayload: Record<string, unknown>,
+    coordinates: { lat: number | null; lon: number | null },
+  ): EnvironmentalData {
+    return {
+      ...item,
+      measurement: redactedPayload,
+      coordinates: item.coordinates
+        ? {
+            lat: coordinates.lat ?? item.coordinates.lat,
+            lon: coordinates.lon ?? item.coordinates.lon,
+          }
+        : item.coordinates,
+    }
+  }
+
+  /**
+   * Enqueue every held reading of this worker whose delay has expired.
+   *
+   * Scoped by the `workerId` prefix of the hold-buffer key, so a reading always
+   * returns to the worker that collected it. Without the scope, whichever worker
+   * happened to tick first would consume every other worker's released entries.
+   */
+  private drainDelayedItems(cycleStats: { queued: number; releasedFromDelay: number }): void {
+    // Hold releases while writes are paused for funding. The reading stays in
+    // the buffer with its release time in the past, so it is picked up on the
+    // first cycle after funding returns rather than being enqueued into a queue
+    // that cannot drain or dropped for backpressure.
+    if (isWritePausedForFunding()) return
+
+    let released: ReturnType<typeof releaseExpiredDelays>
+    try {
+      released = releaseExpiredDelays(Date.now(), this.delayKeyPrefix())
+    } catch (error) {
+      console.warn(`⚠️ ${this.workerId}: delay buffer drain failed:`, error)
+      return
+    }
+    if (released.length === 0) return
+
+    for (const entry of released) {
+      const held = entry.payload as { unifiedHash?: string; item?: EnvironmentalData } | null
+      if (!held?.item) continue
+
+      const queueId = workerQueue.addToQueue(this.toBsvData(held.item, held.unifiedHash || ''), held.item.priority)
+      if (queueId) {
+        this.stats.totalTransactions++
+        cycleStats.queued++
+        cycleStats.releasedFromDelay++
+      } else {
+        // The queue refused it. Put it back rather than dropping it: the
+        // reading was collected once and should not need collecting again just
+        // because the queue was momentarily full. Retried on the next cycle.
+        reholdDelayedItem(entry.key, Date.now() + this.delayReholdMs(), held)
+        console.warn(
+          `⏸️ ${this.workerId}: released delayed reading could not be queued (backpressure); ` +
+            `re-held ${entry.key} for ${(this.delayReholdMs() / 1000).toFixed(0)}s`,
+        )
+      }
+    }
+
+    if (cycleStats.releasedFromDelay > 0 && bsvConfig.logging.level !== 'error') {
+      console.log(`⏳ ${this.workerId}: released ${cycleStats.releasedFromDelay} delayed reading(s) into the queue`)
+    }
+  }
+
+  /** Hold-buffer key prefix owned by this worker. */
+  private delayKeyPrefix(): string {
+    return `${this.workerId}:`
+  }
+
+  /** How long a released-but-unqueueable reading waits before being offered again. */
+  private delayReholdMs(): number {
+    const raw = Number(process.env.BSV_DELAY_REHOLD_MS)
+    return Number.isFinite(raw) && raw >= 1000 ? Math.floor(raw) : 60_000
+  }
+
+  /** Convert a reading into the queue/chain payload shape. */
+  private toBsvData(item: EnvironmentalData, sourceHash: string): BSVTransactionData {
+    const family = (item.family || mapWorkerTypeToFamily(item.type)) as DataFamily
+    const providerId = (item.providerId || resolveProviderIdFromSource(item.source) || undefined) as ProviderId | undefined
+    return {
+      type: item.type,
+      timestamp: item.timestamp,
+      location: item.location,
+      measurement: item.measurement,
+      source_hash: sourceHash,
+      family,
+      providerId,
+      datasetId: item.datasetId,
+      sourceLabel: resolveSourceLabel(item.providerId, item.datasetId, item.source),
+      queueLane: item.queueLane,
+      maxInFlight: item.maxInFlight,
+      coordinates: item.coordinates,
+      stationId: item.stationId,
+    }
+  }
+
+  /**
+   * Send one accepted reading to the chain or the queue.
+   *
+   * Returns 'backpressured' when the queue refused it, which ends the collection
+   * loop for this cycle: continuing would submit further readings that the queue
+   * would also refuse, and each refusal is work the provider already paid for.
+   */
+  private async dispatchToChain(
+    item: EnvironmentalData,
+    unifiedHash: string,
+    redactedPayload: Record<string, unknown>,
+    coordinates: { lat: number | null; lon: number | null },
+    cycleStats: { submitted: number; queued: number; backpressured: number },
+  ): Promise<'ok' | 'backpressured'> {
+    const resolvedFamily = (item.family || mapWorkerTypeToFamily(item.type)) as DataFamily
+    const resolvedProvider = (item.providerId || resolveProviderIdFromSource(item.source) || undefined) as ProviderId | undefined
+
+    const finalCoordinates = item.coordinates
+      ? { lat: coordinates.lat ?? item.coordinates.lat, lon: coordinates.lon ?? item.coordinates.lon }
+      : item.coordinates
+
+    const bsvData: BSVTransactionData = {
+      type: item.type,
+      timestamp: item.timestamp,
+      location: item.location,
+      measurement: redactedPayload,
+      source_hash: unifiedHash,
+      family: resolvedFamily,
+      providerId: resolvedProvider,
+      datasetId: item.datasetId,
+      sourceLabel: resolveSourceLabel(item.providerId, item.datasetId, item.source),
+      queueLane: item.queueLane,
+      maxInFlight: item.maxInFlight,
+      coordinates: finalCoordinates,
+      stationId: item.stationId,
+    }
+
+    // Check if we should bypass queue for direct broadcasting
+    const BYPASS_QUEUE = process.env.BSV_BYPASS_QUEUE === 'true'
+
+    if (BYPASS_QUEUE) {
+      // Direct broadcast - bypass queue to avoid Supabase bottleneck.
+      // Stream must be the canonical data family (same as worker-queue
+      // mapTypeToStream). The previous air/water/seismic/else→advanced
+      // collapse indexed geomagnetism, hydrology, flood, NWS, etc. under
+      // advanced_metrics and left those explorer cards empty.
+      try {
+        const stream = resolvedFamily
+
+        const txid = await blockchainService.writeToChain({
+          stream,
+          timestamp: item.timestamp,
+          family: bsvData.family,
+          providerId: bsvData.providerId,
+          datasetId: bsvData.datasetId,
+          queueLane: bsvData.queueLane,
+          payload: {
+            location: item.location,
+            timestamp: new Date(item.timestamp).toISOString(),
+            source: resolveSourceLabel(bsvData.providerId, bsvData.datasetId, item.source),
+            ...(bsvData.coordinates
+              ? { latitude: bsvData.coordinates.lat, longitude: bsvData.coordinates.lon }
+              : {}),
+            ...(bsvData.stationId ? { station_id: bsvData.stationId } : {}),
+            ...bsvData.measurement,
+            source_hash: unifiedHash
+          }
+        })
+
+        if (bsvConfig.logging.level !== 'error') {
+          console.log(`✅ ${this.workerId}: Direct broadcast ${item.type} (${stream}) - ${txid}`)
+        }
+        this.stats.totalTransactions++
+        cycleStats.submitted++
+      } catch (e) {
+        const eMsg = e instanceof Error ? e.message : String(e)
+        const isTransient = /MEMPOOL_CHAIN_LIMIT|No reservable UTXO|No UTXOs available|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(eMsg)
+        // Reliability guard: never drop a reading on direct-broadcast failure.
+        // Route to queue so retry/backoff/idempotency logic can recover safely.
+        const queueId = workerQueue.addToQueue(bsvData, item.priority)
+        if (queueId) {
+          this.stats.totalTransactions++
+          cycleStats.queued++
+        } else {
+          cycleStats.backpressured++
+        }
+
+        if (isTransient) {
+          if (bsvConfig.logging.level !== 'error') {
+            console.warn(queueId
+              ? `⏳ ${this.workerId}: direct broadcast transient failure, queued for retry (${queueId}) - ${eMsg.split('\n')[0].substring(0, 140)}`
+              : `⏸️ ${this.workerId}: direct broadcast transient failure but queue is backpressured for ${bsvData.datasetId || bsvData.providerId || 'source'}`
+            )
+          }
+        } else {
+          if (queueId) console.error(`❌ ${this.workerId}: Direct broadcast failed, queued for retry (${queueId}):`, e)
+          else console.error(`❌ ${this.workerId}: Direct broadcast failed but queue is backpressured:`, e)
+        }
+      }
+      return 'ok'
+    }
+
+    const queueId = workerQueue.addToQueue(bsvData, item.priority)
+    if (!queueId) {
+      cycleStats.backpressured++
+      return 'backpressured'
+    }
+    this.stats.totalTransactions++
+    cycleStats.queued++
+    if (bsvConfig.logging.level === 'debug') {
+      console.log(`📥 ${this.workerId}: Queued ${item.type} data (${item.priority} priority): ${queueId}`)
+    }
+    return 'ok'
+  }
+
   private computeUnifiedHash(item: EnvironmentalData): string {
     const ts = new Date(item.timestamp).toISOString()
     if (item.type === 'air-quality') {
@@ -478,7 +698,14 @@ export abstract class BaseWorker {
     } else if (item.type === 'seismic') {
       return calculateSourceHash({ type: 'seismic', s: { magnitude: (item.measurement as any)?.magnitude, depth: (item.measurement as any)?.depth, location: item.location, coordinates: { lat: (item.measurement as any)?.latitude, lon: (item.measurement as any)?.longitude }, timestamp: ts, source: item.source, event_id: item.eventId } })
     } else if (item.type === 'advanced') {
-      return calculateSourceHash({ type: 'advanced', a: { ...item.measurement, location: item.location, timestamp: ts, source: item.source } })
+      // Same helper the collector uses to write advanced_metrics_readings — see
+      // advancedMetricsSourceHash for why this must not be inlined twice.
+      return advancedMetricsSourceHash({
+        measurement: item.measurement || {},
+        location: item.location,
+        timestampIso: ts,
+        source: item.source,
+      })
     }
     return this.generateSourceHash(item)
   }
@@ -665,14 +892,43 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
         aqItems = batch as any
       }
       for (const item of aqItems) {
-        const measurement = {
+        // Attribute the reading to the provider that actually produced it.
+        //
+        // aqItems is a mix: the WAQI sweep, the DB-less WAQI index, and — when
+        // both are empty — the collectAirQualityDataBatch fallback, which calls
+        // WeatherAPI when no WAQI key or station is available. Every item was
+        // stamped providerId 'waqi' / datasetId 'waqi_station_feed' regardless,
+        // so WeatherAPI readings were written to the explorer and the chain
+        // under WAQI's identity. That misattributes the data source, and it
+        // also collapses two providers into one queue scope: maxInFlight for
+        // WAQI throttled WeatherAPI enqueues, and dataset-level backpressure
+        // covered both.
+        const fromWeatherApi = /weatherapi/i.test(String(item.source || ''))
+        const itemConfig = fromWeatherApi
+          ? (datasetConfigs.weatherapi_air_quality || config)
+          : config
+
+        // Carry every collected measurement, not a fixed seven fields. so2,
+        // temperature, humidity, pressure and the station coordinates are all
+        // present on the WAQI sweep result and were being dropped here, so they
+        // never reached the persisted row or the on-chain payload.
+        const measurement: Record<string, unknown> = {
           aqi: item.aqi,
           pm25: item.pm25,
           pm10: item.pm10,
           co: item.co,
           no2: item.no2,
           o3: item.o3,
+          so2: item.so2,
+          temperature_c: item.temperature_c ?? item.temperature,
+          humidity_pct: item.humidity_pct ?? item.humidity,
+          pressure_mb: item.pressure_mb ?? item.pressure,
+          wind_kph: item.wind_kph,
+          wind_deg: item.wind_deg,
           source: item.source,
+        }
+        for (const [key, value] of Object.entries(measurement)) {
+          if (value === undefined) delete measurement[key]
         }
         data.push({
           type: 'air-quality',
@@ -680,12 +936,12 @@ export class WAQIEnvironmentalWorker extends BaseWorker {
           location: item.location,
           measurement,
           source: item.source,
-          priority: config.defaultPriority,
+          priority: itemConfig.defaultPriority,
           family: 'air_quality',
-          providerId: 'waqi',
-          datasetId: 'waqi_station_feed',
-          queueLane: config.queueLane,
-          maxInFlight: config.maxInFlight,
+          providerId: fromWeatherApi ? 'weatherapi' : 'waqi',
+          datasetId: fromWeatherApi ? 'weatherapi_air_quality' : 'waqi_station_feed',
+          queueLane: itemConfig.queueLane,
+          maxInFlight: itemConfig.maxInFlight,
           coordinates: (item as any)?.coordinates,
           stationId: (item as any)?.station_id,
         })
@@ -945,6 +1201,16 @@ export class EMSCRealtimeWorker extends BaseWorker {
   private socketConnecting = false
   private bufferedEvents: EnvironmentalData[] = []
   private lastSocketEventAt = 0
+  /** Last time anything came off the socket: open, message, pong, or error. */
+  private lastSocketEventReceivedAt = 0
+  private heartbeatTimer: NodeJS.Timeout | null = null
+  /** Consecutive connection attempts that ended without a socket opening. */
+  private reconnectAttempts = 0
+  private reconnectTimer: NodeJS.Timeout | null = null
+  /** True once we have seen `open` on the current socket. */
+  private awaitingPong = false
+  /** Set when a pong arrives after a ping was issued for the current socket. */
+  private pongReceivedSincePing = false
 
   constructor() {
     super('EMSC-Realtime')
@@ -952,10 +1218,16 @@ export class EMSCRealtimeWorker extends BaseWorker {
 
   public start(): void {
     void this.ensureSocket()
+    this.startHeartbeat()
     super.start()
   }
 
   public stop(): void {
+    this.stopHeartbeat()
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
     try {
       this.socket?.removeAllListeners?.()
       this.socket?.close?.()
@@ -967,6 +1239,147 @@ export class EMSCRealtimeWorker extends BaseWorker {
 
   protected getIntervalMs(): number {
     return datasetConfigs.emsc_realtime_events?.cadence.intervalMs || 60 * 1000
+  }
+
+  /**
+   * Watchdog that detects a dead-but-open socket.
+   *
+   * The socket previously had no liveness check at all. A half-open TCP
+   * connection — the common failure across a NAT rebind, a load balancer idle
+   * timeout, or the server process being killed — leaves `readyState === 1`
+   * forever, emits no `close`, and delivers no messages. Because
+   * `ensureSocket` returns early on readyState 1, nothing ever reconnected, and
+   * the worker stayed subscribed to a dead connection until the process
+   * restarted.
+   *
+   * Three separate checks, because they fail differently:
+   *
+   *   1. **Ping/pong** — an explicit ping every interval. No pong within the
+   *      interval terminates the socket, which fires `close` and lets the
+   *      reconnect path run.
+   *   2. **Silence** — `lastSocketEventReceivedAt` older than a heartbeat
+   *      interval, even with a live socket, indicates a half-open connection
+   *      the pong path could not see. Terminated.
+   *   3. **Half-open teardown** — a socket stuck in CONNECTING past the
+   *      handshake timeout is destroyed and retried.
+   */
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer) return
+    const intervalMs = this.heartbeatIntervalMs()
+    this.heartbeatTimer = setInterval(() => this.heartbeatTick(), intervalMs)
+    // Do not hold the process open just for the heartbeat.
+    this.heartbeatTimer.unref?.()
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+    this.awaitingPong = false
+    this.pongReceivedSincePing = false
+  }
+
+  private heartbeatIntervalMs(): number {
+    const raw = Number(process.env.EMSC_HEARTBEAT_INTERVAL_MS)
+    return Number.isFinite(raw) && raw >= 5000 ? Math.floor(raw) : 30_000
+  }
+
+  private heartbeatTick(): void {
+    const config = datasetConfigs.emsc_realtime_events
+    if (!config?.enabled) return
+
+    const now = Date.now()
+    const ws = this.socket
+    const state = ws?.readyState
+
+    // A connection attempt that never completed: destroy it so ensureSocket
+    // can start a fresh one.
+    if (state === 0 && this.socketConnecting && (now - this.lastSocketEventReceivedAt) > this.heartbeatIntervalMs() * 2) {
+      console.warn('⚠️ EMSC: socket stuck connecting past heartbeat window; terminating')
+      try { ws?.terminate?.() } catch {}
+      this.socket = null
+      this.socketConnecting = false
+      void this.scheduleReconnect()
+      return
+    }
+
+    if (state !== 1) {
+      // Not open. If nothing is connecting, try again — the reconnect timer may
+      // have been lost (for example if `error` fired without `close`).
+      if (!this.socketConnecting) void this.ensureSocket()
+      return
+    }
+
+    // The previous ping went unanswered: the socket is dead.
+    if (this.awaitingPong && !this.pongReceivedSincePing) {
+      console.warn('⚠️ EMSC: no pong within heartbeat interval; terminating half-open socket')
+      try { ws?.terminate?.() } catch {}
+      this.socket = null
+      this.socketConnecting = false
+      this.awaitingPong = false
+      this.pongReceivedSincePing = false
+      void this.scheduleReconnect()
+      return
+    }
+
+    // Socket is open and answered, but nothing has arrived for a whole
+    // interval. Treated as stale even though readyState says otherwise.
+    if (this.lastSocketEventReceivedAt > 0 &&
+        (now - this.lastSocketEventReceivedAt) > this.heartbeatIntervalMs() * 2) {
+      console.warn('⚠️ EMSC: socket silent past heartbeat window; terminating stale connection')
+      try { ws?.terminate?.() } catch {}
+      this.socket = null
+      this.socketConnecting = false
+      this.awaitingPong = false
+      void this.scheduleReconnect()
+      return
+    }
+
+    this.awaitingPong = true
+    this.pongReceivedSincePing = false
+    try {
+      ws.ping?.()
+    } catch (error) {
+      console.warn('⚠️ EMSC: ping failed; terminating socket:', error instanceof Error ? error.message : error)
+      try { ws.terminate?.() } catch {}
+      this.socket = null
+      this.socketConnecting = false
+      void this.scheduleReconnect()
+    }
+  }
+
+  /**
+   * Reconnect with exponential backoff and jitter.
+   *
+   * The previous path relied on the next collection cycle calling
+   * `ensureSocket`, so a fast-failing endpoint was retried on the collection
+   * cadence with no bound — and a flapping endpoint was hammered exactly as
+   * often as the cycle ran. Jitter matters here because every worker instance
+   * runs this class, so a shared outage would otherwise produce a synchronised
+   * reconnect storm the moment the endpoint recovered.
+   */
+  private async scheduleReconnect(): Promise<void> {
+    if (this.reconnectTimer) return
+    const baseMs = Math.max(1000, Number(process.env.EMSC_RECONNECT_BASE_MS || 2000))
+    const maxMs = Math.max(baseMs, Number(process.env.EMSC_RECONNECT_MAX_MS || 120_000))
+    const exponential = Math.min(maxMs, baseMs * Math.pow(2, Math.min(this.reconnectAttempts, 10)))
+    // Full jitter: uniform in [50%, 100%] of the computed delay.
+    const delay = Math.round(exponential * (0.5 + Math.random() * 0.5))
+    this.reconnectAttempts++
+
+    if (bsvConfig.logging.level !== 'error') {
+      console.warn(
+        `🔄 EMSC: reconnecting in ${(delay / 1000).toFixed(1)}s ` +
+          `(attempt ${this.reconnectAttempts}, backoff=${(exponential / 1000).toFixed(1)}s)`,
+      )
+    }
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      void this.ensureSocket()
+    }, delay)
+    this.reconnectTimer.unref?.()
   }
 
   protected async collectData(): Promise<EnvironmentalData[]> {
@@ -1016,18 +1429,35 @@ export class EMSCRealtimeWorker extends BaseWorker {
     if (readyState === 0 || readyState === 1) return
 
     this.socketConnecting = true
+    const attemptStartedAt = Date.now()
     try {
       const WebSocketCtor = require('ws')
       const endpoint = process.env.EMSC_WEBSOCKET_URL || 'wss://www.seismicportal.eu/standing_order/websocket'
       const ws = new WebSocketCtor(endpoint, { handshakeTimeout: 15000 })
       this.socket = ws
+      this.lastSocketEventReceivedAt = attemptStartedAt
+      this.awaitingPong = false
+      this.pongReceivedSincePing = false
 
       ws.on('open', () => {
         this.socketConnecting = false
+        // A successful open resets the backoff: the endpoint is healthy again,
+        // so the next failure should retry promptly rather than inherit an
+        // interval earned by an earlier outage.
+        this.reconnectAttempts = 0
+        this.lastSocketEventReceivedAt = Date.now()
         try { console.log('🌋 EMSC: WebSocket connected') } catch {}
       })
 
+      // Pong is the liveness signal the watchdog reads. Without this handler
+      // every socket would look dead by the second tick.
+      ws.on('pong', () => {
+        this.lastSocketEventReceivedAt = Date.now()
+        this.pongReceivedSincePing = true
+      })
+
       ws.on('message', async (message: Buffer | string) => {
+        this.lastSocketEventReceivedAt = Date.now()
         try {
           const parsed = JSON.parse(String(message))
           const properties = parsed?.data?.properties || {}
@@ -1076,20 +1506,33 @@ export class EMSCRealtimeWorker extends BaseWorker {
       })
 
       ws.on('close', () => {
-        this.socket = null
+        if (this.socket === ws) {
+          this.socket = null
+        }
         this.socketConnecting = false
-        try { console.warn('⚠️ EMSC: WebSocket disconnected, will reconnect on next cycle') } catch {}
+        this.awaitingPong = false
+        this.pongReceivedSincePing = false
+        try { console.warn('⚠️ EMSC: WebSocket disconnected, reconnecting with backoff') } catch {}
+        void this.scheduleReconnect()
       })
 
       ws.on('error', (error: Error) => {
-        this.socket = null
+        if (this.socket === ws) {
+          this.socket = null
+        }
         this.socketConnecting = false
+        this.awaitingPong = false
+        this.pongReceivedSincePing = false
         console.warn('⚠️ EMSC WebSocket error:', error.message)
+        // `error` is not always followed by `close`, so the reconnect is
+        // scheduled here as well. scheduleReconnect is idempotent.
+        void this.scheduleReconnect()
       })
     } catch (error) {
       this.socket = null
       this.socketConnecting = false
       console.warn('⚠️ Unable to initialise EMSC WebSocket:', error)
+      void this.scheduleReconnect()
     }
   }
 }
@@ -1225,30 +1668,11 @@ export class AdvancedMetricsWorker extends BaseWorker {
             const datasetConfig = data.datasetId === 'owm_advanced_metrics'
               ? datasetConfigs.owm_advanced_metrics
               : datasetConfigs.weatherapi_advanced_metrics
-            if (process.env.GAIALOG_NO_DB !== 'true') {
-              try {
-                await insertAdvanced({
-                  provider: data.source,
-                  city: data.location,
-                  lat: data.coordinates?.lat ?? null,
-                  lon: data.coordinates?.lon ?? null,
-                  uv_index: data.uv_index,
-                  soil_moisture_pct: Math.round((data.soil_moisture ?? 0) * 100),
-                  wildfire_risk: data.wildfire_risk,
-                  environmental_score: Math.round((data.environmental_quality_score ?? 0) * 100),
-                  temperature_c: data.temperature_c ?? null,
-                  humidity_pct: data.humidity_pct ?? null,
-                  pressure_mb: data.pressure_mb ?? null,
-                  wind_kph: data.wind_kph ?? null,
-                  wind_deg: data.wind_deg ?? null,
-                  source_hash: calculateSourceHash({ type: 'advanced', a: { ...data, location: data.location, timestamp: new Date(data.timestamp).toISOString(), source: data.source } }),
-                  collected_at: new Date(data.timestamp),
-                })
-              } catch (e) {
-                console.error('insertAdvanced error:', e)
-              }
-            }
-            return {
+            // Build the item first, then derive the hash from it. The hash must
+            // describe exactly the record that is persisted and queued; deriving
+            // it from the raw provider response (as this did) produced a value
+            // the enqueue path could never reproduce.
+            const item: EnvironmentalData = {
               type: 'advanced',
               timestamp: Date.parse(data.timestamp) || Date.now(),
               location: data.location,
@@ -1271,7 +1695,36 @@ export class AdvancedMetricsWorker extends BaseWorker {
               queueLane: datasetConfig?.queueLane,
               maxInFlight: datasetConfig?.maxInFlight,
               coordinates: data.coordinates,
-            } as EnvironmentalData
+            }
+            if (process.env.GAIALOG_NO_DB !== 'true') {
+              try {
+                await insertAdvanced({
+                  provider: data.source,
+                  city: data.location,
+                  lat: data.coordinates?.lat ?? null,
+                  lon: data.coordinates?.lon ?? null,
+                  uv_index: data.uv_index,
+                  soil_moisture_pct: Math.round((data.soil_moisture ?? 0) * 100),
+                  wildfire_risk: data.wildfire_risk,
+                  environmental_score: Math.round((data.environmental_quality_score ?? 0) * 100),
+                  temperature_c: data.temperature_c ?? null,
+                  humidity_pct: data.humidity_pct ?? null,
+                  pressure_mb: data.pressure_mb ?? null,
+                  wind_kph: data.wind_kph ?? null,
+                  wind_deg: data.wind_deg ?? null,
+                  source_hash: advancedMetricsSourceHash({
+                    measurement: item.measurement,
+                    location: item.location,
+                    timestampIso: new Date(item.timestamp).toISOString(),
+                    source: item.source,
+                  }),
+                  collected_at: new Date(item.timestamp),
+                })
+              } catch (e) {
+                console.error('insertAdvanced error:', e)
+              }
+            }
+            return item
           }))
           for (const r of results) if (r) items.push(r)
           processedInPage += slice.length

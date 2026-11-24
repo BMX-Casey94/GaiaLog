@@ -25,13 +25,24 @@
  *     retrying dead inventory forever.
  *   - Inputs are marked spent and the new output admitted in ONE database
  *     transaction, so inventory can never double-count the consolidation.
+ *   - If that commit fails AFTER the transaction was broadcast, the inputs are
+ *     quarantined (removed=true) — never released. Releasing spent inputs
+ *     would let the next cycle build a second transaction spending the same
+ *     outpoints, i.e. a guaranteed double spend.
  *   - Bounded work per cycle (batch size × batches) so consolidation cannot
  *     monopolise the database or the ARC quota.
+ *   - Runs one proactive batch when confirmed dust crosses
+ *     BSV_AUTO_CONSOLIDATE_PROACTIVE_DUST_COUNT, so the pool never has to
+ *     reach starvation before housekeeping happens.
  *
  * Env:
  *   BSV_AUTO_CONSOLIDATE_DISABLED=true       - opt out
  *   BSV_AUTO_CONSOLIDATE_INTERVAL_MS         - default 300_000 (5 min)
  *   BSV_AUTO_CONSOLIDATE_TRIGGER_SATS        - default 3 × split floor
+ *   BSV_AUTO_CONSOLIDATE_PROACTIVE_DUST_COUNT - default 250; sweep one batch
+ *                                               once this many confirmed dust
+ *                                               outputs exist, even when not
+ *                                               starved. 0 disables.
  *   BSV_AUTO_CONSOLIDATE_BATCH_SIZE          - default 500 inputs per TX
  *   BSV_AUTO_CONSOLIDATE_MAX_BATCHES         - default 4 per wallet per cycle
  *   BSV_AUTO_CONSOLIDATE_MIN_INPUT_SATS      - default 3 × per-input fee
@@ -40,10 +51,12 @@
  */
 
 import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
-import * as bsv from 'bsv'
-// BSV has no protocol-enforced dust limit — override the BTC-inherited default
-;(bsv.Transaction as any).DUST_AMOUNT = 1
-import { bsvConfig } from './bsv-config'
+import {
+  buildConsolidationTx as buildConsolidationTransaction,
+  p2pkhLockingScriptHexFromWif as p2pkhLockingScriptHexFromWifSdk,
+} from './broadcast/tx-builder'
+import { getCachedPolicyFeeRateSatPerByte } from './broadcast/broadcaster-client'
+import { DEFAULT_TX_FEE_RATE, bsvConfig } from './bsv-config'
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getTreasuryTopicForWallet } from './treasury-topics'
 import { withOverlayTransaction, refreshTopicCounts } from './overlay-repository'
@@ -60,9 +73,12 @@ const P2PKH_OUTPUT_BYTES = 34
 const TX_BASE_BYTES = 12
 const DUST_LIMIT = 1
 
-const FEE_RATE = Number(
-  (process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE) || 0.1025,
-)
+const FEE_RATE = (() => {
+  const configured = Number(
+    process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE,
+  )
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_TX_FEE_RATE
+})()
 const SPLIT_OUTPUT_SATS = Math.max(1, Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 2000))
 
 function txBytes(numInputs: number, numOutputs: number): number {
@@ -73,10 +89,6 @@ function txBytes(numInputs: number, numOutputs: number): number {
     numInputs * SIGNED_P2PKH_INPUT_BYTES +
     numOutputs * P2PKH_OUTPUT_BYTES
   )
-}
-
-function feeFor(numInputs: number, numOutputs: number): number {
-  return Math.ceil(txBytes(numInputs, numOutputs) * FEE_RATE)
 }
 
 /**
@@ -133,11 +145,64 @@ function triggerSats(): number {
   return splitFloorSats() * 3
 }
 
+/**
+ * Proactive sweep: once this many confirmed eligible dust outputs have piled
+ * up, sweep one batch even though the wallet is not starved yet. Set to 0 to
+ * disable and fall back to reactive (starvation-triggered) consolidation only.
+ */
+const PROACTIVE_DUST_THRESHOLD = ((): number => {
+  const raw = Number(process.env.BSV_AUTO_CONSOLIDATE_PROACTIVE_DUST_COUNT ?? 250)
+  if (!Number.isFinite(raw) || raw < 0) return 250
+  return Math.floor(raw)
+})()
+
 function maxInputSats(): number {
   const override = Number(process.env.BSV_AUTO_CONSOLIDATE_MAX_INPUT_SATS || 0)
   if (Number.isFinite(override) && override > 0) return Math.floor(override)
   // Never eat an output the splitter could have used as its input.
   return Math.max(MIN_INPUT_SATS, splitFloorSats() - 1)
+}
+
+/**
+ * Count confirmed, unlocked, currently-acquirable dust for one wallet.
+ *
+ * Deliberately mirrors lockDustBatch's candidate predicate so the trigger and
+ * the sweep agree on what "eligible dust" means: counting rows the sweep would
+ * then refuse to take would fire the trigger forever without sweeping.
+ *
+ * Role predicate: `dust` rows are tagged change that no write can acquire, so
+ * they are always eligible. `pool` rows below the split floor are the legacy
+ * shape of the same thing — sub-floor change admitted before migration 0035
+ * existed — and must stay eligible, otherwise an upgraded deployment stops
+ * sweeping the backlog it inherited.
+ *
+ * The `LIMIT` caps the scan — the trigger only needs to know whether the count
+ * has reached the threshold, not the exact total.
+ */
+async function countConfirmedDust(walletIndex: number, threshold: number): Promise<number> {
+  const res = await withOverlayTransaction(async (client) => {
+    // Telemetry-grade timeout: this runs every cycle for every wallet, so it
+    // must never hold a backend the way a bulk statement could.
+    await client.query(`SET LOCAL statement_timeout = 15000`)
+    return client.query<{ c: string }>(
+      `SELECT COUNT(*)::text AS c
+         FROM (
+           SELECT 1
+             FROM overlay_admitted_utxos
+            WHERE wallet_index = $1
+              AND removed = false
+              AND locked = false
+              AND confirmed = true
+              AND utxo_role IN ('dust', 'pool')
+              AND satoshis >= $2
+              AND satoshis <= $3
+              AND acquirable_at <= now()
+            LIMIT $4
+         ) AS eligible`,
+      [walletIndex, MIN_INPUT_SATS, maxInputSats(), Math.max(1, threshold)],
+    )
+  })
+  return Number(res.rows[0]?.c || '0')
 }
 
 interface WalletBinding {
@@ -154,13 +219,12 @@ function deriveBindings(): WalletBinding[] {
   return wifs.map((wif, walletIndex) => {
     const key = SDKPrivateKey.fromWif(wif)
     const address = key.toPublicKey().toAddress().toString()
-    const pubKeyHash = Buffer.from(key.toPublicKey().toHash()).toString('hex')
     return {
       walletIndex,
       label: `W${walletIndex + 1}`,
       wif,
       address,
-      outputScriptHex: `76a914${pubKeyHash}88ac`,
+      outputScriptHex: p2pkhLockingScriptHexFromWifSdk(wif),
       topic: getTreasuryTopicForWallet(walletIndex),
     }
   })
@@ -181,6 +245,11 @@ interface LockedInput {
  *
  * Largest-first: starvation is cleared fastest by the highest-value dust, and
  * every candidate is already below the split floor.
+ *
+ * Roles: `dust` is the tagged class for change no write can acquire; `pool`
+ * rows below the split floor are the same economic asset admitted before that
+ * class existed. Both are swept. `reserve` is excluded by the satoshi ceiling —
+ * a reserve row is by definition large enough to fund a split.
  */
 async function lockDustBatch(
   binding: WalletBinding,
@@ -196,6 +265,7 @@ async function lockDustBatch(
         WHERE wallet_index = $1
           AND removed = false
           AND locked = false
+          AND utxo_role IN ('dust', 'pool')
           AND satoshis >= $2
           AND satoshis <= $3
           AND acquirable_at <= now()
@@ -308,6 +378,61 @@ async function archivePhantomBatch(inputs: LockedInput[], reason: string): Promi
   })
 }
 
+/**
+ * Last-resort safety net for inputs whose consolidation transaction is
+ * ALREADY ON-CHAIN but whose inventory commit failed.
+ *
+ * These outputs are spent. If they went back into the spendable pool, the next
+ * maintainer cycle could pick one and broadcast a second transaction spending
+ * the same outpoint — a guaranteed double spend that ARC rejects as 460 and
+ * that leaves the wallet's bookkeeping permanently wrong. Removed rows are
+ * never acquired (every acquire query filters `removed = false`), so archiving
+ * them here is the only safe state.
+ *
+ * Best effort by design: if this UPDATE itself fails, the caller must leave
+ * the rows locked rather than release them.
+ *
+ * Returns how many rows this call newly quarantined and how many were already
+ * archived (the commit may have landed and only the reply been lost, in which
+ * case the rows are already removed and nothing here matches).
+ */
+async function quarantineSpentBatch(
+  inputs: LockedInput[],
+  spendingTxid: string,
+): Promise<{ quarantined: number; alreadyRemoved: number }> {
+  if (inputs.length === 0) return { quarantined: 0, alreadyRemoved: 0 }
+  return withOverlayTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = ${STATEMENT_TIMEOUT_MS}`)
+    const res = await client.query<{ topic: string }>(
+      `UPDATE overlay_admitted_utxos u
+          SET removed = true,
+              removed_at = now(),
+              spending_txid = $4,
+              locked = false,
+              locked_by = NULL,
+              locked_at = NULL
+         FROM unnest($1::text[], $2::text[], $3::int[]) AS t(topic, txid, vout)
+        WHERE u.topic = t.topic
+          AND u.txid = t.txid
+          AND u.vout = t.vout
+          AND u.removed = false
+      RETURNING u.topic`,
+      [
+        inputs.map((i) => i.topic),
+        inputs.map((i) => i.txid),
+        inputs.map((i) => i.vout),
+        spendingTxid,
+      ],
+    )
+    const byTopic = new Map<string, number>()
+    for (const row of res.rows) byTopic.set(row.topic, (byTopic.get(row.topic) || 0) + 1)
+    for (const [topic, delta] of byTopic) await refreshTopicCounts(client, topic, -delta)
+
+    const quarantined = res.rowCount ?? 0
+    return { quarantined, alreadyRemoved: inputs.length - quarantined }
+  })
+}
+
 /** Mark every input spent and admit the consolidated output atomically. */
 async function commitConsolidation(input: {
   binding: WalletBinding
@@ -382,32 +507,45 @@ async function commitConsolidation(input: {
   })
 }
 
-function buildConsolidationTx(
+/**
+ * Build and sign the consolidation transaction.
+ *
+ * Every input is swept into ONE output back to the signing wallet, with no
+ * change output — a consolidation that left change behind would have
+ * consolidated nothing. The fee is passed explicitly at the live Broadcaster
+ * policy rate so the sweep cannot be rejected for under-paying, and the
+ * `efBytes` payload that comes back is what the Broadcaster validates against.
+ */
+async function buildConsolidationTx(
   binding: WalletBinding,
   inputs: LockedInput[],
-): { rawHex: string; fee: number; outputSats: number } {
-  const fee = feeFor(inputs.length, 1)
+): Promise<{
+  rawHex: string
+  efBytes: Uint8Array
+  fee: number
+  outputSats: number
+}> {
+  const liveFeeRate = await getCachedPolicyFeeRateSatPerByte(FEE_RATE)
+  const fee = Math.ceil(txBytes(inputs.length, 1) * liveFeeRate)
   const inputSum = inputs.reduce((acc, i) => acc + i.satoshis, 0)
   const outputSats = inputSum - fee
   if (outputSats <= DUST_LIMIT) {
     throw new Error(`outputSats=${outputSats} (inputSum=${inputSum} fee=${fee})`)
   }
 
-  const tx = new (bsv as any).Transaction()
-  tx.from(
-    inputs.map((i) => ({
-      txId: i.txid,
-      outputIndex: i.vout,
-      address: binding.address,
-      script: i.outputScript,
-      satoshis: i.satoshis,
+  const built = await buildConsolidationTransaction({
+    wif: binding.wif,
+    inputs: inputs.map(input => ({
+      txid: input.txid,
+      vout: input.vout,
+      satoshis: input.satoshis,
+      lockingScriptHex: input.outputScript || binding.outputScriptHex,
     })),
-  )
-  tx.to(binding.address, outputSats)
-  // Explicit fee, no change output: the entire input sum minus fee is the output.
-  tx.fee(fee)
-  tx.sign((bsv as any).PrivateKey.fromWIF(binding.wif))
-  return { rawHex: tx.serialize(), fee, outputSats }
+    destinationAddress: binding.address,
+    explicitFeeSats: fee,
+  })
+
+  return { rawHex: built.rawHex, efBytes: built.efBytes, fee: built.feeSats, outputSats }
 }
 
 function isMissingInputsError(message: string): boolean {
@@ -431,16 +569,23 @@ async function consolidateWallet(
   binding: WalletBinding,
   lockedBy: string,
   includeUnconfirmed: boolean,
+  maxBatches: number = MAX_BATCHES_PER_WALLET,
 ): Promise<WalletResult> {
   const result: WalletResult = { batches: 0, inputsSpent: 0, satsRecovered: 0, archived: 0 }
   const floor = splitFloorSats()
 
-  for (let batch = 0; batch < MAX_BATCHES_PER_WALLET; batch++) {
+  for (let batch = 0; batch < Math.max(1, maxBatches); batch++) {
     const inputs = await lockDustBatch(binding, lockedBy, includeUnconfirmed)
     if (inputs.length === 0) break
 
+    // The live policy rate is used for both the economic pre-check and the
+    // build, so "would this sweep produce a usable output" is answered at the
+    // same rate the fee is actually paid at.
+    const liveFeeRate = await getCachedPolicyFeeRateSatPerByte(FEE_RATE)
+    const projectedFee = Math.ceil(txBytes(inputs.length, 1) * liveFeeRate)
+
     const inputSum = inputs.reduce((acc, i) => acc + i.satoshis, 0)
-    const projectedOutput = inputSum - feeFor(inputs.length, 1)
+    const projectedOutput = inputSum - projectedFee
     if (projectedOutput < floor) {
       // Sweeping this dust would not even produce a splittable output; paying
       // the fee would burn value for nothing. Back the rows off for an hour.
@@ -453,9 +598,9 @@ async function consolidateWallet(
       break
     }
 
-    let built: { rawHex: string; fee: number; outputSats: number }
+    let built: { rawHex: string; efBytes: Uint8Array; fee: number; outputSats: number }
     try {
-      built = buildConsolidationTx(binding, inputs)
+      built = await buildConsolidationTx(binding, inputs)
     } catch (err) {
       await releaseBatch(inputs, lockedBy, 10 * 60_000)
       console.error(
@@ -467,7 +612,7 @@ async function consolidateWallet(
 
     let txid: string
     try {
-      txid = await broadcastSplitTransactionRaw(built.rawHex)
+      txid = await broadcastSplitTransactionRaw(built.rawHex, built.efBytes)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (isMissingInputsError(message)) {
@@ -496,14 +641,46 @@ async function consolidateWallet(
         outputSats: built.outputSats,
       })
     } catch (err) {
-      // The TX is on-chain but inventory did not record it. Stop immediately:
-      // continuing risks selecting the same inputs again and double-spending.
+      // The TX is already broadcast — these outpoints are spent on-chain.
+      // Releasing them would put them straight back in the spendable pool and
+      // the next cycle would build a second transaction spending the same
+      // inputs: a guaranteed double spend. Quarantine them instead, and if
+      // even that fails, leave them LOCKED so nothing can ever pick them up.
+      const message = err instanceof Error ? err.message : String(err)
       console.error(
         `🚨 [auto-consolidate] ${binding.label}: TX ${txid} BROADCAST OK but inventory commit ` +
-          `FAILED — ${err instanceof Error ? err.message : String(err)}. Halting this wallet; ` +
-          `reconcile with \`npx tsx scripts/recovery-import-onchain-utxos.ts --apply\`.`,
+          `FAILED — ${message}. The ${inputs.length} input(s) are spent on-chain; ` +
+          `quarantining them so they can never be double-spent.`,
       )
-      await releaseBatch(inputs, lockedBy, 30 * 60_000)
+
+      let quarantine: { quarantined: number; alreadyRemoved: number }
+      try {
+        quarantine = await quarantineSpentBatch(inputs, txid)
+      } catch (quarantineErr) {
+        console.error(
+          `🚨 [auto-consolidate] ${binding.label}: quarantine ALSO failed — ` +
+            `${quarantineErr instanceof Error ? quarantineErr.message : String(quarantineErr)}. ` +
+            `Leaving ${inputs.length} input(s) LOCKED (owner=${lockedBy}) so no other worker can ` +
+            `spend them. Reconcile with ` +
+            `\`npx tsx scripts/recovery-import-onchain-utxos.ts --apply\`.`,
+        )
+        break
+      }
+
+      if (quarantine.alreadyRemoved > 0) {
+        // The commit probably landed and only the reply was lost (connection
+        // died after COMMIT). Nothing left to do beyond the audit trail.
+        console.error(
+          `🚨 [auto-consolidate] ${binding.label}: ${quarantine.quarantined} input(s) quarantined, ` +
+            `${quarantine.alreadyRemoved} already archived (commit likely landed). ` +
+            `Verify with \`npx tsx scripts/recovery-import-onchain-utxos.ts\`.`,
+        )
+      } else {
+        console.error(
+          `🚨 [auto-consolidate] ${binding.label}: all ${quarantine.quarantined} spent input(s) ` +
+            `quarantined. The consolidated output will be re-admitted by the funding sweep.`,
+        )
+      }
       break
     }
 
@@ -536,7 +713,35 @@ async function runCycle(): Promise<void> {
 
       const diag = await getInventoryDiagnostic(binding.walletIndex)
       const largestUsable = confirmedOnly ? diag.largestConfirmedSats : diag.largestSats
-      if (largestUsable >= trigger) continue
+
+      if (largestUsable >= trigger) {
+        // Not starved. Dust can still build up while every write is funded by
+        // a large reserve input: those writes each leave a small change output
+        // that nothing ever spends, and the pile only gets swept once the
+        // wallet finally starves — by which point the sweep is a recovery
+        // operation rather than routine housekeeping. Sweep one batch early to
+        // keep the pool shallow and an unconfirmed ancestor chain short.
+        if (PROACTIVE_DUST_THRESHOLD > 0) {
+          const dustCount = await countConfirmedDust(binding.walletIndex, PROACTIVE_DUST_THRESHOLD)
+          if (dustCount >= PROACTIVE_DUST_THRESHOLD) {
+            console.log(
+              `♻️  [auto-consolidate] ${binding.label}: ${dustCount} confirmed dust output(s) ` +
+                `(>= proactive threshold ${PROACTIVE_DUST_THRESHOLD}) — sweeping one batch ahead of ` +
+                `starvation.`,
+            )
+            const swept = await consolidateWallet(binding, lockedBy, false, 1)
+            if (swept.batches > 0) {
+              cooldownUntilByWallet.set(binding.walletIndex, Date.now() + COOLDOWN_MS)
+              console.log(
+                `♻️  [auto-consolidate] ${binding.label} proactive sweep: ${swept.batches} batch(es), ` +
+                  `${swept.inputsSpent.toLocaleString()} inputs → ` +
+                  `${swept.satsRecovered.toLocaleString()} sats.`,
+              )
+            }
+          }
+        }
+        continue
+      }
 
       // Prefer confirmed dust. If the heap is entirely confirmed=false (the
       // production failure mode after a write storm), fall back to aged

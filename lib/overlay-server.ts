@@ -22,8 +22,28 @@ function createRateLimiter() {
   const state = new Map<string, RateLimitState>()
   const { rateLimitWindowMs, rateLimitMax } = getOverlayServerConfig()
 
+  // Prune expired windows so the map cannot grow without bound. Client IPs and
+  // request paths are attacker-controlled, so unbounded growth is a memory
+  // exhaustion vector on a public overlay endpoint.
+  const PRUNE_EVERY_HITS = 512
+  const PRUNE_SIZE_THRESHOLD = 1000
+  let hitsSincePrune = 0
+
+  const pruneExpired = (now: number) => {
+    for (const [entryKey, entry] of state) {
+      if (now - entry.windowStartedAt >= rateLimitWindowMs) state.delete(entryKey)
+    }
+    hitsSincePrune = 0
+  }
+
   return function isRateLimited(key: string): boolean {
     const now = Date.now()
+
+    hitsSincePrune += 1
+    if (hitsSincePrune >= PRUNE_EVERY_HITS || state.size > PRUNE_SIZE_THRESHOLD) {
+      pruneExpired(now)
+    }
+
     const existing = state.get(key)
     if (!existing || (now - existing.windowStartedAt) >= rateLimitWindowMs) {
       state.set(key, { windowStartedAt: now, hits: 1 })

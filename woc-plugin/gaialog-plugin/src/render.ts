@@ -1,7 +1,19 @@
 /* HTML rendering for GaiaLog plugin */
 
-import { getFamilyTitle, getKeyMetrics, getRenderableMetricEntries } from '../../../lib/family-metrics'
-import { resolveAttributionText } from '../../../lib/stream-registry'
+import { getFamilyTitle, getKeyMetrics, getRenderableMetricEntries, resolveAttributionText } from './family-metadata.js'
+
+/**
+ * Root-level GaiaLog document fields. `lib/blockchain.ts` promotes
+ * provider_id/dataset_id out of `payload` to the document root, so the renderer
+ * must read attribution from the root document as well as the payload.
+ */
+export interface GaiaLogRootContext {
+	provider_id?: string | null
+	dataset_id?: string | null
+	provider?: string | null
+	source?: string | null
+	data_type?: string | null
+}
 
 function escapeHtml(value: unknown): string {
 	return String(value ?? '')
@@ -31,7 +43,7 @@ function stat(label: string, value: unknown): string {
 	</div>`
 }
 
-export function renderTypeSections(dataType: string, payload: any): string {
+export function renderTypeSections(dataType: string, payload: any, root?: GaiaLogRootContext | null): string {
 	const sections: string[] = []
 	const p = payload || {}
 
@@ -41,10 +53,17 @@ export function renderTypeSections(dataType: string, payload: any): string {
 	const datePart = dateISO ? String(dateISO).slice(0, 10) : ''
 	const timePart = dateISO ? (dateISO.includes('T') ? String(dateISO).slice(11, 19) : '') : ''
 
+	// Attribution lives at the document root because blockchain.ts strips
+	// provider_id/dataset_id from the payload. Fall back to payload fields for
+	// legacy documents that still carry them inline.
+	const providerId = root?.provider_id ?? p.provider_id ?? null
+	const datasetId = root?.dataset_id ?? p.dataset_id ?? null
+	const sourceLabel = root?.provider ?? p.source ?? null
+
 	const primaryStats = getKeyMetrics(dataType, p, 12)
 	const secondaryStats = getRenderableMetricEntries(p, 24)
 		.filter(entry => !primaryStats.some(primary => primary.label === entry.label && primary.value === entry.value))
-	const attributionText = resolveAttributionText(p.provider_id, p.source)
+	const attributionText = resolveAttributionText(providerId, sourceLabel)
 
 	sections.push(`
 		<div class="gl-card">
@@ -53,8 +72,8 @@ export function renderTypeSections(dataType: string, payload: any): string {
 				${chip('Location', loc)}
 				${chip('Date', datePart)}
 				${chip('Time', timePart)}
-				${chip('Provider', p.provider_id ?? p.source ?? '')}
-				${chip('Dataset', p.dataset_id ?? '')}
+				${chip('Provider', providerId ?? sourceLabel ?? '')}
+				${chip('Dataset', datasetId ?? '')}
 			</div>
 			<div class="gl-grid">
 				${(primaryStats.length > 0 ? primaryStats : secondaryStats).map(entry => stat(entry.label, entry.value)).join('')}
@@ -181,7 +200,7 @@ export function renderHtml(opts: {
 					<div class="gl-tagline">Immutable Earth data, stored on-chain.</div>
 				</div>
 			</div>
-			${renderTypeSections(String(json?.data_type ?? '').trim(), json?.payload)}
+			${renderTypeSections(String(json?.data_type ?? '').trim(), json?.payload, json)}
 			<div class="gl-footer">
 				<div class="gl-footer-meta">GaiaLog Data Decoder (Plugin) — v1.7</div>
 				${viewOnWoc}

@@ -1,9 +1,24 @@
 #!/usr/bin/env npx tsx
 /**
- * Sweep all UTXOs from a recovery/disposable WIF into the three GaiaLog treasury wallets
- * (BSV_WALLET_1/2/3), split as evenly as possible.
+ * Sweep all UTXOs from a recovery/disposable WIF into the configured GaiaLog
+ * treasury wallets (BSV_WALLET_1, BSV_WALLET_2, BSV_WALLET_3), split as evenly
+ * as the configured wallet count allows.
+ *
+ * Wallet count
+ * ------------
+ * One, two or three treasury destinations are supported. The script uses
+ * whichever of BSV_WALLET_1/2/3 have a private key (or an `_ADDRESS` override)
+ * and splits the sweepable balance evenly across them, so a deployment that has
+ * consolidated onto a single unified treasury wallet still works — it simply
+ * produces one output.
  *
  * Security: never commit WIFs. Pass via env or a gitignored candidates file.
+ *
+ * Broadcast: `broadcastSplitTransactionRaw(rawHex, efBytes)` — the BSV
+ * Broadcaster (Arcade) is tried first with the sweep's BRC-30 EF bytes, so the
+ * transaction gets synchronous policy/script validation and a lifecycle to
+ * follow. The legacy TAAL → GorillaPool → WoC chain is the fallback when the
+ * Broadcaster cannot be reached.
  *
  * Usage:
  *   # Probe which candidate WIF has funds (one WIF per line in file):
@@ -20,18 +35,29 @@ import './load-env-for-tools'
 
 import fs from 'node:fs'
 import path from 'node:path'
-import * as bsv from 'bsv'
-;(bsv.Transaction as any).DUST_AMOUNT = 1
-
-import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
+import { P2PKH, PrivateKey } from '@bsv/sdk'
+import { DEFAULT_TX_FEE_RATE, bsvConfig } from '../lib/bsv-config'
 import { getUnspentForAddress } from '../lib/utxo-provider'
 import { broadcastSplitTransactionRaw } from '../lib/broadcast-raw-tx'
+import { buildPaymentTx } from '../lib/broadcast/tx-builder'
 
-const FEE_RATE_SAT_PER_BYTE = Number(
-  process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE ?? '0.1025',
-)
-const SIGNED_P2PKH_INPUT_BYTES = 149
-const P2PKH_OUTPUT_BYTES = 34
+/**
+ * Effective fee rate in satoshis per byte.
+ *
+ * `BSV_TX_FEE_RATE_SAT_PER_BYTE` is the explicit name, `BSV_TX_FEE_RATE` the
+ * historical alias, and `DEFAULT_TX_FEE_RATE` the single shared fallback, so the
+ * sweep cannot drift from the rest of the spend path.
+ */
+function resolveFeeRateSatPerByte(): number {
+  const raw = process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE || process.env.BSV_TX_FEE_RATE
+  const parsed = Number.parseFloat(String(raw ?? '').trim())
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TX_FEE_RATE
+}
+
+const FEE_RATE_SAT_PER_BYTE = resolveFeeRateSatPerByte()
+const SIGNED_P2PKH_INPUT_BYTES = 149 // worst-case signed P2PKH input
+const P2PKH_OUTPUT_BYTES = 34 // 8 value + 1 scriptLen + 25 script
+const MAX_TREASURY_WALLETS = 3
 
 function txOverheadBytes(numInputs: number, numOutputs: number): number {
   const inputVarint = numInputs <= 252 ? 1 : numInputs <= 65535 ? 3 : 5
@@ -91,38 +117,70 @@ function loadCandidateWifs(candidatesFile: string | null): string[] {
   return unique
 }
 
-function resolveTreasuryAddresses(): string[] {
-  const keys = [
-    process.env.BSV_WALLET_1_PRIVATE_KEY,
-    process.env.BSV_WALLET_2_PRIVATE_KEY,
-    process.env.BSV_WALLET_3_PRIVATE_KEY,
-  ]
-  const addresses: string[] = []
-  for (let i = 0; i < keys.length; i++) {
-    const wif = keys[i]
-    const envAddr = process.env[`BSV_WALLET_${i + 1}_ADDRESS` as keyof NodeJS.ProcessEnv]
-    if (wif && wif.length > 10 && !wif.includes('your_private_key')) {
-      const addr = SDKPrivateKey.fromWif(wif).toPublicKey().toAddress().toString()
-      addresses.push(addr)
-    } else if (envAddr && envAddr.length > 20) {
-      addresses.push(envAddr)
-    }
-  }
-  if (addresses.length !== 3) {
-    throw new Error(
-      `Need 3 treasury destinations (BSV_WALLET_1/2/3_PRIVATE_KEY or _ADDRESS). Found ${addresses.length}.`,
-    )
-  }
-  return addresses
+interface TreasuryDestination {
+  label: string
+  address: string
+  lockingScriptHex: string
 }
 
-function p2pkhScriptHexForAddress(address: string, wif: string): string {
-  if ((bsv.Script as any).fromAddress) {
-    return (bsv.Script as any).fromAddress(address).toHex()
+/**
+ * Resolve the configured treasury destinations.
+ *
+ * Each slot contributes at most one destination: a private key wins over an
+ * `_ADDRESS` override because the key is what the wallet manager derives from.
+ * Slots are evaluated in order and empty slots are skipped, so a single-wallet
+ * deployment (only BSV_WALLET_1_PRIVATE_KEY set) yields one destination while a
+ * three-wallet deployment yields three.
+ */
+function resolveTreasuryDestinations(): TreasuryDestination[] {
+  const destinations: TreasuryDestination[] = []
+  const seen = new Set<string>()
+  const p2pkh = new P2PKH()
+
+  for (let i = 1; i <= MAX_TREASURY_WALLETS; i++) {
+    const label = `W${i}`
+    const wif = String(process.env[`BSV_WALLET_${i}_PRIVATE_KEY`] || '').trim()
+    const envAddr = String(process.env[`BSV_WALLET_${i}_ADDRESS`] || '').trim()
+
+    let address: string | null = null
+    if (wif && wif.length > 10 && !wif.includes('your_private_key')) {
+      try {
+        address = PrivateKey.fromWif(wif).toPublicKey().toAddress().toString()
+      } catch (err) {
+        throw new Error(
+          `BSV_WALLET_${i}_PRIVATE_KEY is not a valid WIF: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+    } else if (envAddr.length > 20) {
+      address = envAddr
+    }
+
+    if (!address) continue
+    if (!address.startsWith('1')) {
+      throw new Error(`${label}: treasury destination ${address} is not a Mainnet P2PKH address.`)
+    }
+    if (seen.has(address)) {
+      // Two slots pointing at one address is a configuration mistake: the
+      // "split evenly across wallets" maths would send two separate outputs
+      // to the same place while reporting two destinations.
+      throw new Error(`${label}: treasury destination ${address} is already used by another wallet slot.`)
+    }
+    seen.add(address)
+
+    const lockingScriptHex = p2pkh.lock(address).toHex().toLowerCase()
+    if (!/^76a914[0-9a-f]{40}88ac$/.test(lockingScriptHex)) {
+      throw new Error(`${label}: derived locking script for ${address} is not P2PKH: ${lockingScriptHex}`)
+    }
+    destinations.push({ label, address, lockingScriptHex })
   }
-  const key = SDKPrivateKey.fromWif(wif)
-  const pubKeyHash = Buffer.from(key.toPublicKey().toHash()).toString('hex')
-  return '76a914' + pubKeyHash + '88ac'
+
+  if (destinations.length === 0) {
+    throw new Error(
+      'No treasury destinations configured. Set BSV_WALLET_1_PRIVATE_KEY (or BSV_WALLET_1_ADDRESS) ' +
+        'and optionally BSV_WALLET_2_* / BSV_WALLET_3_*.',
+    )
+  }
+  return destinations
 }
 
 async function probeWif(
@@ -133,7 +191,7 @@ async function probeWif(
 > {
   let address: string
   try {
-    address = SDKPrivateKey.fromWif(wif).toPublicKey().toAddress().toString()
+    address = PrivateKey.fromWif(wif).toPublicKey().toAddress().toString()
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
     return { ok: false, reason }
@@ -144,52 +202,106 @@ async function probeWif(
 }
 
 async function sweep(wif: string, apply: boolean): Promise<void> {
-  const sdkKey = SDKPrivateKey.fromWif(wif)
-  const sourceAddress = sdkKey.toPublicKey().toAddress().toString()
-  const destinations = resolveTreasuryAddresses()
-
-  if (process.env.BSV_NETWORK !== 'mainnet') {
-    console.warn('⚠️ BSV_NETWORK is not mainnet; ensure this is intentional.')
+  if (bsvConfig.network !== 'mainnet') {
+    throw new Error(`Refusing to sweep on ${bsvConfig.network}: GaiaLog is mainnet only.`)
   }
+
+  const sourceAddress = PrivateKey.fromWif(wif).toPublicKey().toAddress().toString()
+  if (!sourceAddress.startsWith('1')) {
+    throw new Error(`Source WIF resolves to ${sourceAddress}, which is not a Mainnet P2PKH address.`)
+  }
+  const destinations = resolveTreasuryDestinations()
+  if (destinations.some((d) => d.address === sourceAddress)) {
+    throw new Error(`Source address ${sourceAddress} is also a treasury destination — refusing to sweep to itself.`)
+  }
+
+  const p2pkh = new P2PKH()
+  const sourceScriptHex = p2pkh.lock(sourceAddress).toHex().toLowerCase()
 
   const utxos = await getUnspentForAddress(sourceAddress, { confirmedOnly: false })
   if (!utxos.length) {
     throw new Error(`No UTXOs for ${sourceAddress}`)
   }
 
-  const scriptHex = p2pkhScriptHexForAddress(sourceAddress, wif)
-  const inputs = utxos.map((u: any) => ({
-    txId: u.tx_hash,
-    outputIndex: u.tx_pos,
-    address: sourceAddress,
-    script: scriptHex,
-    satoshis: Number(u.value) || 0,
-  }))
+  const inputs = utxos.map((u: any) => {
+    const txid = String(u?.tx_hash || '')
+    const vout = Number(u?.tx_pos ?? 0)
+    const satoshis = Number(u?.value) || 0
+    if (!/^[0-9a-fA-F]{64}$/.test(txid)) {
+      throw new Error(`Provider returned a malformed UTXO txid "${txid}" for ${sourceAddress}`)
+    }
+    if (!Number.isInteger(vout) || vout < 0) {
+      throw new Error(`Provider returned a malformed vout ${vout} for ${txid}`)
+    }
+    if (!Number.isSafeInteger(satoshis) || satoshis <= 0) {
+      throw new Error(`Provider returned an invalid value ${satoshis} for ${txid}:${vout}`)
+    }
+    return { txid, vout, satoshis }
+  })
 
   const inputSum = inputs.reduce((acc, i) => acc + i.satoshis, 0)
-  const numOutputs = 3
-  const fee = Math.ceil(estimateTxSize(inputs.length, numOutputs) * FEE_RATE_SAT_PER_BYTE)
+  const numOutputs = destinations.length
+  const fee = Math.max(1, Math.ceil(estimateTxSize(inputs.length, numOutputs) * FEE_RATE_SAT_PER_BYTE))
   const distributable = inputSum - fee
-  if (distributable < 3) {
-    throw new Error(`Insufficient funds after fee: inputSum=${inputSum} fee=${fee}`)
+  if (distributable < numOutputs) {
+    throw new Error(
+      `Insufficient funds after fee: inputSum=${inputSum} sats, fee=${fee} sats, ${numOutputs} destination(s) need at least 1 sat each.`,
+    )
   }
 
-  const perWallet = Math.floor(distributable / 3)
-  let remainder = distributable - perWallet * 3
-  const outputAmounts = [perWallet, perWallet, perWallet]
-  for (let i = 0; outputAmounts[i] !== undefined && remainder > 0; i++) {
+  // Even split with the remainder spread one satoshi at a time from the first
+  // destination onwards, so no satoshi is silently dropped.
+  const perWallet = Math.floor(distributable / numOutputs)
+  let remainder = distributable - perWallet * numOutputs
+  const outputAmounts = destinations.map(() => perWallet)
+  for (let i = 0; i < outputAmounts.length && remainder > 0; i++) {
     outputAmounts[i] += 1
     remainder -= 1
   }
 
-  const tx = new (bsv as any).Transaction().from(inputs)
-  for (let i = 0; i < destinations.length; i++) {
-    tx.to(destinations[i], outputAmounts[i])
+  // The explicit fee and the exactly-distributed outputs leave a zero
+  // remainder, so the builder emits no change output — a sweep that left change
+  // behind would not be a sweep. `changeFloorSats: 2` makes that a rule rather
+  // than an arithmetic coincidence: a stray 1-sat remainder goes to the miner
+  // instead of becoming an unspendable output back at the source address.
+  const built = await buildPaymentTx({
+    wif,
+    inputs: inputs.map((input) => ({
+      txid: input.txid,
+      vout: input.vout,
+      satoshis: input.satoshis,
+      lockingScriptHex: sourceScriptHex,
+    })),
+    outputs: destinations.map((destination, index) => ({
+      address: destination.address,
+      satoshis: outputAmounts[index],
+    })),
+    changeAddress: sourceAddress,
+    explicitFeeSats: fee,
+    changeFloorSats: 2,
+  })
+
+  const changeOutputs = built.outputs.filter((output) => output.isChange)
+  if (changeOutputs.length > 0) {
+    throw new Error(
+      `Built sweep emitted ${changeOutputs.length} change output(s) back to ${sourceAddress}; ` +
+        'a sweep must move the whole spendable balance out of the source wallet. Refusing to broadcast.',
+    )
   }
-  tx.fee(fee)
-  const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
-  tx.sign(signingKey)
-  const rawHex = tx.serialize()
+  if (built.outputs.length !== destinations.length) {
+    throw new Error(
+      `Built sweep has ${built.outputs.length} output(s) but ${destinations.length} treasury destination(s) were requested.`,
+    )
+  }
+
+  const rawHex = built.rawHex
+  const efBytes = built.efBytes
+  const txid = built.txid
+  const outputSum = outputAmounts.reduce((acc, s) => acc + s, 0)
+  const actualFee = inputSum - outputSum
+  if (actualFee < fee) {
+    throw new Error(`Built sweep pays ${actualFee} sats, below the ${fee} sat target — refusing to broadcast`)
+  }
 
   console.log(
     JSON.stringify(
@@ -197,14 +309,17 @@ async function sweep(wif: string, apply: boolean): Promise<void> {
         sourceAddress,
         inputCount: inputs.length,
         inputSum,
-        fee,
+        fee: actualFee,
         feeRateSatPerByte: FEE_RATE_SAT_PER_BYTE,
-        outputs: destinations.map((addr, i) => ({
-          address: addr,
+        destinations: destinations.map((d, i) => ({
+          wallet: d.label,
+          address: d.address,
           sats: outputAmounts[i],
           bsv: (outputAmounts[i] / 1e8).toFixed(8),
         })),
-        txSizeBytes: rawHex.length / 2,
+        txSizeBytes: built.sizeBytes,
+        efBytes: efBytes.length,
+        txid,
         apply,
       },
       null,
@@ -217,8 +332,14 @@ async function sweep(wif: string, apply: boolean): Promise<void> {
     return
   }
 
-  const txid = await broadcastSplitTransactionRaw(rawHex)
-  console.log(`✅ Sweep broadcast: ${txid}`)
+  const broadcastTxid = await broadcastSplitTransactionRaw(rawHex, efBytes)
+  if (broadcastTxid.toLowerCase() !== txid) {
+    throw new Error(
+      `Broadcaster returned ${broadcastTxid} but the signed sweep hashes to ${txid}. ` +
+        'Treat the sweep as unknown: verify on chain before re-running.',
+    )
+  }
+  console.log(`✅ Sweep broadcast: ${broadcastTxid}`)
 }
 
 async function main() {
@@ -256,11 +377,10 @@ async function main() {
     return
   }
 
-  const sourceWif = wifs.length === 1 ? wifs[0] : wifs[0]
   if (wifs.length > 1) {
     console.warn('Multiple WIFs supplied; using the first. Use --probe to auto-select.')
   }
-  await sweep(sourceWif, apply)
+  await sweep(wifs[0], apply)
 }
 
 main().catch((err) => {

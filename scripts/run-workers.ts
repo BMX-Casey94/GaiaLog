@@ -90,6 +90,10 @@ async function main() {
     try {
       const { getSpendSourceStatus } = await import('../lib/spend-source')
       const { getOverlayFallbackConfig } = await import('../lib/overlay-config')
+      // Imported after env is loaded: bsv-config resolves the fee rate from
+      // process.env at module evaluation, so a static import would pin the
+      // wrong value when PM2 supplies the real one.
+      const { DEFAULT_TX_FEE_RATE } = await import('../lib/bsv-config')
       const spendSource = getSpendSourceStatus()
       const gate = getOverlayFallbackConfig()
       const overlayWallets = spendSource.wallets
@@ -103,7 +107,7 @@ async function main() {
         `overlayWallets=${overlayWallets || 'none'}`
       )
       console.log(
-        `📡 Broadcast config: fee=${Number(process.env.BSV_TX_FEE_RATE || 0.105)} sat/B ` +
+        `📡 Broadcast config: fee=${Number(process.env.BSV_TX_FEE_RATE || DEFAULT_TX_FEE_RATE)} sat/B ` +
         `timeout=${Math.max(3000, Number(process.env.BSV_BROADCAST_TIMEOUT_MS || 15000))}ms ` +
         `minSpendConf=${getMinSpendConfirmations()} queueGateMinConf=${getQueueGateMinConfirmations()} ` +
         `utxoPool=${process.env.BSV_ENABLE_UTXO_POOL === 'true' ? 'on' : 'off'} ` +
@@ -128,6 +132,21 @@ async function main() {
     // GorillaPool broadcasts and unlocks / confirms / releases inventory.
     // Opt-out via BSV_ARC_STATUS_POLL_DISABLED=true.
     startArcStatusPoller()
+    // BSV Broadcaster: the SSE stream is the fast status path (a MINED event
+    // arrives seconds after the block, with a merkle proof attached), and the
+    // reconciler is the durable one (it polls the accepting instance by txid).
+    // Both are started because neither covers the other's failure: a stream can
+    // drop silently, and a poll only sees state that has already been recorded.
+    // Opt out of the pair with BSV_BROADCASTER_DISABLED=true, or separately with
+    // BSV_BROADCASTER_SSE_DISABLED / BSV_BROADCAST_RECONCILE_DISABLED.
+    if (process.env.BSV_BROADCASTER_DISABLED === 'true') {
+      console.log('📡 BSV Broadcaster subscriber/reconciler disabled via BSV_BROADCASTER_DISABLED')
+    } else {
+      const { startSseSubscriber } = await import('../lib/broadcast/sse-subscriber')
+      const { startBroadcastReconciler } = await import('../lib/broadcast/reconcile-poll')
+      startSseSubscriber()
+      startBroadcastReconciler()
+    }
     // Wallet funding monitor: low-frequency (5 min) per-wallet runway/days
     // alerting so the operator gets ≥7 days of warning before any wallet
     // exhausts its BSV. Self-throttled CRITICAL alerts; opt-out via
@@ -245,6 +264,17 @@ async function main() {
       try {
         const { stopArcStatusPoller } = await import('../lib/arc-status-poller')
         stopArcStatusPoller()
+      } catch {}
+      // Abort the SSE stream so a shutdown does not leave a half-read
+      // connection, and clear the reconciler interval so no query starts while
+      // the pool is draining.
+      try {
+        const { stopSseSubscriber } = await import('../lib/broadcast/sse-subscriber')
+        stopSseSubscriber()
+      } catch {}
+      try {
+        const { stopBroadcastReconciler } = await import('../lib/broadcast/reconcile-poll')
+        stopBroadcastReconciler()
       } catch {}
       try {
         stopWalletFundingMonitor()

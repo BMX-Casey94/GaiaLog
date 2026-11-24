@@ -1,5 +1,4 @@
-import * as bsv from 'bsv'
-import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
+import { PrivateKey as SDKPrivateKey, P2PKH } from '@bsv/sdk'
 import { AuthFetch } from '@bsv/sdk/auth'
 import { ProtoWallet } from '@bsv/sdk/wallet'
 import { bsvConfig } from './bsv-config'
@@ -161,6 +160,31 @@ function parseBool(value: string | undefined, fallback: boolean): boolean {
   return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
 }
 
+const LEGACY_FALLBACK_WARN_KEY = '__GAIALOG_SPEND_SOURCE_LEGACY_FALLBACK_WARNED__'
+
+/**
+ * Legacy UTXO fallback is off by default.
+ *
+ * In overlay mode a silent fallback to legacy selection means a temporary
+ * overlay blip quietly routes spend selection through the legacy UTXO
+ * provider, which is exactly the failure mode this migration removes: the
+ * operator sees a healthy pipeline while a second, unaudited inventory is
+ * being spent from. Enabling it must be a deliberate, visible decision.
+ */
+function warnIfLegacyFallbackEnabled(): void {
+  const raw = process.env.BSV_SPEND_SOURCE_LEGACY_FALLBACK_ENABLED
+  if (raw == null || raw.trim() === '') return
+  if (!parseBool(raw, false)) return
+  const globalState = globalThis as any
+  if (globalState[LEGACY_FALLBACK_WARN_KEY]) return
+  globalState[LEGACY_FALLBACK_WARN_KEY] = true
+  console.warn(
+    '⚠️ BSV_SPEND_SOURCE_LEGACY_FALLBACK_ENABLED=true: overlay lookups may fall back to legacy UTXO selection. ' +
+      'Legacy fallback is disabled by default because it hides overlay failures and can spend from a second inventory. ' +
+      'Set BSV_SPEND_SOURCE_LEGACY_FALLBACK_ENABLED=false unless this is a deliberate, temporary exception.',
+  )
+}
+
 function parseSpendSourceMode(value: string | undefined): SpendSourceMode {
   switch (String(value || '').trim().toLowerCase()) {
     case 'shadow':
@@ -212,14 +236,20 @@ function isLegacyUtxoConfirmed(utxo: any, minConf?: number): boolean {
   return confirmations >= m || (height != null && height > 0)
 }
 
+/**
+ * P2PKH locking script hex for a mainnet base58 address.
+ *
+ * Returns an empty string for anything that is not a well-formed address: the
+ * caller treats a missing script as "no script known" and falls back to its own
+ * derivation, whereas throwing here would fail an inventory listing over one
+ * malformed row.
+ */
 function getOutputScriptHex(address: string): string {
   try {
-    const fromAddress = (bsv.Script as any).fromAddress
-    if (fromAddress) return fromAddress(address).toHex()
+    return new P2PKH().lock(String(address ?? '').trim()).toHex().toLowerCase()
   } catch {
-    // Fall through to empty script for unsupported address formats.
+    return ''
   }
-  return ''
 }
 
 function getWalletAddress(walletIndex: number): string | null {
@@ -348,8 +378,20 @@ function registerOverlayWalletFailure(walletIndex: number, kind: 'lookup' | 'sub
   state.lastFallbackReason = reason
   state.lastFallbackAt = Date.now()
   state.fallbackCount += 1
+
+  // Temporary fallback only means "route to legacy" when the operator enabled
+  // legacy fallback. With it disabled the window is recorded for status output
+  // but overlay stays the active source and its errors surface to the caller.
+  const legacyFallbackEnabled = getSpendSourceConfig().legacyFallbackEnabled
+  if (legacyFallbackEnabled) {
+    console.warn(
+      `⚠️ Overlay spend-source fallback activated for W${walletIndex + 1} until ${new Date(state.fallbackUntil).toISOString()}: ${reason}`,
+    )
+    return
+  }
   console.warn(
-    `⚠️ Overlay spend-source fallback activated for W${walletIndex + 1} until ${new Date(state.fallbackUntil).toISOString()}: ${reason}`,
+    `⚠️ Overlay spend-source failure threshold reached for W${walletIndex + 1}: ${reason}. ` +
+      `Legacy fallback is disabled, so overlay remains the active source and this error will surface to the caller.`,
   )
 }
 
@@ -601,7 +643,7 @@ export function getSpendSourceConfig(): SpendSourceConfig {
   return {
     mode: parseSpendSourceMode(process.env.BSV_SPEND_SOURCE_MODE),
     shadowReadsEnabled: parseBool(process.env.BSV_SPEND_SOURCE_SHADOW_READS, true),
-    legacyFallbackEnabled: parseBool(process.env.BSV_SPEND_SOURCE_LEGACY_FALLBACK_ENABLED, true),
+    legacyFallbackEnabled: parseBool(process.env.BSV_SPEND_SOURCE_LEGACY_FALLBACK_ENABLED, false),
     confirmedOnlyDefault: parseBool(process.env.BSV_OVERLAY_CONFIRMED_ONLY, true),
     canaryWalletIndex: parseOptionalIndex(process.env.BSV_OVERLAY_CANARY_WALLET),
     forcedLegacyWalletIndexes: fallbackConfig.forcedLegacyWalletIndexes,
@@ -646,7 +688,10 @@ export function getSpendSourceStatus(): SpendSourceStatus {
         temporaryFallbackUntil: temporaryFallbackActive ? state.fallbackUntil : null,
         lastFallbackReason: state.lastFallbackReason,
         fallbackCount: state.fallbackCount,
-        overlaySelected: config.mode === 'overlay' && overlayUsable && !forcedLegacy && !temporaryFallbackActive
+        // A temporary fallback only removes the wallet from the overlay path
+        // when legacy fallback is enabled; otherwise overlay stays selected.
+        overlaySelected: config.mode === 'overlay' && overlayUsable && !forcedLegacy
+          && !(config.legacyFallbackEnabled && temporaryFallbackActive)
           && (config.canaryWalletIndex == null || config.canaryWalletIndex === walletIndex),
       }
     }),
@@ -1043,6 +1088,11 @@ class ShadowSpendSource implements SpendSource {
 const legacySpendSource = new LegacySpendSource()
 const overlaySpendSource = new OverlayHttpSpendSource()
 
+// Module load is the process startup point for every consumer of spend
+// selection (web, workers, scripts), so the warning fires once, early, and only
+// when the operator has explicitly re-enabled the legacy fallback.
+warnIfLegacyFallbackEnabled()
+
 function warnOverlayFallback(reason: string): void {
   const globalState = globalThis as any
   if (globalState[OVERLAY_FALLBACK_WARN_KEY]) return
@@ -1057,7 +1107,12 @@ function isOverlayConfigured(config: SpendSourceConfig): boolean {
 function walletUsesOverlay(config: SpendSourceConfig, walletIndex?: number): boolean {
   if (config.mode !== 'overlay') return false
   if (typeof walletIndex === 'number') {
-    if (isWalletForcedLegacy(walletIndex) || isWalletTemporarilyFallback(walletIndex)) {
+    // Forced-legacy is explicit operator configuration and is always honoured.
+    if (isWalletForcedLegacy(walletIndex)) return false
+    // A temporary fallback only disqualifies the wallet when legacy fallback is
+    // actually enabled. With fallback off there is no alternative to route to,
+    // so keep using the overlay and let its error surface.
+    if (config.legacyFallbackEnabled && isWalletTemporarilyFallback(walletIndex)) {
       return false
     }
   }
@@ -1090,6 +1145,12 @@ export function getSpendSourceForWallet(walletIndex?: number): SpendSource {
       return legacySpendSource
     }
     throw new Error('Overlay spend source requested but lookup/submit endpoints are not fully configured')
+  }
+
+  // Overlay mode but this wallet is pinned to legacy, or is inside a temporary
+  // fallback window that the operator explicitly enabled.
+  if (typeof walletIndex === 'number' && config.legacyFallbackEnabled && isWalletTemporarilyFallback(walletIndex)) {
+    warnOverlayFallback(`W${walletIndex + 1} is in a temporary overlay fallback window.`)
   }
 
   if (config.shadowReadsEnabled && overlayConfigured) {

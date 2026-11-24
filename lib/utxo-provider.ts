@@ -26,6 +26,26 @@ const UTXO_429_COOLDOWN_MS = Math.max(1000, Number(process.env.BSV_UTXO_429_COOL
 const UTXO_DEGRADED_LOG_INTERVAL_MS = Math.max(10000, Number(process.env.BSV_UTXO_DEGRADED_LOG_INTERVAL_MS || 60000))
 const OVERLAY_UTXO_LIST_LIMIT = Math.max(1, Number(process.env.BSV_OVERLAY_UTXO_LIST_LIMIT || 10000))
 
+// ─── Bitails provider (default) ──────────────────────────────────────────────
+// Wallet address UTXO lookups must come from the overlay or an internal/Bitails
+// indexer. Bitails pages `/address/{address}/unspent` with from/limit, so a
+// wallet holding tens of thousands of dust outputs needs several pages before
+// the inventory is complete.
+const BITAILS_API_BASE = (process.env.BSV_BITAILS_API_BASE || 'https://api.bitails.io').replace(/\/+$/, '')
+const BITAILS_UNSPENT_PAGE_LIMIT = Math.min(
+  1000,
+  Math.max(1, Math.floor(Number(process.env.BSV_BITAILS_UNSPENT_PAGE_LIMIT || 100))),
+)
+const BITAILS_UNSPENT_MAX_PAGES = Math.min(
+  1000,
+  Math.max(1, Math.floor(Number(process.env.BSV_BITAILS_UNSPENT_MAX_PAGES || 50))),
+)
+const BITAILS_MAX_RETRY_WAIT_MS = Math.max(0, Number(process.env.BSV_BITAILS_MAX_RETRY_WAIT_MS || 3000))
+const UTXO_ADDRESS_CONCURRENCY = Math.min(
+  8,
+  Math.max(1, Math.floor(Number(process.env.BSV_UTXO_ADDRESS_CONCURRENCY || 2))),
+)
+
 type OverlayLookupConfig = {
   providerId: string
   lookupUrl: string | null
@@ -359,6 +379,168 @@ function extractUtxoList(payload: any): any[] {
   return []
 }
 
+/**
+ * Policy gate for WhatsOnChain address UTXO reads.
+ *
+ * Workspace policy: wallet address UTXO lookups must come from the overlay or a
+ * custom internal/Bitails indexer. WhatsOnChain is only permitted as a
+ * break-glass path, which requires BOTH an explicit operator opt-in and the
+ * global WoC read kill-switch to be clear.
+ */
+function isWocUtxoReadAllowed(): boolean {
+  return process.env.GAIALOG_EMERGENCY_WOC_UTXO === 'true'
+    && process.env.GAIALOG_DISABLE_WOC_READS !== 'true'
+}
+
+function bitailsHeaders(): HeadersMap {
+  const headers: HeadersMap = { Accept: 'application/json' }
+  const apiKey = String(process.env.BSV_BITAILS_API_KEY || '').trim()
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+  return headers
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/** Retry-After may be seconds or an HTTP date; cap the wait so callers stay responsive. */
+function parseRetryAfterMs(value: string | null): number {
+  if (!value) return 0
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(BITAILS_MAX_RETRY_WAIT_MS, seconds * 1000)
+  const dateMs = Date.parse(value)
+  if (Number.isFinite(dateMs)) return Math.min(BITAILS_MAX_RETRY_WAIT_MS, Math.max(0, dateMs - Date.now()))
+  return 0
+}
+
+type BitailsUnspentRow = {
+  txid?: string
+  tx_hash?: string
+  vout?: number
+  tx_pos?: number
+  satoshis?: number
+  value?: number
+  blockheight?: number
+  height?: number
+  confirmations?: number
+}
+
+/**
+ * Page `/address/{address}/unspent` until the address is exhausted.
+ *
+ * Bitails returns `{ scripthash, unspent: [...] }` and pages with from/limit
+ * (see lib/wallet-funding-admit.ts). A dust-heavy wallet needs several pages,
+ * so paging is capped rather than unbounded: a partial inventory with a loud
+ * warning is safer than an unbounded request loop against a third party.
+ */
+async function fetchBitailsUnspent(address: string, options: GetUnspentOptions): Promise<any[]> {
+  const collected: any[] = []
+  // Dedupe by outpoint: if the indexer ever ignores `from` and repeats a page,
+  // stopping at the page budget must not hand the spend path two entries for
+  // one coin.
+  const seenOutpoints = new Set<string>()
+  let from = 0
+  let truncated = false
+
+  for (let page = 0; page < BITAILS_UNSPENT_MAX_PAGES; page++) {
+    const url = `${BITAILS_API_BASE}/address/${encodeURIComponent(address)}/unspent?from=${from}&limit=${BITAILS_UNSPENT_PAGE_LIMIT}`
+    let attempt = 0
+    let rows: BitailsUnspentRow[] = []
+
+    while (true) {
+      const controller = new AbortController()
+      const timeout = setTimeout(
+        () => controller.abort(new Error(`UTXO_FETCH_TIMEOUT:${UTXO_FETCH_TIMEOUT_MS}`)),
+        UTXO_FETCH_TIMEOUT_MS,
+      )
+      try {
+        const res = await fetch(url, { headers: bitailsHeaders(), signal: controller.signal })
+          .finally(() => clearTimeout(timeout))
+
+        if (!res.ok) {
+          const body = await res.text().catch(() => '')
+          const retryable = res.status === 429 || (res.status >= 500 && res.status < 600)
+          if (!retryable || attempt >= UTXO_FETCH_MAX_RETRIES) {
+            // The "NNN " prefix is what the caller's cooldown logic parses.
+            throw new Error(`${res.status} Bitails unspent failed: ${(body || res.statusText).slice(0, 200)}`)
+          }
+          const wait = parseRetryAfterMs(res.headers.get('Retry-After'))
+            || (UTXO_FETCH_BACKOFF_BASE_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 100))
+          attempt += 1
+          await sleep(wait)
+          continue
+        }
+
+        const payload = await res.json().catch(() => null)
+        const list = Array.isArray(payload)
+          ? payload
+          : (Array.isArray((payload as any)?.unspent)
+            ? (payload as any).unspent
+            : (Array.isArray((payload as any)?.utxos) ? (payload as any).utxos : []))
+        rows = list as BitailsUnspentRow[]
+        break
+      } catch (error) {
+        clearTimeout(timeout)
+        const err = error instanceof Error ? error : new Error(String(error))
+        // 429/5xx already exhausted their retries above; network/timeout errors retry here.
+        if (attempt >= UTXO_FETCH_MAX_RETRIES || /^\d{3}\b/.test(err.message)) throw err
+        attempt += 1
+        await sleep(UTXO_FETCH_BACKOFF_BASE_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 100))
+      }
+    }
+
+    for (const row of rows) {
+      const txid = String(row?.txid || row?.tx_hash || '')
+      if (!/^[0-9a-fA-F]{64}$/.test(txid)) continue
+      const vout = Number(row?.vout ?? row?.tx_pos ?? 0)
+      if (!Number.isInteger(vout) || vout < 0) continue
+      const value = Number(row?.satoshis ?? row?.value ?? 0)
+      if (!Number.isFinite(value) || value < 0) continue
+
+      const height = Number(row?.blockheight ?? row?.height ?? 0)
+      const confirmedHeight = Number.isFinite(height) && height > 0 ? height : undefined
+      const rawConfirmations = Number(row?.confirmations)
+      // Bitails reports confirmations on mined outputs. When absent but a block
+      // height is known, treat it as at least one confirmation rather than
+      // reporting a mined output as unspent-but-unconfirmed.
+      const confirmations = Number.isFinite(rawConfirmations) && rawConfirmations > 0
+        ? Math.floor(rawConfirmations)
+        : (confirmedHeight ? 1 : 0)
+
+      if (options.confirmedOnly === true && confirmations <= 0) continue
+
+      const outpoint = `${txid}:${vout}`
+      if (seenOutpoints.has(outpoint)) continue
+      seenOutpoints.add(outpoint)
+
+      collected.push({
+        tx_hash: txid,
+        tx_pos: vout,
+        value,
+        height: confirmedHeight,
+        confirmations,
+      })
+    }
+
+    if (rows.length < BITAILS_UNSPENT_PAGE_LIMIT) {
+      truncated = false
+      break
+    }
+    from += rows.length
+    truncated = page === BITAILS_UNSPENT_MAX_PAGES - 1
+  }
+
+  if (truncated) {
+    console.warn(
+      `[UTXO Provider] Bitails unspent pagination capped at ${BITAILS_UNSPENT_MAX_PAGES} page(s) ` +
+        `(${collected.length} output(s)) for ${address.substring(0, 10)}...; ` +
+        `raise BSV_BITAILS_UNSPENT_MAX_PAGES if this wallet holds more.`,
+    )
+  }
+
+  return collected
+}
+
 function maybeUseCachedUtxos(address: string, cache: UtxoCacheEntry, now: number, reason: string, options: GetUnspentOptions = {}): any[] | null {
   if (cache.utxos.length === 0 || cache.fetchedAt <= 0) return null
   const ageMs = now - cache.fetchedAt
@@ -396,7 +578,7 @@ export async function getUnspentForAddress(address: string, options: GetUnspentO
   }
 
   const fetchPromise = (async (): Promise<any[]> => {
-    const provider = (process.env.BSV_UTXO_PROVIDER || 'woc').toLowerCase()
+    const requestedProvider = (process.env.BSV_UTXO_PROVIDER || 'bitails').trim().toLowerCase()
     // Optional custom template for ARC or other indexers: supports {address} and {net}
     const customTemplate = process.env.BSV_UTXO_ENDPOINT_TEMPLATE || process.env.BSV_ARC_UTXO_URL_TEMPLATE || ''
     const customHeadersJson = process.env.BSV_UTXO_HEADERS_JSON || ''
@@ -404,6 +586,21 @@ export async function getUnspentForAddress(address: string, options: GetUnspentO
     const wocPath = options.confirmedOnly ? 'confirmed/unspent' : 'unspent/all'
     const overlayWalletIndex = getWalletIndexForAddress(address)
     const overlayPreferred = overlayWalletIndex != null && String(process.env.BSV_SPEND_SOURCE_MODE || '').trim().toLowerCase() === 'overlay'
+
+    // WoC is a break-glass path only. Refuse the request and fall back to
+    // Bitails when the policy gate is closed.
+    let provider = requestedProvider
+    if (provider === 'woc' && !isWocUtxoReadAllowed()) {
+      const blockedBy = process.env.GAIALOG_DISABLE_WOC_READS === 'true'
+        ? 'GAIALOG_DISABLE_WOC_READS=true'
+        : 'GAIALOG_EMERGENCY_WOC_UTXO is not "true"'
+      console.error(
+        `[UTXO Provider] POLICY VIOLATION: WoC address UTXO lookup requested for ${address.substring(0, 10)}... ` +
+          `but ${blockedBy}. Wallet address UTXO lookups must come from the overlay or a Bitails/internal indexer. ` +
+          `Falling back to the bitails provider.`,
+      )
+      provider = 'bitails'
+    }
 
     try {
       if (overlayPreferred) {
@@ -442,42 +639,58 @@ export async function getUnspentForAddress(address: string, options: GetUnspentO
         return normalized
       }
 
-      // Default: WhatsOnChain
-      const url = `https://api.whatsonchain.com/v1/bsv/${NET}/address/${address}/${wocPath}`
-      const res = await fetchWithRetry(url, buildHeaders())
-      const data = await res.json().catch(() => [])
-      const normalized = normaliseUtxoShape(extractUtxoList(data))
+      if (provider === 'woc') {
+        const url = `https://api.whatsonchain.com/v1/bsv/${NET}/address/${address}/${wocPath}`
+        const res = await fetchWithRetry(url, buildHeaders())
+        const data = await res.json().catch(() => [])
+        const normalized = normaliseUtxoShape(extractUtxoList(data))
+        cache.utxos = normalized
+        cache.fetchedAt = Date.now()
+        cache.cooldownUntil = 0
+        cache.lastError = undefined
+
+        // Log if we got empty results (might indicate an issue)
+        if (normalized.length === 0) {
+          console.log(`[UTXO Provider] WhatsOnChain returned 0 UTXOs for ${address.substring(0, 10)}... (status: ${res.status}, path=${wocPath})`)
+        } else if (bsvConfig.logging.level === 'debug') {
+          console.log(`[UTXO Provider] WhatsOnChain returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}... (path=${wocPath})`)
+        }
+
+        return normalized
+      }
+
+      if (provider !== 'bitails') {
+        console.warn(
+          `[UTXO Provider] Unsupported BSV_UTXO_PROVIDER="${requestedProvider}"; using the bitails provider. ` +
+            `Supported values: bitails, custom, arc (with BSV_UTXO_ENDPOINT_TEMPLATE), woc (emergency only).`,
+        )
+      }
+
+      const normalized = await fetchBitailsUnspent(address, options)
       cache.utxos = normalized
       cache.fetchedAt = Date.now()
       cache.cooldownUntil = 0
       cache.lastError = undefined
-
-      // Log if we got empty results (might indicate an issue)
-      if (normalized.length === 0) {
-        console.log(`[UTXO Provider] WhatsOnChain returned 0 UTXOs for ${address.substring(0, 10)}... (status: ${res.status}, path=${wocPath})`)
-      } else if (bsvConfig.logging.level === 'debug') {
-        console.log(`[UTXO Provider] WhatsOnChain returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}... (path=${wocPath})`)
+      if (normalized.length > 0 || bsvConfig.logging.level === 'debug') {
+        console.log(`[UTXO Provider] Bitails returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}...`)
       }
-
       return normalized
     } catch (e) {
       lastError = e instanceof Error ? e : new Error(String(e))
       if (overlayPreferred) {
         console.error(`[UTXO Provider] Overlay lookup failed for ${address.substring(0, 10)}...:`, lastError.message)
-      } else if (provider !== 'woc') {
+      } else if (provider !== 'woc' && provider !== 'bitails') {
+        // Custom/ARC indexers may be down; Bitails is the sanctioned fallback.
         try {
-          const url = `https://api.whatsonchain.com/v1/bsv/${NET}/address/${address}/${wocPath}`
-          const res = await fetchWithRetry(url, buildHeaders())
-          const data = await res.json().catch(() => [])
-          const normalized = normaliseUtxoShape(extractUtxoList(data))
+          const normalized = await fetchBitailsUnspent(address, options)
           cache.utxos = normalized
           cache.fetchedAt = Date.now()
           cache.cooldownUntil = 0
           cache.lastError = undefined
-          console.log(`[UTXO Provider] Fallback to WOC returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}...`)
+          console.log(`[UTXO Provider] Fallback to Bitails returned ${normalized.length} UTXO(s) for ${address.substring(0, 10)}...`)
           return normalized
         } catch (fallbackError) {
-          console.error(`[UTXO Provider] Both ${provider} and WOC fallback failed for ${address.substring(0, 10)}...:`, fallbackError)
+          console.error(`[UTXO Provider] Both ${provider} and Bitails fallback failed for ${address.substring(0, 10)}...:`, fallbackError)
         }
       } else {
         console.error(`[UTXO Provider] Failed to fetch UTXOs for ${address.substring(0, 10)}...:`, lastError.message)
@@ -500,11 +713,39 @@ export async function getUnspentForAddress(address: string, options: GetUnspentO
   return fetchPromise
 }
 
+/**
+ * Fetch UTXOs for several addresses.
+ *
+ * Concurrency is bounded (default 2) rather than unbounded: each address fans
+ * out into one or more paginated indexer requests, so a `Promise.all` over a
+ * large wallet set turns one caller into a burst that trips the indexer's rate
+ * limiter for every other consumer on the box.
+ */
 export async function getUnspentForAddresses(addresses: string[]): Promise<Record<string, any[]>> {
   const out: Record<string, any[]> = {}
-  await Promise.all(addresses.map(async (addr) => {
-    try { out[addr] = await getUnspentForAddress(addr) } catch { out[addr] = [] }
-  }))
+  const queue = Array.from(new Set((addresses || []).filter(addr => typeof addr === 'string' && addr.length > 0)))
+  if (queue.length === 0) return out
+
+  let cursor = 0
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = cursor
+      cursor += 1
+      if (index >= queue.length) return
+      const addr = queue[index]
+      try {
+        out[addr] = await getUnspentForAddress(addr)
+      } catch {
+        out[addr] = []
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(UTXO_ADDRESS_CONCURRENCY, queue.length) },
+    () => worker(),
+  )
+  await Promise.all(workers)
   return out
 }
 

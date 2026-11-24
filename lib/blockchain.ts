@@ -1,13 +1,22 @@
-import * as bsv from 'bsv'
 import * as v8 from 'v8'
-// BSV has no protocol-enforced dust limit (unlike BTC's 546 sat).
-// Override the library's inherited BTC default so change outputs of any
-// value (≥1 sat) are kept instead of being silently absorbed into fees.
-;(bsv.Transaction as any).DUST_AMOUNT = 1
+import { createHash } from 'crypto'
 import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
+import {
+  buildOpReturnTx,
+  buildPaymentTx,
+  p2pkhLockingScriptHexFromWif as p2pkhLockingScriptHexFromWifSdk,
+  type TxInputSpec,
+} from './broadcast/tx-builder'
+import {
+  getBroadcasterCallbackToken,
+  getCachedPolicyFeeRateSatPerByte,
+  recordBroadcasterAcceptance,
+  submitTransaction,
+  type AcceptedOutcome,
+} from './broadcast/broadcaster-client'
 // DB write via repositories (Postgres)
 import { upsertTxLog } from './repositories'
-import { bsvConfig } from './bsv-config'
+import { DEFAULT_TX_FEE_RATE, bsvConfig } from './bsv-config'
 import { APP_NAME, SCHEMA_VERSION } from './constants'
 // Data credibility features
 import { dataValidator, qualityScorer } from './validation'
@@ -25,7 +34,7 @@ import {
 import { QueueLane, resolveProviderIdFromSource, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
 import { upsertArcBroadcastStatus } from './arc-broadcast-status'
-import { classifyArcTxStatus } from './arc-tx-status'
+import { classifyArcTxStatus, type ArcPhase, type ArcStatusProvider } from './arc-tx-status'
 
 // Types
 export interface BlockchainData {
@@ -84,15 +93,20 @@ const BSV_PRIVATE_KEY = process.env.BSV_PRIVATE_KEY || process.env.BSV_WALLET_1_
 const BSV_FALLBACK_WIF = (bsvConfig?.wallets?.privateKeys && bsvConfig.wallets.privateKeys.length > 0) ? bsvConfig.wallets.privateKeys[0] : ''
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY
 const WOC_NETWORK = (process.env.BSV_NETWORK === 'mainnet') ? 'main' : 'test'
-// Broadcasting endpoints: GorillaPool ARC (primary) → TAAL ARC (fallback)
-const GORILLAPOOL_ARC_ENDPOINT = (process.env.BSV_GORILLAPOOL_ARC_ENDPOINT || 'https://arc.gorillapool.io').replace(/\/$/, '')
-const TAAL_ARC_ENDPOINT = (process.env.BSV_API_ENDPOINT || 'https://arc.taal.com').replace(/\/$/, '')
-// GorillaPool/TAAL ARC policy floor: ~100 sat/kB.
-// Operator standard: 0.1025 sat/byte (102.5 sat/kB) — 2.5% margin above ARC floor.
-// This thin margin is only safe in combination with:
-//   (a) deterministic explicit-fee build (no dust-burn fallback) — see buildSignedTransaction
-//   (b) INPUT_SIGNED = 149 conservative size estimate (absorbs ECDSA signature variance)
-const FEE_RATE_SAT_PER_BYTE = Number(process.env.BSV_TX_FEE_RATE || 0.1025)
+// Fee-rate floor for every transaction this service builds.
+//
+// The live rate is read from the BSV Broadcaster (`GET /policy`) through
+// `getCachedPolicyFeeRateSatPerByte` and held by `resolveFeeRateForBuild`,
+// which takes the highest rate across reachable hosts and refreshes it in the
+// background so a write never waits on it. This constant is the floor and the
+// fallback when no host can be reached: `DEFAULT_TX_FEE_RATE` (0.15 sat/byte)
+// clears the 0.1 sat/byte network floor with headroom.
+const FEE_RATE_SAT_PER_BYTE = (() => {
+  const configured = Number(
+    process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE,
+  )
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_TX_FEE_RATE
+})()
 // BSV has no protocol-enforced dust limit (unlike BTC's 546). 1 sat is the minimum viable output.
 const DUST_LIMIT = 1
 // UTXO spend policy: default allows all UTXOs (including unconfirmed).
@@ -104,7 +118,6 @@ const DUST_LIMIT = 1
 const MIN_SPEND_CONF = getMinSpendConfirmations()
 const REFRESH_THRESHOLD = Number(process.env.BSV_UTXO_REFRESH_THRESHOLD || 10)
 const SPEND_SOURCE_LIST_LIMIT = Math.max(100, Number(process.env.BSV_SPEND_SOURCE_LIST_LIMIT || 5000))
-const BROADCAST_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.BSV_BROADCAST_TIMEOUT_MS || 15000))
 const SLOW_WRITE_TO_CHAIN_MS = Math.max(1000, Number(process.env.BSV_SLOW_WRITE_TO_CHAIN_MS || 5000))
 const SLOW_UTXO_LOOKUP_MS = Math.max(250, Number(process.env.BSV_SLOW_UTXO_LOOKUP_MS || 2000))
 const EMERGENCY_LEGACY_UTXO_MODE = process.env.GAIALOG_EMERGENCY_LEGACY_UTXO === 'true'
@@ -138,11 +151,190 @@ const CONFIRMATION_MAX_PER_TICK = Math.max(1, Number(process.env.BSV_CONFIRMATIO
 const CONFIRMATION_MAX_TRACKED_TXIDS = Math.max(1000, Number(process.env.BSV_CONFIRMATION_MAX_TRACKED_TXIDS || (WHATSONCHAIN_API_KEY ? 50000 : 15000)))
 const CONFIRMATION_MAX_TRACK_MS = Math.max(CONFIRMATION_RETRY_BASE_DELAY_MS, Number(process.env.BSV_CONFIRMATION_MAX_TRACK_MS || 6 * 60 * 60 * 1000))
 const HEAP_GUARD_ENABLED = process.env.BSV_HEAP_GUARD_ENABLED !== 'false'
+// Maximum OP_RETURN payload size in bytes, before script assembly.
+//
+// BSV's practical ceiling for a single non-standard transaction is far above
+// this; the cap exists to stop a runaway payload (an unbounded provider array,
+// a credibility blob, a mis-serialised object) from being built, signed and
+// broadcast as a multi-megabyte transaction that the operators then have to
+// pay for. Large enough that every legitimate reading fits, small enough that
+// a bug fails at build time with a named error rather than at broadcast.
+const BSV_MAX_OPRETURN_BYTES = (() => {
+  const raw = Number(process.env.BSV_MAX_OPRETURN_BYTES)
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 90_000
+})()
 const HEAP_GUARD_HIGH_WATERMARK = Math.min(0.98, Math.max(0.5, Number(process.env.BSV_HEAP_GUARD_HIGH_WATERMARK || 0.82)))
 const HEAP_GUARD_PAUSE_MS = Math.max(5000, Number(process.env.BSV_HEAP_GUARD_PAUSE_MS || 30000))
 const HEAP_GUARD_MAX_BYTES = Math.max(0, Number(process.env.BSV_HEAP_GUARD_MAX_BYTES || 0))
 
 // Supabase client removed; we persist via Postgres repositories (tx_log)
+
+/**
+ * Locally computed transaction id for a signed transaction's hex.
+ *
+ * Double SHA-256 of the serialised transaction, byte-reversed — the definition
+ * every BSV node and broadcaster uses. Computed here from the hex we are about
+ * to send, so a broadcaster's echoed txid can be checked against the actual
+ * transaction rather than trusted.
+ */
+function computeTxidFromHex(txHex: string): string | null {
+  try {
+    const bytes = Buffer.from(txHex, 'hex')
+    if (bytes.length === 0) return null
+    return createHash('sha256')
+      .update(createHash('sha256').update(bytes).digest())
+      .digest()
+      .reverse()
+      .toString('hex')
+  } catch {
+    return null
+  }
+}
+
+/** Ceiling on the fee-retry multiplier, whatever the environment asks for. */
+const BROADCAST_FEE_RETRY_MAX = 3
+
+/**
+ * Fee multiplier applied once when the broadcaster answers 465 (fee too low).
+ *
+ * 1.5x on a 0.15 sat/byte build is 0.225 sat/byte, comfortably above the live
+ * floor without paying an order of magnitude over it. Overridable, and clamped
+ * so a misconfigured value cannot produce an absurd fee on the rebuild.
+ */
+const BROADCAST_FEE_RETRY_MULTIPLIER = (() => {
+  const configured = Number(process.env.BSV_BROADCASTER_FEE_RETRY_MULTIPLIER)
+  const multiplier = Number.isFinite(configured) && configured > 1 ? configured : 1.5
+  return Math.min(multiplier, BROADCAST_FEE_RETRY_MAX)
+})()
+
+/**
+ * Terminal statuses the broadcaster uses for a transaction it has judged.
+ * Presence of one means the answer is about these bytes, not about a mismatch.
+ */
+const TERMINAL_TX_STATUSES = new Set([
+  'REJECTED',
+  'INVALID',
+  'MALFORMED',
+  'EVICTED',
+  'DOUBLE_SPEND_ATTEMPTED',
+])
+
+/**
+ * True when a terminal outcome leaves the network state of OUR transaction
+ * unknown, which is the one case where the input must be quarantined rather
+ * than released.
+ *
+ * The distinguishing signal is structural, not textual: a 2xx response whose
+ * status says the transaction was accepted, paired with a terminal verdict,
+ * means the host acknowledged something other than the bytes we signed (a
+ * truncated echo, a truncated txid, a response for a different txid). A 4xx —
+ * or a 2xx carrying a rejection status — is a verdict about our bytes, and
+ * releasing the input is safe because nothing of ours was relayed.
+ */
+function terminalOutcomeLeavesStateUnknown(outcome: {
+  httpStatus: number
+  txStatus: string | null
+}): boolean {
+  if (outcome.httpStatus < 200 || outcome.httpStatus >= 300) return false
+  const status = (outcome.txStatus ?? '').trim().toUpperCase()
+  return !TERMINAL_TX_STATUSES.has(status)
+}
+
+/**
+ * Which status provider an accepted submission came from.
+ *
+ * Only the Broadcaster's own verdict makes `DOUBLE_SPEND_ATTEMPTED` terminal.
+ * A degraded acceptance came from a relay that does not track lifecycle, so it
+ * takes the cautious ARC branch and holds the inputs.
+ */
+function arcStatusProviderForAcceptance(outcome: AcceptedOutcome): ArcStatusProvider {
+  return outcome.degraded ? 'arc' : 'broadcaster'
+}
+
+/**
+ * True when an error is a deterministic rejection that retrying cannot fix.
+ *
+ * `TERMINAL_BROADCAST_ERROR` covers malformed scripts, invalid signatures and
+ * double spends: every host validates the same bytes against the same
+ * consensus rules, so a retry repeats the same rejection. Used to skip the
+ * retry ladder rather than burn attempts on a payload that can never be mined.
+ */
+export function isTerminalBroadcastError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /TERMINAL_BROADCAST_ERROR/.test(message)
+}
+
+/** True when the broadcaster reported the fee as below its policy floor. */
+export function isFeeTooLowBroadcastError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /FEE_TOO_LOW|fee too low|\b465\b/i.test(message)
+}
+
+/**
+ * True when the endpoint asked for a delay (503/429/476) rather than judging the transaction. */
+export function isEndpointBackoffError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /ENDPOINT_BACKOFF|BROADCASTER_BACKPRESSURE/.test(message)
+}
+
+/**
+ * The fee rate used to build the next transaction.
+ *
+ * `getCachedPolicyFeeRateSatPerByte` is the source of truth, but it fans out a
+ * `GET /policy` to every host when its 60-second cache expires. `writeToChain`
+ * runs once per reading, so calling it directly would mean a burst of writes
+ * arriving just after expiry each pays up to a 4-second timeout — and, worse,
+ * fires its own set of requests, since the client dedupes nothing in flight.
+ *
+ * So the resolved rate is held here and reused until a refresh completes. A
+ * stale rate is safe by construction: the builder adds a safety multiplier and
+ * the write path retries a 465 rejection once at 1.5x. A missing rate (first
+ * write after process start) is the only case that waits, and concurrent
+ * first writes share one fetch.
+ */
+let cachedEffectiveFeeRate: number | null = null
+let cachedEffectiveFeeRateAt = 0
+let feeRateRefreshInFlight: Promise<void> | null = null
+const FEE_RATE_REFRESH_INTERVAL_MS = 60_000
+
+function refreshEffectiveFeeRateInBackground(): void {
+  if (feeRateRefreshInFlight) return
+  feeRateRefreshInFlight = getCachedPolicyFeeRateSatPerByte(FEE_RATE_SAT_PER_BYTE)
+    .then(rate => {
+      if (Number.isFinite(rate) && rate > 0) {
+        cachedEffectiveFeeRate = rate
+        cachedEffectiveFeeRateAt = Date.now()
+      }
+    })
+    .catch(() => {
+      // Keep the last known rate; the floor is still a valid build value.
+    })
+    .finally(() => {
+      feeRateRefreshInFlight = null
+    })
+}
+
+/**
+ * The fee rate to build at, without adding network latency to a write.
+ *
+ * Returns the cached rate immediately when one exists and refreshes it in the
+ * background once it ages past the client's own cache window. Only a process
+ * with no rate yet waits, and only for one fetch.
+ */
+async function resolveFeeRateForBuild(): Promise<number> {
+  const fresh = cachedEffectiveFeeRate != null
+    && Date.now() - cachedEffectiveFeeRateAt < FEE_RATE_REFRESH_INTERVAL_MS
+  if (fresh) return cachedEffectiveFeeRate as number
+  if (cachedEffectiveFeeRate != null && cachedEffectiveFeeRate > 0) {
+    // Serve the stale rate now; the refresh lands before the next build.
+    refreshEffectiveFeeRateInBackground()
+    return cachedEffectiveFeeRate
+  }
+
+  refreshEffectiveFeeRateInBackground()
+  await feeRateRefreshInFlight
+  return cachedEffectiveFeeRate ?? FEE_RATE_SAT_PER_BYTE
+}
 
 // Wallet class for BSV operations
 export class BSVWallet {
@@ -314,8 +506,6 @@ export class BlockchainService {
     { broadcastsOk: 0, broadcastsFailed: 0, utxoRefreshes: 0, rawUtxosFetched: 0, heapBackoffs: 0 }
   private operationalErrors: Map<string, number> = new Map()
   private heapBackoffUntilMs = 0
-  private broadcastBackoffUntilByChannel: Map<'gorillapool_arc' | 'taal_arc' | 'whatsonchain', number> = new Map()
-  private broadcastBackoffLogAtByChannel: Map<'gorillapool_arc' | 'taal_arc' | 'whatsonchain', number> = new Map()
 
   constructor() {
     try {
@@ -489,40 +679,20 @@ export class BlockchainService {
     logger(parts.join(' '))
   }
 
+  /**
+   * Best-effort channel attribution for observability.
+   *
+   * Broadcasts go through the BSV Broadcaster's host ladder first, with the
+   * legacy ARC relays only as a transport-level fallback; the labels here match
+   * what an operator sees in the logs.
+   */
   private detectBroadcastChannel(message: string): string {
     const safe = String(message || '').toUpperCase()
+    if (safe.includes('BSV_BROADCASTER') || safe.includes('ARCADE-')) return 'bsv_broadcaster'
     if (safe.includes('GORILLAPOOL')) return 'gorillapool_arc'
     if (safe.includes('TAAL')) return 'taal_arc'
     if (safe.includes('WHATSONCHAIN') || safe.includes('WOC')) return 'whatsonchain'
     return 'unknown'
-  }
-
-  private isBroadcastChannelBackedOff(channel: 'gorillapool_arc' | 'taal_arc' | 'whatsonchain'): boolean {
-    const until = this.broadcastBackoffUntilByChannel.get(channel) || 0
-    if (until <= Date.now()) {
-      this.broadcastBackoffUntilByChannel.delete(channel)
-      return false
-    }
-    return true
-  }
-
-  private clearBroadcastChannelBackoff(channel: 'gorillapool_arc' | 'taal_arc' | 'whatsonchain'): void {
-    this.broadcastBackoffUntilByChannel.delete(channel)
-  }
-
-  private noteBroadcastChannelBackoff(
-    channel: 'gorillapool_arc' | 'taal_arc' | 'whatsonchain',
-    durationMs: number,
-    reason: string,
-  ): void {
-    const until = Date.now() + Math.max(1000, durationMs)
-    this.broadcastBackoffUntilByChannel.set(channel, until)
-    const lastLog = this.broadcastBackoffLogAtByChannel.get(channel) || 0
-    if ((Date.now() - lastLog) > 15000) {
-      const label = channel === 'gorillapool_arc' ? 'GorillaPool ARC' : channel === 'taal_arc' ? 'TAAL ARC' : 'WoC'
-      console.warn(`⏸️  ${label} backoff for ${Math.round(durationMs / 1000)}s: ${reason}`)
-      this.broadcastBackoffLogAtByChannel.set(channel, Date.now())
-    }
   }
 
   private buildWhatsOnChainHeaders(includeJsonContentType: boolean = false): Record<string, string> {
@@ -954,6 +1124,8 @@ export class BlockchainService {
     let acceptedVia: string | undefined
     let acceptedTxid: string | undefined
     let acceptedTxStatus: string | undefined
+    let acceptedPhase: ArcPhase = 'pending'
+    let actualFeeSats: number | undefined
     let fromAddress = '' // hoisted so outer catch can signal per-wallet backoff
     try {
       if (this.shouldTraceTimings()) {
@@ -961,8 +1133,14 @@ export class BlockchainService {
       }
       // Check if blockchain is configured
       if (!BSV_PRIVATE_KEY && !BSV_FALLBACK_WIF) {
-        console.warn('⚠️ Blockchain private key not configured, skipping write to chain')
-        return 'blockchain-not-configured'
+        // Throwing rather than returning a sentinel string. The previous
+        // `return 'blockchain-not-configured'` was indistinguishable from a
+        // real txid to every caller that only checked for a non-empty string,
+        // so a misconfigured deployment recorded readings as broadcast and
+        // linked them to a txid that does not exist. A throw reaches the
+        // caller's failure path, where it is retried or recorded as a failure.
+        console.warn('⚠️ Blockchain private key not configured; refusing to build a transaction')
+        throw new Error('BLOCKCHAIN_NOT_CONFIGURED: no signing keys available')
       }
       this.enforceHeapGuard()
 
@@ -987,20 +1165,31 @@ export class BlockchainService {
         }
       })()
 
-      // Rename WAQI-style fields for clarity on-chain
+      // Rename WAQI-style fields for clarity on-chain. Everything not renamed is
+      // carried through unchanged: the earlier form rebuilt the payload from a
+      // fixed list, which silently dropped so2, temperature_c, humidity_pct,
+      // pressure_mb, wind_kph, wind_deg, coordinates and any other field the
+      // collector had attached.
       let payloadOut: any = sanitizedPayload
       try {
         if (data.stream === 'air_quality' && sanitizedPayload && typeof sanitizedPayload === 'object') {
-          const p: any = sanitizedPayload
+          const {
+            aqi,
+            pm25,
+            pm10,
+            co,
+            no2,
+            o3,
+            ...rest
+          } = sanitizedPayload as Record<string, any>
           payloadOut = {
-            location: p.location,
-            timestamp: p.timestamp,
-            air_quality_index: p.aqi,
-            fine_particulate_matter_pm25: p.pm25,
-            coarse_particulate_matter_pm10: p.pm10,
-            carbon_monoxide: p.co,
-            nitrogen_dioxide: p.no2,
-            ozone: p.o3,
+            ...rest,
+            air_quality_index: aqi,
+            fine_particulate_matter_pm25: pm25,
+            coarse_particulate_matter_pm10: pm10,
+            carbon_monoxide: co,
+            nitrogen_dioxide: no2,
+            ozone: o3,
           }
         }
       } catch {}
@@ -1105,6 +1294,16 @@ export class BlockchainService {
         extras.push('encoding=gzip')
       }
       // Create OP_RETURN with Tag + Version + payload (+ optional extras)
+      //
+      // Size is checked before the script is assembled and before any UTXO is
+      // acquired, so an oversized payload costs nothing and fails with a named
+      // error instead of producing a transaction that ARC rejects for size.
+      if (payloadBytes.length > BSV_MAX_OPRETURN_BYTES) {
+        throw new Error(
+          `OPRETURN_PAYLOAD_TOO_LARGE: ${payloadBytes.length} bytes exceeds the ` +
+            `${BSV_MAX_OPRETURN_BYTES}-byte limit (BSV_MAX_OPRETURN_BYTES) for stream=${data.stream}`,
+        )
+      }
       const scriptHex = buildOpFalseOpReturnWithTag({
         tag: 'GaiaLog',
         version: 'v1',
@@ -1112,26 +1311,53 @@ export class BlockchainService {
         extra: extras,
         useTrueReturn,
       })
-      const opReturnScript = (bsv as any).Script.fromHex(scriptHex)
       const opReturnBytes = scriptHex.length / 2
       const opReturnOutputSats = useTrueReturn ? 1 : 0
-      // Deterministic size constants. We always emit a P2PKH change output (BSV has no
-      // dust limit), so the change-output bytes are always present.
-      const BASE_WITH_CHANGE = 44 // version (4) + locktime (4) + in-count varint (1) + out-count varint (1) + P2PKH change output (34)
-      const INPUT_SIGNED = 149 // worst-case signed P2PKH input (32 txid + 4 vout + 1 scriptLen + ~108 sig+pubkey + 4 sequence). 149 absorbs high-S signature variance.
 
-      const estimateExplicitFee = (inputCount: number, feeMultiplier: number): { estimatedSize: number; explicitFee: number } => {
+      // The fee rate comes from the broadcaster's own `/policy`, cached for 60s
+      // and taken as the maximum across reachable hosts. Building at that rate
+      // means one signed transaction clears the floor at every host in the
+      // ladder, which matters because a fee rejection is terminal and cannot be
+      // retried more cheaply elsewhere.
+      const effectiveFeeRate = await resolveFeeRateForBuild()
+
+      // Deterministic size model: version + locktime + in-count + out-count
+      // (10), one worst-case signed P2PKH input (149), the OP_RETURN output
+      // envelope and body, and a 34-byte P2PKH change output.
+      const BASE_WITH_CHANGE = 44
+      const INPUT_SIGNED = 149
+      const estimateOpReturnTxSize = (inputCount: number): number => {
         const opReturnOutputEnvelope = 8 + (opReturnBytes < 253 ? 1 : 3)
-        const estimatedSize = BASE_WITH_CHANGE + inputCount * INPUT_SIGNED + opReturnOutputEnvelope + opReturnBytes
-        const explicitFee = Math.ceil(estimatedSize * FEE_RATE_SAT_PER_BYTE * feeMultiplier)
-        return { estimatedSize, explicitFee }
+        return BASE_WITH_CHANGE + inputCount * INPUT_SIGNED + opReturnOutputEnvelope + opReturnBytes
       }
-      const { explicitFee: singleInputExplicitFee } = estimateExplicitFee(1, 1)
-      // 1.2x safety multiplier on the per-tx minimum stops the acquire layer from handing us
-      // a UTXO so close to threshold that signature variance pushes us under ARC's floor.
+
+      // 1.2x safety multiplier on the per-tx minimum stops the acquire layer
+      // handing back a UTXO so close to the threshold that signature variance
+      // (70-72 byte DER) pushes the transaction under the fee floor.
       const minInputSatoshis = Math.max(
         UTXO_POOL_MIN_SATS,
-        Math.ceil((opReturnOutputSats + singleInputExplicitFee + DUST_LIMIT) * 1.2),
+        Math.ceil(
+          (opReturnOutputSats + Math.ceil(estimateOpReturnTxSize(1) * effectiveFeeRate) + DUST_LIMIT) *
+            1.2,
+        ),
+      )
+
+      // Smallest change output that is worth creating at all.
+      //
+      // Auto-consolidation spends roughly one input per dust row, so a row worth
+      // less than about three consolidation-input fees cannot pay for its own
+      // sweep. Change below `minInputSatoshis` is still real money — it just
+      // cannot fund a write — so it is admitted as `dust` for consolidation to
+      // collect. Change below this floor is genuinely uneconomic and is folded
+      // into the fee instead, which loses strictly less than stranding it.
+      //
+      // Clamped to `minInputSatoshis`: if the acquire threshold were ever lower
+      // than three input fees, a change output large enough to fund a write
+      // would otherwise be swallowed as fee, which is the exact waste this
+      // constant exists to prevent.
+      const minConsolidatableDustSats = Math.min(
+        minInputSatoshis,
+        Math.ceil(INPUT_SIGNED * effectiveFeeRate * 3),
       )
 
       const walletLookupStartedAt = Date.now()
@@ -1149,131 +1375,206 @@ export class BlockchainService {
       selectedSpendableCount = 1
       fromAddress = address
 
-      const scriptPubKey = acquiredUtxo.output_script || (
-        (bsv.Script as any).fromAddress
-          ? (bsv.Script as any).fromAddress(address).toHex()
-          : this.p2pkhLockingScriptHexFromWif(wif)
-      )
-      const bitcoreUtxos = [{
-        txId: acquiredUtxo.txid,
-        outputIndex: acquiredUtxo.vout,
-        address,
-        script: scriptPubKey,
+      const scriptPubKey =
+        acquiredUtxo.output_script || p2pkhLockingScriptHexFromWifSdk(wif)
+
+      // Exactly one input: the UTXO the acquisition layer locked for us.
+      const inputSpec: TxInputSpec = {
+        txid: acquiredUtxo.txid,
+        vout: acquiredUtxo.vout,
         satoshis: Number(acquiredUtxo.satoshis),
-      }]
-
-      // Create transaction using explicit fee. bsv's feePerKb uses _estimateSize()
-      // which runs BEFORE signing — input scriptSigs grow from ~40 to ~149 bytes,
-      // so the library underestimates size and we end up with ~22 sat/kB instead of 102.5.
-      // We estimate size ourselves: signed P2PKH input=149 bytes, op_return known.
-      // BSV has no dust limit (unlike BTC's 546), so we ALWAYS emit a change output
-      // and pay exactly explicitFee — fee becomes deterministic and clears ARC's policy
-      // floor (~100 sat/kB) every time at our 102.5 sat/kB rate.
-      const buildSignedTransaction = (feeMultiplier: number): {
-        serialized: string
-        changeOutput: { vout: number; satoshis: number; outputScript: string } | null
-      } => {
-        const numInputs = bitcoreUtxos.length
-        const { explicitFee } = estimateExplicitFee(numInputs, feeMultiplier)
-        const inputSats = bitcoreUtxos.reduce((s: number, u: any) => s + (u.satoshis || 0), 0)
-        const availableForFee = inputSats - opReturnOutputSats
-        if (availableForFee < explicitFee + DUST_LIMIT) {
-          throw new Error(`Selected inputs do not cover explicit fee + 1 sat change: input=${inputSats} explicitFee=${explicitFee} (need at least ${explicitFee + opReturnOutputSats + DUST_LIMIT})`)
-        }
-        // Change below minInputSatoshis can never be acquired for another write, so
-        // emitting it admits a permanently stranded row to the inventory. Every split
-        // output previously decayed into exactly one such row (500 -> 404 -> 308 -> 212
-        // -> 116 stranded), which is how the wallets accumulated 179,437 sub-floor UTXOs
-        // holding 4.46M unusable sats. Below the floor we pay the remainder as fee
-        // instead; the transaction then has no change output and leaves nothing behind.
-        const projectedChange = inputSats - opReturnOutputSats - explicitFee
-        const emitChange = projectedChange >= minInputSatoshis
-
-        const tx = new (bsv as any).Transaction()
-          .from(bitcoreUtxos)
-          .addOutput(new bsv.Transaction.Output({
-            script: opReturnScript,
-            satoshis: opReturnOutputSats,
-          }))
-        if (emitChange) {
-          // BSV has no dust limit; emit change so fee = explicitFee deterministically.
-          tx.fee(explicitFee).change(address)
-        } else {
-          // No change output: the fee is implicitly the whole remainder, which raises the
-          // effective sat/byte rate. That is always above ARC's policy floor, never below.
-          tx.fee(availableForFee)
-        }
-        const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
-        tx.sign(signingKey)
-        const serialized = tx.serialize()
-        const outputSats = tx.outputs.reduce((s: number, o: any) => s + (o.satoshis || o._satoshis || 0), 0)
-        const actualFee = inputSats - outputSats
-        const txSizeBytes = serialized.length / 2
-        if (actualFee < 2) {
-          console.warn(`⚠️  TX fee sanity check: fee=${actualFee} sats, explicitFee=${explicitFee}, txSize=${txSizeBytes} bytes, input=${inputSats}`)
-        }
-        const changeOutput = tx.outputs
-          .map((output: any, vout: number) => {
-            let outputScript = ''
-            try {
-              outputScript = typeof output?.script?.toHex === 'function'
-                ? output.script.toHex()
-                : String(output?.script || '')
-            } catch {}
-            return {
-              vout,
-              satoshis: Number(output?.satoshis || output?._satoshis || 0),
-              outputScript,
-            }
-          })
-          .find((output: { satoshis: number; outputScript: string }) =>
-            output.satoshis > 0 && output.outputScript.toLowerCase() !== scriptHex.toLowerCase()
-          ) || null
-        return { serialized, changeOutput }
+        lockingScriptHex: scriptPubKey,
       }
 
-      // Build prevouts for ARC Extended Format (order must match inputs)
-      const p2pkhScriptDefault = this.p2pkhLockingScriptHexFromWif(wif)
-      const prevoutsForArc = Array.isArray(bitcoreUtxos) ? bitcoreUtxos.map((u: any) => {
-        const sats = Number(u?.satoshis ?? u?.value ?? 0)
-        let scriptHex = ''
-        try {
-          const sc: any = u?.script
-          if (typeof sc === 'string') scriptHex = sc
-          else if (sc && typeof sc.toHex === 'function') scriptHex = sc.toHex()
-        } catch {}
-        if (!scriptHex) scriptHex = p2pkhScriptDefault
-        return { lockingScript: scriptHex, satoshis: sats }
-      }) : []
+      /**
+       * Build and sign the OP_RETURN transaction at a given fee multiplier.
+       *
+       * The fee is passed explicitly (`explicitFeeSats`) rather than letting the
+       * builder derive it, because the rate that matters is the broadcaster's
+       * own live `/policy` rate, which the builder cannot see from a worker. The
+       * size estimate uses the conservative 149-byte signed input, so the fee is
+       * an upper bound on what the signed transaction needs — it can never come
+       * out one satoshi under the floor because a DER signature ran long.
+       */
+      const buildOpReturn = async (feeMultiplier: number) => {
+        const explicitFeeSats = Math.ceil(
+          estimateOpReturnTxSize(1) * effectiveFeeRate * feeMultiplier,
+        )
+        const built = await buildOpReturnTx({
+          wif,
+          inputs: [inputSpec],
+          opReturnScriptHex: scriptHex,
+          opReturnSats: opReturnOutputSats,
+          changeAddress: address,
+          explicitFeeSats,
+          // The builder folds any remainder below the change floor into the fee,
+          // so "no change output" and "uneconomic remainder" are the same case.
+          emitChange: true,
+          changeFloorSats: minConsolidatableDustSats,
+        })
+        const change = built.outputs.find(output => output.isChange) ?? null
+        return {
+          built,
+          change,
+          // Change large enough for a later write to acquire is pool inventory.
+          // Smaller (but still sweepable) change is dust, which consolidation
+          // collects and returns to reserve — keeping it out of the pool.
+          changeRole: change == null
+            ? null
+            : (change.satoshis >= minInputSatoshis ? 'pool' as const : 'dust' as const),
+        }
+      }
 
-      // Broadcast transaction via GorillaPool ARC (primary) → TAAL ARC (fallback)
       let normalHex = ''
       let changeOutput: { vout: number; satoshis: number; outputScript: string } | null = null
+      let changeRole: 'pool' | 'dust' | null = null
+      let acceptedOutcome: AcceptedOutcome | null = null
+      // Set when the broadcaster's txid disagrees with the transaction we built.
+      // The catch block must then quarantine the input rather than release it:
+      // the signed transaction may be on the network, so returning its input to
+      // the pool invites a second spend of it.
+      let txidMismatch = false
+      const prevoutSpecs = [{ lockingScript: scriptPubKey, satoshis: Number(acquiredUtxo.satoshis) }]
       try {
         const buildStartedAt = Date.now()
-        const builtTx = buildSignedTransaction(1)
-        normalHex = builtTx.serialized
-        changeOutput = builtTx.changeOutput
+        let prepared = await buildOpReturn(1)
         txBuildMs = Date.now() - buildStartedAt
+
         const broadcastStartedAt = Date.now()
-        let broadcastResult: { txid: string; acceptedVia: string; txStatus: string } | null = null
-        try {
-          broadcastResult = await this.broadcastTransaction(normalHex, prevoutsForArc, traceId)
-        } finally {
+        let outcome = await submitTransaction({
+          efBytes: prepared.built.efBytes,
+          rawHex: prepared.built.rawHex,
+          expectedTxid: prepared.built.txid,
+          callbackToken: getBroadcasterCallbackToken(),
+          allowLegacyFallback: true,
+        })
+
+        // 465 means the fee was under the current floor — the policy rate moved
+        // between the cached read and the submission. Rebuilding the SAME
+        // outpoint at a higher multiplier retries cheaply; acquiring a fresh
+        // UTXO instead would pay a second full transaction for the same reading.
+        if (outcome.kind === 'fee-too-low') {
+          console.warn(
+            `⚠️  Broadcaster rejected fee as too low (465) for trace=${traceId} at ` +
+              `${effectiveFeeRate.toFixed(3)} sat/byte; rebuilding the same input at ` +
+              `${BROADCAST_FEE_RETRY_MULTIPLIER}x and retrying once`,
+          )
+          const rebuildStartedAt = Date.now()
+          prepared = await buildOpReturn(BROADCAST_FEE_RETRY_MULTIPLIER)
+          txBuildMs += Date.now() - rebuildStartedAt
+          // The rebuild's submit time is the one that counts as broadcast time.
+          const retrySubmitStartedAt = Date.now()
+          outcome = await submitTransaction({
+            efBytes: prepared.built.efBytes,
+            rawHex: prepared.built.rawHex,
+            expectedTxid: prepared.built.txid,
+            callbackToken: getBroadcasterCallbackToken(),
+            allowLegacyFallback: true,
+          })
+          broadcastMs = Date.now() - retrySubmitStartedAt
+        } else {
           broadcastMs = Date.now() - broadcastStartedAt
         }
-        if (!broadcastResult) throw new Error('Broadcast result missing')
-        const { txid, acceptedVia: acceptedViaResult, txStatus } = broadcastResult
-        acceptedVia = acceptedViaResult
-        acceptedTxid = txid
-        acceptedTxStatus = txStatus
-        await upsertArcBroadcastStatus({
-          txid,
-          txStatus,
-          acceptedVia: acceptedViaResult,
-        })
+
+        normalHex = prepared.built.rawHex
+        actualFeeSats = prepared.built.feeSats
+        changeOutput = prepared.change
+          ? {
+              vout: prepared.change.vout,
+              satoshis: prepared.change.satoshis,
+              outputScript: prepared.change.outputScript,
+            }
+          : null
+        changeRole = prepared.changeRole
+
+        if (outcome.kind === 'terminal') {
+          if (outcome.doubleSpend) {
+            throw new Error(`DOUBLE_SPEND_ATTEMPTED: ${outcome.message}`)
+          }
+          // A 2xx response that carries no verdict about these bytes means the
+          // host acknowledged something else, so our transaction may still be
+          // propagating. That is the one case where the input must be
+          // quarantined rather than released — releasing it invites a second
+          // spend of an outpoint that may already be spent.
+          if (terminalOutcomeLeavesStateUnknown(outcome)) {
+            txidMismatch = true
+            throw new Error(`TXID_MISMATCH: ${outcome.message}`)
+          }
+          throw new Error(
+            `TERMINAL_BROADCAST_ERROR: broadcaster rejected the transaction` +
+              `${outcome.code != null ? ` (code ${outcome.code})` : ''}` +
+              `${outcome.txStatus ? ` [${outcome.txStatus}]` : ''} from ${outcome.host}: ${outcome.message}`,
+          )
+        }
+
+        if (outcome.kind === 'non-final') {
+          // 476: the locktime has not passed yet. Nothing is wrong with the
+          // transaction; it becomes valid later, so the caller must retry.
+          throw new Error(
+            `ENDPOINT_BACKOFF: transaction not final yet (476 locktime) from ${outcome.host}: ${outcome.message}`,
+          )
+        }
+
+        if (outcome.kind === 'fee-too-low') {
+          // Already retried once at a higher multiplier above.
+          throw new Error(
+            `FEE_TOO_LOW: broadcaster rejected the rebuilt transaction as under-paying ` +
+              `(${outcome.code}) at ${effectiveFeeRate.toFixed(3)} sat/byte: ${outcome.message}`,
+          )
+        }
+
+        if (outcome.kind === 'pending-retry') {
+          // Nothing was learned about the transaction: the host asked us to come
+          // back later. Retryable, and the input is still unspent.
+          throw new Error(
+            `ENDPOINT_BACKOFF: ${outcome.reason} (retry in ${Math.round(outcome.retryAfterMs / 1000)}s)`,
+          )
+        }
+
+        if (outcome.kind === 'transport') {
+          throw new Error(`BROADCAST_ENDPOINT_UNAVAILABLE: ${outcome.reason}`)
+        }
+
+        // accepted — either the Broadcaster itself or a degraded relay fallback.
+        if (outcome.txid.toLowerCase() !== prepared.built.txid.toLowerCase()) {
+          txidMismatch = true
+          console.error(
+            `❌ Txid mismatch for trace=${traceId}: accepted=${outcome.txid.substring(0, 16)}... ` +
+              `local=${prepared.built.txid.substring(0, 16)}... (via ${outcome.host}); rejecting broadcast`,
+          )
+          throw new Error(
+            `TXID_MISMATCH: broadcaster returned ${outcome.txid.slice(0, 16)}... but the signed ` +
+              `transaction hashes to ${prepared.built.txid.slice(0, 16)}...`,
+          )
+        }
+
+        acceptedOutcome = outcome
+        acceptedVia = outcome.degraded
+          ? (outcome.legacyProvider ?? 'legacy_relay')
+          : 'bsv_broadcaster'
+        acceptedTxid = outcome.txid
+        // The provider is what decides how DOUBLE_SPEND_ATTEMPTED classifies: a
+        // broadcaster rejection is final, an ARC report is not. `AcceptedOutcome`
+        // carries the split as `degraded`/`legacyProvider`, so the classifier's
+        // provider is derived from those rather than read from a field.
+        acceptedTxStatus = outcome.txStatus
+        acceptedPhase = classifyArcTxStatus(
+          outcome.txStatus,
+          arcStatusProviderForAcceptance(outcome),
+        )
       } catch (innerErr) {
-        if (inventoryBacked) {
+        if (txidMismatch && inventoryBacked) {
+          // Unknown network state: quarantine so the input cannot be acquired
+          // and spent again. The local txid is the true id of the transaction
+          // that was built and submitted.
+          const localTxid = computeTxidFromHex(normalHex) || acceptedTxid || ''
+          await this.quarantineSpentOutpoint({
+            topic: acquiredUtxo.topic,
+            txid: acquiredUtxo.txid,
+            vout: acquiredUtxo.vout,
+            spendingTxid: localTxid,
+          })
+        } else if (inventoryBacked) {
           // Cooldown so a UTXO whose broadcast just failed (commonly ARC 460
           // "parent transaction not found" in chain-of-unconfirmed conditions)
           // is not instantly re-acquired by the next worker and rejected for
@@ -1291,27 +1592,96 @@ export class BlockchainService {
 
       const txid = acceptedTxid!
 
-      if (inventoryBacked) {
-        try {
-          await consumeAndAdmitChange({
-            topic: acquiredUtxo.topic,
-            walletIndex: walletIndexForLog,
-            spentTxid: acquiredUtxo.txid,
-            spentVout: acquiredUtxo.vout,
-            spendingTxid: txid,
-            rawTx: normalHex,
-            phase: classifyArcTxStatus(acceptedTxStatus),
-            change: changeOutput ? {
-              vout: changeOutput.vout,
-              satoshis: changeOutput.satoshis,
-              outputScript: changeOutput.outputScript,
-              confirmed: false,
-              utxoRole: 'pool',
-            } : null,
+      // Persist the acceptance. Runs outside the broadcast try/catch on purpose:
+      // this is a bookkeeping write about a transaction the network has already
+      // accepted, and letting it run inside the block meant a failure here
+      // released the spent input back to the pool — an accepted transaction
+      // whose input was offered up for a second spend.
+      //
+      // `recordBroadcasterAcceptance` writes the fields the SSE subscriber and
+      // the reconciler depend on: `accepted_endpoint`, `provider`,
+      // `callback_token`, `merkle_path` and the block it commits to. It sets
+      // `provider: 'broadcaster'`, so the reconciler queries the right host for
+      // this txid instead of an ARC endpoint that has never heard of it.
+      try {
+        if (acceptedOutcome) {
+          await recordBroadcasterAcceptance(acceptedOutcome)
+        } else {
+          // Defensive: an acceptance with no outcome should not be reachable.
+          await upsertArcBroadcastStatus({
+            txid,
+            txStatus: acceptedTxStatus,
+            acceptedVia: acceptedVia!,
           })
-        } catch (inventoryErr) {
-          const inventoryMsg = inventoryErr instanceof Error ? inventoryErr.message : String(inventoryErr)
-          console.error(`❌ Inventory consume/admit failed for ${txid.substring(0, 12)}...: ${inventoryMsg}`)
+        }
+      } catch (statusErr) {
+        console.warn(
+          `⚠️  Could not persist broadcast status for ${txid.substring(0, 12)}...: ` +
+            `${statusErr instanceof Error ? statusErr.message : String(statusErr)}. ` +
+            `Broadcast succeeded; the status poller will pick this txid up from tx_log.`,
+        )
+      }
+
+      if (inventoryBacked) {
+        // Spend the input and admit the change. This must succeed: the
+        // transaction is already on the network and has paid for the input, so
+        // a failure here means the overlay still believes the input is
+        // available.
+        //
+        // The previous behaviour logged and continued, which left the spent
+        // outpoint in `removed = false, locked = <this worker>`. Once the lock
+        // aged past reapStaleLocks' 15 minutes, the reaper freed it and the
+        // next write happily acquired and re-spent a UTXO that was already
+        // spent — a guaranteed txn-mempool-conflict, and a change output that
+        // was never recorded at all.
+        //
+        // One immediate retry covers a transient connection loss during the
+        // commit. If it still fails, fall back to a direct, minimal UPDATE that
+        // marks the outpoint spent. That needs no change row and no topic
+        // counter, so it is far more likely to succeed than the full call, and
+        // it removes the row from the reaper's reach permanently.
+        const admitArgs = {
+          topic: acquiredUtxo.topic,
+          walletIndex: walletIndexForLog,
+          spentTxid: acquiredUtxo.txid,
+          spentVout: acquiredUtxo.vout,
+          spendingTxid: txid,
+          rawTx: normalHex,
+          phase: acceptedPhase,
+          change: changeOutput ? {
+            vout: changeOutput.vout,
+            satoshis: changeOutput.satoshis,
+            outputScript: changeOutput.outputScript,
+            confirmed: false,
+            // `dust` keeps sub-floor change out of the pool (no acquisition will
+            // ever take it) while making it visible to the consolidation sweep,
+            // which returns it to `reserve`. `pool` is only for change a later
+            // write can actually acquire.
+            utxoRole: changeRole ?? ('pool' as const),
+          } : null,
+        }
+        try {
+          await consumeAndAdmitChange(admitArgs)
+        } catch (firstErr) {
+          const firstMsg = firstErr instanceof Error ? firstErr.message : String(firstErr)
+          console.warn(
+            `⚠️  Inventory consume/admit failed for ${txid.substring(0, 12)}... (${firstMsg}); retrying once`,
+          )
+          try {
+            await consumeAndAdmitChange(admitArgs)
+          } catch (retryErr) {
+            const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+            console.error(
+              `❌ Inventory consume/admit failed twice for ${txid.substring(0, 12)}...: ${retryMsg}. ` +
+                `Quarantining spent outpoint ${acquiredUtxo.txid}:${acquiredUtxo.vout} so it cannot be re-spent.`,
+            )
+            await this.quarantineSpentOutpoint({
+              topic: acquiredUtxo.topic,
+              txid: acquiredUtxo.txid,
+              vout: acquiredUtxo.vout,
+              spendingTxid: txid,
+            })
+          }
         }
       } else {
         void this.notifyEmergencyUtxoManager({
@@ -1364,7 +1734,7 @@ export class BlockchainService {
               txid,
               rawTx: normalHex,
               acceptedVia,
-              prevouts: prevoutsForArc,
+              prevouts: prevoutSpecs,
               broadcastedAt: new Date().toISOString(),
             },
           }).catch((submitErr) => {
@@ -1419,11 +1789,21 @@ export class BlockchainService {
           await upsertTxLog({
             txid,
             type: data.stream,
-            provider: (data as any)?.payload?.source || 'unknown',
+            // The resolved provider label, not the raw payload source. The
+            // previous form wrote `payload.source || 'unknown'`, which is
+            // 'unknown' for every family whose collector does not stamp a
+            // `source` into the payload — including all thirteen that do not
+            // go through the legacy four. providerValue is already derived
+            // earlier in this method from providerId + datasetId + payload.
+            provider: providerValue,
             collected_at: new Date(data.timestamp),
             status: 'pending',
             onchain_at: new Date(),
-            fee_sats: null,
+            // actualFee is measured from the signed transaction in
+            // buildSignedTransaction (input sats minus output sats). It was
+            // computed and then discarded, so tx_log.fee_sats was always null
+            // and the fee actually paid was unrecoverable after the fact.
+            fee_sats: actualFeeSats ?? null,
             wallet_index: walletIndexForLog,
             retries: 0,
             error: null,
@@ -1472,7 +1852,11 @@ export class BlockchainService {
         txid: acceptedTxid,
         error: msg,
       })
-      const transient = /already reserved|No UTXOs available across wallets|No inventory UTXOs available across wallets|No emergency spendable UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF/i.test(msg)
+      // Retryable conditions: the transaction was never judged invalid, the
+      // network or the wallet just could not serve it this time. A terminal
+      // rejection is deliberately absent — that one is worth a full log line and
+      // a `failed` tx_log row, because it will never be mined as built.
+      const transient = /already reserved|No UTXOs available across wallets|No inventory UTXOs available across wallets|No emergency spendable UTXOs available across wallets|No reservable UTXO|MEMPOOL_CHAIN_LIMIT|txn-mempool-conflict|DOUBLE_SPEND|HEAP_PRESSURE_BACKOFF|ENDPOINT_BACKOFF|BROADCASTER_BACKPRESSURE|FEE_TOO_LOW|BROADCAST_ENDPOINT_UNAVAILABLE|BROADCAST_RATE_LIMITED/i.test(msg)
       const failedProviderValue = (data as any)?.payload?.source || 'unknown'
       const failedProviderId = (data as any)?.providerId || (data as any)?.payload?.provider_id || resolveProviderIdFromSource(failedProviderValue) || undefined
       const failedDatasetId = (data as any)?.datasetId || (data as any)?.payload?.dataset_id || undefined
@@ -1503,8 +1887,12 @@ export class BlockchainService {
       } else if (/txn-mempool-conflict|DOUBLE_SPEND/i.test(msg)) {
         // One-liner instead of full stack trace — this is recoverable
         console.warn(`⚠️  UTXO conflict (will retry with fresh UTXO): ${msg.split('\n')[0].substring(0, 120)}`)
+      } else if (isEndpointBackoffError(error)) {
+        console.warn(`⏳ Broadcaster asked for a delay; the UTXO is held for retry: ${msg.split('\n')[0].substring(0, 160)}`)
+      } else if (isFeeTooLowBroadcastError(error)) {
+        console.warn(`⚠️  Fee under policy after a rebuild at a higher multiplier: ${msg.split('\n')[0].substring(0, 160)}`)
       }
-      
+
       // Log failed transaction
       if (!transient) {
         const failedLog: TransactionLog = {
@@ -1886,6 +2274,72 @@ export class BlockchainService {
   }
 
   /**
+   * Mark a spent outpoint as removed in the overlay inventory, without touching
+   * its change output or topic counters.
+   *
+   * Last-resort path after {@link consumeAndAdmitChange} has failed twice. The
+   * transaction is already on the network, so the outpoint is spent whether the
+   * overlay knows it or not. Leaving the row in place means `reapStaleLocks`
+   * eventually clears its lock and the pool offers it again — a UTXO that is
+   * provably gone, which produces `txn-mempool-conflict` on every retry.
+   *
+   * Deliberately minimal: one UPDATE on one row plus the topic counter, no
+   * change row, no joins. Marking the row removed is the part of the full
+   * admission that must not be lost, and the part least likely to fail under
+   * the conditions that caused the original failure.
+   *
+   * Failure here is logged, not thrown. The broadcast already succeeded; the
+   * caller's contract is that the transaction is on-chain, and turning an
+   * inventory-bookkeeping failure into a failed write would only cause a
+   * duplicate broadcast of a transaction that has already been paid for.
+   */
+  private async quarantineSpentOutpoint(input: {
+    topic: string
+    txid: string
+    vout: number
+    spendingTxid: string
+  }): Promise<boolean> {
+    try {
+      const { withOverlayTransaction, refreshTopicCounts } = await import('./overlay-repository')
+      await withOverlayTransaction(async (client) => {
+        await client.query(`SET LOCAL statement_timeout = 15000`)
+        const res = await client.query(
+          `UPDATE overlay_admitted_utxos
+              SET removed = true,
+                  spending_txid = $4,
+                  removed_at = now(),
+                  locked = false,
+                  locked_by = NULL,
+                  locked_at = NULL
+            WHERE topic = $1
+              AND txid = $2
+              AND vout = $3
+              AND removed = false`,
+          [input.topic, input.txid, input.vout, input.spendingTxid],
+        )
+        // Keep overlay_topic_counts consistent with the row we just removed.
+        // Gated on rowCount so a row already removed by a partially-successful
+        // admission attempt is not double-counted.
+        if ((res.rowCount || 0) > 0) {
+          await refreshTopicCounts(client, input.topic, -1)
+        }
+      })
+      console.warn(
+        `🛡️  Quarantined spent outpoint ${input.txid}:${input.vout} (spent by ${input.spendingTxid.substring(0, 12)}...) — ` +
+          `it can no longer be re-acquired by the pool.`,
+      )
+      return true
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      console.error(
+        `❌ Quarantine of spent outpoint ${input.txid}:${input.vout} failed: ${msg}. ` +
+          `This outpoint is spent and remains acquirable — manual reconciliation required.`,
+      )
+      return false
+    }
+  }
+
+  /**
    * Force refresh all UTXO caches for all configured wallets
    * Useful when UTXOs are not being detected despite having balances
    */
@@ -1952,402 +2406,82 @@ export class BlockchainService {
     console.log('✅ UTXO cache refresh complete')
   }
 
-  // ARC txStatus values that indicate the TX was genuinely accepted for our purposes.
-  // SEEN_IN_ORPHAN_MEMPOOL means this broadcaster stored the exact transaction. The input
-  // stays locked and change stays unspendable. Returning null here would fail the broadcast,
-  // release the input, and let a later write sign a different transaction against a spend
-  // that may still be mined. BSV_ARC_ACCEPT_ORPHAN_MEMPOOL no longer changes that.
-  private static ARC_OK_STATUSES = new Set([
-    'SEEN_ON_NETWORK',
-    'MINED',
-    'ACCEPTED',
-    'STORED',
-    'RECEIVED',
-    'REQUESTED_BY_NETWORK',
-    'SENT_TO_NETWORK',
-    'ANNOUNCED_TO_NETWORK',
-  ])
-
-  // ARC txStatus values that mean the TX was rejected (should NOT be treated as success)
-  private static ARC_REJECT_STATUSES = new Set([
-    'DOUBLE_SPEND_ATTEMPTED',
-    'REJECTED',
-    'INVALID',
-    'MALFORMED',
-    'EVICTED',
-  ])
-
   /**
-   * Parse an ARC response and return the txid + txStatus ONLY if the TX was genuinely accepted.
-   * ARC returns HTTP 200 + a valid txid even for DOUBLE_SPEND_ATTEMPTED — we must
-   * inspect the txStatus field to avoid logging a rejected TX as "successful".
+   * Send value to one or more addresses from a wallet this service controls.
+   *
+   * A thin wrapper over `buildPaymentTx` + `submitTransaction` so no caller
+   * needs to know which network path is current. Change returns to the signing
+   * wallet and is subject to the same dust floor as the write path: a remainder
+   * too small for consolidation pays the fee rather than becoming an output
+   * nothing will ever spend.
    */
-  private parseArcResponse(
-    responseText: string,
-    providerLabel: string,
-  ): { txid: string; txStatus: string } | null {
-    try {
-      const parsed = JSON.parse(responseText || '{}')
-      const txid = typeof parsed.txid === 'string' && /^[0-9a-fA-F]{64}$/.test(parsed.txid)
-        ? parsed.txid : null
-      const status = typeof parsed.txStatus === 'string' ? parsed.txStatus : ''
+  private async sendPayment(input: {
+    wif: string
+    fromAddress: string
+    outputs: Array<{ address: string; satoshis: number }>
+    utxos: Array<{ txid: string; vout: number; satoshis: number; lockingScriptHex: string }>
+  }): Promise<{ txid: string; acceptedVia: string; txStatus: string }> {
+    const effectiveFeeRate = await resolveFeeRateForBuild()
 
-      // Reject if ARC explicitly flagged as failed
-      if (txid && BlockchainService.ARC_REJECT_STATUSES.has(status)) {
-        const competing = Array.isArray(parsed.competingTxs) ? ` (competing: ${parsed.competingTxs[0]?.substring(0, 12)}...)` : ''
-        console.warn(`⚠️  ARC (${providerLabel}): TX rejected — txStatus=${status}${competing} txid=${txid.substring(0, 12)}...`)
-        return null
+    // One recipient output plus change, with a worst-case signed input each.
+    const estimatedBytes = 10 + input.utxos.length * 149 + (input.outputs.length + 1) * 34
+
+    const built = await buildPaymentTx({
+      wif: input.wif,
+      inputs: input.utxos.map(utxo => ({
+        txid: utxo.txid,
+        vout: utxo.vout,
+        satoshis: utxo.satoshis,
+        lockingScriptHex: utxo.lockingScriptHex,
+      })),
+      outputs: input.outputs,
+      changeAddress: input.fromAddress,
+      explicitFeeSats: Math.ceil(estimatedBytes * effectiveFeeRate),
+      // Same three-inputs-worth-of-fee floor the write path uses, so a payment
+      // cannot leave behind change that only consolidation could ever collect.
+      changeFloorSats: Math.ceil(149 * effectiveFeeRate * 3),
+    })
+
+    const outcome = await submitTransaction({
+      efBytes: built.efBytes,
+      rawHex: built.rawHex,
+      expectedTxid: built.txid,
+      callbackToken: getBroadcasterCallbackToken(),
+      allowLegacyFallback: true,
+    })
+
+    if (outcome.kind === 'accepted') {
+      await recordBroadcasterAcceptance(outcome)
+      return {
+        txid: outcome.txid,
+        acceptedVia: outcome.degraded ? (outcome.legacyProvider ?? 'legacy_relay') : 'bsv_broadcaster',
+        txStatus: outcome.txStatus,
       }
+    }
 
-      // Orphan mempool: this broadcaster stored the transaction. Stop here. The same raw
-      // hex on the next broadcaster is not a second spend, but a null result fails the
-      // broadcast and releases the input for a different one.
-      if (txid && status === 'SEEN_IN_ORPHAN_MEMPOOL') {
-        if (bsvConfig.logging.level !== 'error') {
-          console.warn(
-            `⚠️  ARC (${providerLabel}): txStatus=SEEN_IN_ORPHAN_MEMPOOL — holding txid=${txid.substring(0, 12)}... ` +
-              `(input stays locked; change stays unspendable until the network sees the parent)`,
-          )
-        }
-        return { txid, txStatus: status }
-      }
-
-      // Accept if status is known-good or if no status field was returned (legacy ARC)
-      if (txid && (BlockchainService.ARC_OK_STATUSES.has(status) || !status)) {
-        if (bsvConfig.logging.level === 'debug') {
-          console.log(`📡 ARC (${providerLabel}): txStatus=${status || 'N/A'} txid=${txid.substring(0, 12)}...`)
-        }
-        return { txid, txStatus: status }
-      }
-
-      // Unknown status with a txid — log but accept cautiously
-      if (txid) {
-        console.warn(`⚠️  ARC (${providerLabel}): Unknown txStatus="${status}" — accepting txid=${txid.substring(0, 12)}... cautiously`)
-        return { txid, txStatus: status }
-      }
-    } catch {}
-
-    // Fallback: some ARC deployments return plain string txid (no JSON)
-    const plain = (responseText || '').replace(/"/g, '').trim()
-    if (/^[0-9a-fA-F]{64}$/.test(plain)) return { txid: plain, txStatus: '' }
-    return null
+    if (outcome.kind === 'terminal') {
+      const competing = outcome.doubleSpend ? 'DOUBLE_SPEND_ATTEMPTED: ' : ''
+      const code = outcome.code != null ? ' (code ' + String(outcome.code) + ')' : ''
+      throw new Error('TERMINAL_BROADCAST_ERROR: ' + competing + outcome.message + code)
+    }
+    if (outcome.kind === 'fee-too-low') {
+      throw new Error('FEE_TOO_LOW: ' + outcome.message)
+    }
+    if (outcome.kind === 'non-final') {
+      throw new Error('ENDPOINT_BACKOFF: transaction not final yet (476): ' + outcome.message)
+    }
+    if (outcome.kind === 'pending-retry') {
+      throw new Error('ENDPOINT_BACKOFF: ' + outcome.reason)
+    }
+    throw new Error('BROADCAST_ENDPOINT_UNAVAILABLE: ' + outcome.reason)
   }
 
-  private async broadcastTransaction(
-    serializedTx: string,
-    prevouts?: Array<{ lockingScript: string; satoshis: number }>,
-    traceId?: string
-  ): Promise<{ txid: string; acceptedVia: string; txStatus: string }> {
-    const errors: string[] = []
-
-    // Build ARC request bodies:
-    // - extended format includes prevouts for stricter validation
-    // - raw-only body is a compatibility fallback (some ARC gateways reject extended metadata)
-    const arcBodyRaw: any = { rawTx: serializedTx }
-    const useExtended = !!(prevouts && prevouts.length > 0 && (process.env.BSV_ARC_EXTENDED_FORMAT !== 'false'))
-    const arcBodyExtended: any = { rawTx: serializedTx }
-    if (useExtended) {
-      try {
-        arcBodyExtended.inputs = prevouts!.map(p => ({
-          lockingScript: p.lockingScript,
-          satoshis: Math.max(0, Number(p.satoshis) || 0),
-        }))
-      } catch {}
-    }
-
-    // Method 1: TAAL ARC (primary) — requires BSV_ARC_API_KEY (TAAL platform.taal.com).
-    // Promoted ahead of GorillaPool because GorillaPool's outbound peer relay was observed to
-    // silently fail to propagate TXs past its own mempool (TXs sit at ANNOUNCED_TO_NETWORK
-    // indefinitely while WoC/Bitails/TAAL all 404 the txid). TAAL is a miner-operated node and
-    // both relays to peers and submits to its own pool, giving us actual on-chain confirmations.
-    try {
-      if (this.isBroadcastChannelBackedOff('taal_arc')) {
-        errors.push('TAAL ARC skipped (ENDPOINT_BACKOFF)')
-        this.logBroadcastStep(traceId, 'taal_arc', 'skipped', 0, 'ENDPOINT_BACKOFF')
-      } else {
-      const taalStartedAt = Date.now()
-      this.logBroadcastStep(traceId, 'taal_arc', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
-      const arcKey = process.env.BSV_ARC_API_KEY
-      const taalHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
-      if (arcKey) taalHeaders['Authorization'] = `Bearer ${arcKey}`
-
-      const arcRes = await this.fetchWithTimeout(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
-        method: 'POST',
-        headers: taalHeaders,
-        body: JSON.stringify(useExtended ? arcBodyExtended : arcBodyRaw)
-      })
-      const arcText = await arcRes.text().catch(() => '')
-      if (arcRes.ok) {
-        const parsed = this.parseArcResponse(arcText, 'TAAL')
-        if (parsed) {
-          this.logBroadcastStep(traceId, 'taal_arc', 'accepted', Date.now() - taalStartedAt, `txid=${this.shortenToken(parsed.txid, 12)}`)
-          this.clearBroadcastChannelBackoff('taal_arc')
-          return { txid: parsed.txid, acceptedVia: 'taal_arc', txStatus: parsed.txStatus }
-        }
-        this.logBroadcastStep(traceId, 'taal_arc', 'rejected', Date.now() - taalStartedAt, 'ok-without-accepted-txid')
-        errors.push(`TAAL ARC: rejected or unexpected response: ${arcText.substring(0, 200)}`)
-      } else {
-        this.logBroadcastStep(traceId, 'taal_arc', `http_${arcRes.status}`, Date.now() - taalStartedAt)
-        if (bsvConfig.logging.level !== 'error') {
-          console.warn(`⚠️  ARC (TAAL) ${arcRes.status}: ${arcText.substring(0, 150)}`)
-        }
-        if (arcRes.status === 429) {
-          this.noteBroadcastChannelBackoff('taal_arc', 60000, 'HTTP 429')
-        } else if (arcRes.status >= 500) {
-          this.noteBroadcastChannelBackoff('taal_arc', 30000, `HTTP ${arcRes.status}`)
-        }
-        const taal461 = arcRes.status === 461 || /malformed|false\/empty top stack/i.test(arcText)
-        const taal460 =
-          arcRes.status === 460 ||
-          /parent transaction not found|fee requires|Not extended format|Missing input scripts|Failed validity with parents/i.test(arcText)
-        const taalCompatRetry = useExtended && (taal461 || taal460)
-        if (taalCompatRetry) {
-          try {
-            const taalCompatStartedAt = Date.now()
-            this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
-            const taalCompatRes = await this.fetchWithTimeout(`${TAAL_ARC_ENDPOINT}/v1/tx`, {
-              method: 'POST',
-              headers: taalHeaders,
-              body: JSON.stringify(arcBodyRaw),
-            })
-            const taalCompatText = await taalCompatRes.text().catch(() => '')
-            if (taalCompatRes.ok) {
-              const parsed = this.parseArcResponse(taalCompatText, 'TAAL')
-              if (parsed) {
-                this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'accepted', Date.now() - taalCompatStartedAt, `txid=${this.shortenToken(parsed.txid, 12)}`)
-                if (bsvConfig.logging.level !== 'error') {
-                  console.warn('⚠️  ARC (TAAL): accepted after rawTx compatibility retry (460/461)')
-                }
-                this.clearBroadcastChannelBackoff('taal_arc')
-                return { txid: parsed.txid, acceptedVia: 'taal_arc', txStatus: parsed.txStatus }
-              }
-              this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'rejected', Date.now() - taalCompatStartedAt, 'ok-without-accepted-txid')
-              errors.push(`TAAL ARC compatibility retry: unexpected response: ${taalCompatText.substring(0, 200)}`)
-            } else {
-              this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', `http_${taalCompatRes.status}`, Date.now() - taalCompatStartedAt)
-              if (bsvConfig.logging.level !== 'error') {
-                console.warn(`⚠️  ARC (TAAL compat) ${taalCompatRes.status}: ${taalCompatText.substring(0, 150)}`)
-              }
-              if (taalCompatRes.status === 429) {
-                this.noteBroadcastChannelBackoff('taal_arc', 60000, 'HTTP 429')
-              } else if (taalCompatRes.status >= 500) {
-                this.noteBroadcastChannelBackoff('taal_arc', 30000, `HTTP ${taalCompatRes.status}`)
-              }
-              errors.push(`TAAL ARC compatibility retry failed (${taalCompatRes.status}): ${taalCompatText.substring(0, 300)}`)
-            }
-          } catch (compatErr) {
-            this.logBroadcastStep(traceId, 'taal_arc_rawtx_retry', 'error', undefined, compatErr instanceof Error ? compatErr.message : String(compatErr))
-            this.noteBroadcastChannelBackoff('taal_arc', 30000, compatErr instanceof Error ? compatErr.message : String(compatErr))
-            errors.push(`TAAL ARC compatibility retry error: ${compatErr instanceof Error ? compatErr.message : String(compatErr)}`)
-          }
-        } else {
-          errors.push(`TAAL ARC failed (${arcRes.status}): ${arcText.substring(0, 300)}`)
-        }
-      }
-      }
-    } catch (e) {
-      this.logBroadcastStep(traceId, 'taal_arc', 'error', undefined, e instanceof Error ? e.message : String(e))
-      this.noteBroadcastChannelBackoff('taal_arc', 30000, e instanceof Error ? e.message : String(e))
-      errors.push(`TAAL ARC error: ${e instanceof Error ? e.message : String(e)}`)
-    }
-
-    // Method 2: GorillaPool ARC (fallback) — public access, no API key required.
-    // Kept in the chain as a safety net for environments without BSV_ARC_API_KEY and to absorb
-    // bursts when TAAL is rate-limiting (HTTP 429). Note: GorillaPool may report
-    // ANNOUNCED_TO_NETWORK without actually relaying to peers — confirmation polling will
-    // detect the staleness and trigger a re-broadcast through TAAL on the next pass.
-    try {
-      if (this.isBroadcastChannelBackedOff('gorillapool_arc')) {
-        errors.push('GorillaPool ARC skipped (ENDPOINT_BACKOFF)')
-        this.logBroadcastStep(traceId, 'gorillapool_arc', 'skipped', 0, 'ENDPOINT_BACKOFF')
-      } else {
-      const gpStartedAt = Date.now()
-      this.logBroadcastStep(traceId, 'gorillapool_arc', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
-      const gpHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
-      const gpApiKey = process.env.BSV_GORILLAPOOL_API_KEY
-      if (gpApiKey) gpHeaders['Authorization'] = `Bearer ${gpApiKey}`
-
-      const gpRes = await this.fetchWithTimeout(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
-        method: 'POST',
-        headers: gpHeaders,
-        body: JSON.stringify(useExtended ? arcBodyExtended : arcBodyRaw)
-      })
-      const gpText = await gpRes.text().catch(() => '')
-      if (gpRes.ok) {
-        const parsed = this.parseArcResponse(gpText, 'GorillaPool')
-        if (parsed) {
-          this.logBroadcastStep(traceId, 'gorillapool_arc', 'accepted', Date.now() - gpStartedAt, `txid=${this.shortenToken(parsed.txid, 12)}`)
-          this.clearBroadcastChannelBackoff('gorillapool_arc')
-          return { txid: parsed.txid, acceptedVia: 'gorillapool_arc', txStatus: parsed.txStatus }
-        }
-        this.logBroadcastStep(traceId, 'gorillapool_arc', 'rejected', Date.now() - gpStartedAt, 'ok-without-accepted-txid')
-        errors.push(`GorillaPool ARC: rejected or unexpected response: ${gpText.substring(0, 200)}`)
-      } else {
-        if (bsvConfig.logging.level !== 'error') {
-          console.warn(`⚠️  ARC (GorillaPool) ${gpRes.status}: ${gpText.substring(0, 150)}`)
-        }
-        if (gpRes.status === 429) {
-          this.noteBroadcastChannelBackoff('gorillapool_arc', 60000, 'HTTP 429')
-        } else if (gpRes.status >= 500) {
-          this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, `HTTP ${gpRes.status}`)
-        }
-        // GorillaPool sometimes rejects extended-format metadata with 461, or returns 460 when parents
-        // are not visible to ARC. Retry once with rawTx-only before failing over to WoC.
-        const gp461 = gpRes.status === 461 || /malformed|false\/empty top stack/i.test(gpText)
-        const gp460 =
-          gpRes.status === 460 ||
-          /parent transaction not found|fee requires|Not extended format|Missing input scripts|Failed validity with parents/i.test(gpText)
-        const gpCompatRetry = useExtended && (gp461 || gp460)
-        this.logBroadcastStep(traceId, 'gorillapool_arc', `http_${gpRes.status}`, Date.now() - gpStartedAt, gpCompatRetry ? 'compat-retry' : undefined)
-        if (gpCompatRetry) {
-          try {
-            const gpCompatStartedAt = Date.now()
-            this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
-            const gpCompatRes = await this.fetchWithTimeout(`${GORILLAPOOL_ARC_ENDPOINT}/v1/tx`, {
-              method: 'POST',
-              headers: gpHeaders,
-              body: JSON.stringify(arcBodyRaw)
-            })
-            const gpCompatText = await gpCompatRes.text().catch(() => '')
-            if (gpCompatRes.ok) {
-              const parsed = this.parseArcResponse(gpCompatText, 'GorillaPool')
-              if (parsed) {
-                this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'accepted', Date.now() - gpCompatStartedAt, `txid=${this.shortenToken(parsed.txid, 12)}`)
-                if (bsvConfig.logging.level !== 'error') {
-                  console.warn('⚠️  ARC (GorillaPool): accepted after rawTx compatibility retry (460/461 / extended mismatch)')
-                }
-                this.clearBroadcastChannelBackoff('gorillapool_arc')
-                return { txid: parsed.txid, acceptedVia: 'gorillapool_arc', txStatus: parsed.txStatus }
-              }
-              this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'rejected', Date.now() - gpCompatStartedAt, 'ok-without-accepted-txid')
-              errors.push(`GorillaPool ARC compatibility retry: unexpected response: ${gpCompatText.substring(0, 200)}`)
-            } else {
-              this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', `http_${gpCompatRes.status}`, Date.now() - gpCompatStartedAt)
-              if (bsvConfig.logging.level !== 'error') {
-                console.warn(`⚠️  ARC (GorillaPool compat) ${gpCompatRes.status}: ${gpCompatText.substring(0, 150)}`)
-              }
-              if (gpCompatRes.status === 429) {
-                this.noteBroadcastChannelBackoff('gorillapool_arc', 60000, 'HTTP 429')
-              } else if (gpCompatRes.status >= 500) {
-                this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, `HTTP ${gpCompatRes.status}`)
-              }
-              errors.push(`GorillaPool ARC compatibility retry failed (${gpCompatRes.status}): ${gpCompatText.substring(0, 300)}`)
-            }
-          } catch (compatErr) {
-            this.logBroadcastStep(traceId, 'gorillapool_arc_rawtx_retry', 'error', undefined, compatErr instanceof Error ? compatErr.message : String(compatErr))
-            this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, compatErr instanceof Error ? compatErr.message : String(compatErr))
-            errors.push(`GorillaPool ARC compatibility retry error: ${compatErr instanceof Error ? compatErr.message : String(compatErr)}`)
-          }
-        } else {
-          errors.push(`GorillaPool ARC failed (${gpRes.status}): ${gpText.substring(0, 300)}`)
-        }
-      }
-      }
-    } catch (e) {
-      this.logBroadcastStep(traceId, 'gorillapool_arc', 'error', undefined, e instanceof Error ? e.message : String(e))
-      this.noteBroadcastChannelBackoff('gorillapool_arc', 30000, e instanceof Error ? e.message : String(e))
-      errors.push(`GorillaPool ARC error: ${e instanceof Error ? e.message : String(e)}`)
-    }
-
-    // Method 3: WhatsOnChain broadcast (final fallback)
-    // WoC broadcasts directly to miners and does NOT share ARC's
-    // double-spend conflict memory — this unblocks UTXOs that ARC
-    // incorrectly flags as DOUBLE_SPEND_ATTEMPTED due to stale conflicts.
-    try {
-      if (this.isBroadcastChannelBackedOff('whatsonchain')) {
-        errors.push('WoC broadcast skipped (ENDPOINT_BACKOFF)')
-        this.logBroadcastStep(traceId, 'whatsonchain', 'skipped', 0, 'ENDPOINT_BACKOFF')
-      } else {
-      const wocStartedAt = Date.now()
-      this.logBroadcastStep(traceId, 'whatsonchain', 'start', undefined, `timeout=${BROADCAST_FETCH_TIMEOUT_MS}ms`)
-      const wocNetwork = WOC_NETWORK
-      const wocHeaders = this.buildWhatsOnChainHeaders(true)
-
-      const wocRes = await this.fetchWithTimeout(`https://api.whatsonchain.com/v1/bsv/${wocNetwork}/tx/raw`, {
-        method: 'POST',
-        headers: wocHeaders,
-        body: JSON.stringify({ txhex: serializedTx })
-      })
-      const wocText = await wocRes.text().catch(() => '')
-      if (wocRes.ok) {
-        // WoC returns the txid as a plain string (with quotes)
-        const txid = wocText.replace(/"/g, '').trim()
-        if (/^[0-9a-fA-F]{64}$/.test(txid)) {
-          this.logBroadcastStep(traceId, 'whatsonchain', 'accepted', Date.now() - wocStartedAt, `txid=${this.shortenToken(txid, 12)}`)
-          console.log(`📡 WoC broadcast accepted: txid=${txid.substring(0, 12)}...`)
-          this.clearBroadcastChannelBackoff('whatsonchain')
-          return { txid, acceptedVia: 'whatsonchain', txStatus: '' }
-        }
-        this.logBroadcastStep(traceId, 'whatsonchain', 'rejected', Date.now() - wocStartedAt, 'ok-without-accepted-txid')
-        errors.push(`WoC returned unexpected response: ${wocText.substring(0, 200)}`)
-      } else {
-        this.logBroadcastStep(traceId, 'whatsonchain', `http_${wocRes.status}`, Date.now() - wocStartedAt)
-        if (bsvConfig.logging.level !== 'error') {
-          console.warn(`⚠️  WoC broadcast ${wocRes.status}: ${wocText.substring(0, 150)}`)
-        }
-        if (wocRes.status === 429) {
-          this.noteBroadcastChannelBackoff('whatsonchain', WHATSONCHAIN_API_KEY ? 60000 : 120000, 'HTTP 429')
-        } else if (wocRes.status >= 500) {
-          this.noteBroadcastChannelBackoff('whatsonchain', 30000, `HTTP ${wocRes.status}`)
-        }
-        errors.push(`WoC broadcast failed (${wocRes.status}): ${wocText.substring(0, 300)}`)
-      }
-      }
-    } catch (e) {
-      this.logBroadcastStep(traceId, 'whatsonchain', 'error', undefined, e instanceof Error ? e.message : String(e))
-      this.noteBroadcastChannelBackoff('whatsonchain', 30000, e instanceof Error ? e.message : String(e))
-      errors.push(`WoC broadcast error: ${e instanceof Error ? e.message : String(e)}`)
-    }
-
-    // If we reach here, all methods failed.
-    // Detect the specific "too-long-mempool-chain" transient condition — this resolves
-    // automatically once the next block is mined and parent TXs are confirmed.
-    const allErrors = errors.join('\n')
-    const isMempoolChain = allErrors.includes('too-long-mempool-chain')
-    if (isMempoolChain) {
-      console.warn(`⏳ Mempool chain too long — waiting for next block to shorten the unconfirmed ancestor chain. Will retry automatically.`)
-      throw new Error('MEMPOOL_CHAIN_LIMIT')
-    }
-    const isRateLimited = /429|TOO MANY REQUESTS|RATE LIMIT/i.test(allErrors)
-    if (isRateLimited) {
-      throw new Error(`BROADCAST_RATE_LIMITED\n${allErrors}`)
-    }
-    const isEndpointUnavailable = /BROADCAST_TIMEOUT|fetch failed|ENDPOINT_BACKOFF|ECONN|ENOTFOUND|ETIMEDOUT|TIMED OUT|NETWORK/i.test(allErrors)
-    if (isEndpointUnavailable) {
-      throw new Error(`BROADCAST_ENDPOINT_UNAVAILABLE\n${allErrors}`)
-    }
-    throw new Error(`All broadcast methods failed:\n${allErrors}`)
-  }
-
-  private async fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number = BROADCAST_FETCH_TIMEOUT_MS): Promise<Response> {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), timeoutMs)
-    try {
-      return await fetch(url, { ...init, signal: controller.signal })
-    } catch (error) {
-      if (controller.signal.aborted) {
-        throw new Error(`BROADCAST_TIMEOUT:${timeoutMs}`)
-      }
-      throw error
-    } finally {
-      clearTimeout(timeout)
-    }
-  }
-
-  private p2pkhLockingScriptHexFromWif(wif: string): string {
-    const key = SDKPrivateKey.fromWif(wif)
-    const pubKeyHash = Buffer.from(key.toPublicKey().toHash())
-    const opDup = '76'
-    const opHash160 = 'a9'
-    const push20 = '14'
-    const opEqualVerify = '88'
-    const opCheckSig = 'ac'
-    const hashHex = pubKeyHash.toString('hex')
-    return opDup + opHash160 + push20 + hashHex + opEqualVerify + opCheckSig
-  }
 
   async sendToAddress(toAddress: string, amountSats: number): Promise<string> {
     try {
+      if (!Number.isSafeInteger(amountSats) || amountSats < 1) {
+        throw new Error(`amountSats must be a positive integer number of satoshis (got ${amountSats})`)
+      }
       if (!BSV_PRIVATE_KEY && !BSV_FALLBACK_WIF) {
         throw new Error('No private key configured')
       }
@@ -2357,67 +2491,50 @@ export class BlockchainService {
       }
 
       const fromAddress = this.wallet.getAddress()
+      const wif = (this.wallet as any)['wif'] as string
       const utxos = await this.wallet.getUTXOs()
       if (!Array.isArray(utxos) || utxos.length === 0) {
         throw new Error('No UTXOs available')
       }
 
-      // Sort by value descending and pick as many as needed
+      const ownLockingScriptHex = p2pkhLockingScriptHexFromWifSdk(wif)
+      const effectiveFeeRate = await resolveFeeRateForBuild()
+
+      // Largest first, so the fewest inputs fund the payment. Grown one input at
+      // a time against the fee for that input count, because a larger input set
+      // costs more bytes and therefore more fee.
       const sorted = [...utxos].sort((a: any, b: any) => (b.value || 0) - (a.value || 0))
-      const scriptFromAddr = (bsv.Script as any).fromAddress
-        ? (bsv.Script as any).fromAddress(fromAddress).toHex()
-        : this.p2pkhLockingScriptHexFromWif((this.wallet as any)['wif'])
+      const estimateSendFee = (inputCount: number) =>
+        Math.ceil((10 + inputCount * 149 + 2 * 34) * effectiveFeeRate)
 
-      // Explicit-fee build (avoids bsv's pre-sign _estimateSize underestimate which would
-      // produce ~22 sat/kB actual rate vs our 102.5 sat/kB target).
-      // Size formula: BASE 12 + N inputs × 149 + 2 P2PKH outputs (recipient + change) × 34 = 88 + 149N
-      const SEND_BASE_BYTES = 12 // version + locktime + in-count + out-count varints
-      const SEND_INPUT_BYTES = 149 // signed P2PKH input
-      const SEND_P2PKH_OUTPUT_BYTES = 34 // value (8) + scriptLen (1) + P2PKH script (25)
-      const estimateSendBytes = (inputCount: number) => SEND_BASE_BYTES + inputCount * SEND_INPUT_BYTES + 2 * SEND_P2PKH_OUTPUT_BYTES
-      const selected: any[] = []
+      const selected: Array<{ txid: string; vout: number; satoshis: number; lockingScriptHex: string }> = []
       let totalInput = 0
-      // Iteratively grow input set until inputs cover amount + the explicit fee for that input count.
-      for (const u of sorted) {
+      for (const utxo of sorted) {
+        const satoshis = Number(utxo?.value ?? utxo?.satoshis ?? 0)
+        if (!Number.isFinite(satoshis) || satoshis < 1) continue
         selected.push({
-          txId: u.tx_hash,
-          outputIndex: u.tx_pos,
-          address: fromAddress,
-          script: scriptFromAddr,
-          satoshis: u.value,
+          txid: String(utxo?.tx_hash ?? utxo?.txid ?? ''),
+          vout: Number(utxo?.tx_pos ?? utxo?.vout ?? 0),
+          satoshis,
+          lockingScriptHex: String(utxo?.script || ownLockingScriptHex),
         })
-        totalInput += u.value
-        const explicitFeeForCount = Math.ceil(estimateSendBytes(selected.length) * FEE_RATE_SAT_PER_BYTE)
-        if (totalInput >= amountSats + explicitFeeForCount + DUST_LIMIT) break
-      }
-      const explicitFee = Math.ceil(estimateSendBytes(selected.length) * FEE_RATE_SAT_PER_BYTE)
-      if (totalInput < amountSats + explicitFee + DUST_LIMIT) {
-        throw new Error(`Insufficient UTXO value for requested amount + fee: input=${totalInput} need>=${amountSats + explicitFee + DUST_LIMIT}`)
+        totalInput += satoshis
+        if (totalInput >= amountSats + estimateSendFee(selected.length) + DUST_LIMIT) break
       }
 
-      const tx = new (bsv as any).Transaction()
-        .from(selected)
-        .to(toAddress, amountSats)
-        .fee(explicitFee)
-        .change(fromAddress)
+      const minimumRequired = amountSats + estimateSendFee(selected.length) + DUST_LIMIT
+      if (selected.length === 0 || totalInput < minimumRequired) {
+        throw new Error(
+          `Insufficient UTXO value for requested amount + fee: input=${totalInput} need>=${minimumRequired}`,
+        )
+      }
 
-      const signingKey = (bsv as any).PrivateKey.fromWIF((this.wallet as any)['wif'])
-      tx.sign(signingKey)
-
-      // Broadcast
-      const p2pkhScriptDefault = this.p2pkhLockingScriptHexFromWif((this.wallet as any)['wif'])
-      const prevoutsForArc = Array.isArray(selected) ? selected.map((u: any) => {
-        const sats = Number(u?.satoshis ?? u?.value ?? 0)
-        let scriptHex = ''
-        try {
-          const sc: any = u?.script
-          if (typeof sc === 'string') scriptHex = sc
-          else if (sc && typeof sc.toHex === 'function') scriptHex = sc.toHex()
-        } catch {}
-        if (!scriptHex) scriptHex = p2pkhScriptDefault
-        return { lockingScript: scriptHex, satoshis: sats }
-      }) : []
-      const { txid } = await this.broadcastTransaction(tx.serialize(), prevoutsForArc)
+      const { txid } = await this.sendPayment({
+        wif,
+        fromAddress,
+        outputs: [{ address: toAddress, satoshis: amountSats }],
+        utxos: selected,
+      })
       return txid
     } catch (error) {
       console.error('sendToAddress error:', error)

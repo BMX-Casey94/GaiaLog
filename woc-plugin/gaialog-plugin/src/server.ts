@@ -2,16 +2,37 @@ import express from 'express'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { dirname } from 'path'
+import { createHash } from 'crypto'
 import { promises as fs } from 'fs'
-import { renderErrorHtml, renderHtml, renderHomeHtml } from './render'
-import { parsePushes, validateGaiaLog } from './opreturn-validator'
-import { buildOpFalseOpReturnWithTag } from './opreturn'
+import { renderErrorHtml, renderHtml, renderHomeHtml } from './render.js'
+import { parsePushes, validateGaiaLog } from './opreturn-validator.js'
+import { buildOpFalseOpReturnWithTag } from './opreturn.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
 const PORT = Number(process.env.PORT || 8787)
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY
+
+/**
+ * Build WoC request headers for the configured API key. Modern keys are
+ * prefixed `mainnet_`/`testnet_` and must travel in Authorization; legacy keys
+ * use the `woc-api-key` header.
+ */
+export function buildWocHeaders(apiKey: string | undefined | null): Record<string, string> {
+	if (!apiKey) return {}
+	const key = String(apiKey).trim()
+	if (!key) return {}
+	if (key.startsWith('mainnet_') || key.startsWith('testnet_')) {
+		return { Authorization: key }
+	}
+	return { 'woc-api-key': key }
+}
+
+/** Cache key: full SHA-256 of the script hex, never a truncated prefix. */
+export function hexCacheKey(scriptHex: string): string {
+	return createHash('sha256').update(scriptHex).digest('hex')
+}
 
 type Cached = { html: string; at: number }
 const CACHE_TTL_MS = 15 * 60 * 1000
@@ -59,9 +80,9 @@ async function resolveLogoDataUrl(): Promise<string | null> {
 }
 
 async function fetchTxAndFindScriptHex(network: string, txid: string, vout?: number): Promise<string> {
-	const headers: Record<string, string> = {}
-	if (WHATSONCHAIN_API_KEY) headers['woc-api-key'] = WHATSONCHAIN_API_KEY
-	const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`, { headers })
+	const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`, {
+		headers: buildWocHeaders(WHATSONCHAIN_API_KEY),
+	})
 	if (!res.ok) throw new Error(`Failed to fetch TX: ${res.status}`)
 	const j = await res.json()
 	const outs = Array.isArray(j?.vout) ? j.vout : []
@@ -146,7 +167,7 @@ app.get('/', async (req, res) => {
 			if (cached) return res.type('html').send(cached)
 			hex = await fetchTxAndFindScriptHex(network, txid, Number.isFinite(vout) ? vout : undefined)
 		} else {
-			key = `GET:hex:${hex.slice(0, 64)}`
+			key = `GET:hex:${hexCacheKey(hex)}`
 			const cached = getCache(key)
 			if (cached) return res.type('html').send(cached)
 		}
@@ -208,7 +229,7 @@ app.post('/data-decode/gaialog', async (req, res) => {
 		const network = String(body?.network || 'main').trim()
 		if (!scriptHex) throw new Error('script_hex required')
 
-		const key = `POST:data-decode:${network}:${scriptHex.slice(0, 64)}`
+		const key = `POST:data-decode:${network}:${hexCacheKey(scriptHex)}`
 		const cached = getCache(key)
 		if (cached) return res.type('text/html').send(cached)
 
@@ -259,7 +280,7 @@ app.post('/', async (req, res) => {
 			}
 		}
 
-		const key = `POST:${txid ?? 'hex'}:${hex.slice(0, 64)}`
+		const key = `POST:${txid ?? 'hex'}:${hexCacheKey(hex)}`
 		const cached = getCache(key)
 		if (cached) return res.type('html').send(cached)
 
@@ -289,9 +310,26 @@ app.post('/', async (req, res) => {
 	}
 })
 
-app.listen(PORT, () => {
-	console.log(`[GaiaLog Plugin] Listening on http://localhost:${PORT}`)
-})
+/**
+ * Start the HTTP listener only when this module is the process entry point.
+ * Importing `server.js` (for tests or embedding) then has no side effect.
+ */
+export function startServer(port: number = PORT) {
+	return app.listen(port, () => {
+		console.log(`[GaiaLog Plugin] Listening on http://localhost:${port}`)
+	})
+}
+
+const entryArg = (() => {
+	const arg = process.argv[1] || ''
+	return arg.replace(/\\/g, '/')
+})()
+
+if (/\/server\.(ts|js)$/.test(entryArg)) {
+	startServer()
+}
+
+export { app }
 
 
 

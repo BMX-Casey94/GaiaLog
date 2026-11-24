@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { validateGaiaLog, parsePushes } from '@/lib/opreturn-validator'
 import { promises as fs } from 'fs'
 import path from 'path'
-import { renderHtml, renderErrorHtml, detectKnownNonGaia } from '../../../route'
+import { renderHtml, renderErrorHtml, detectKnownNonGaia, buildWocHeaders } from '../../../route'
 
 export const runtime = 'nodejs'
 
@@ -31,9 +31,9 @@ function setCache(key: string, html: string): void {
 }
 
 async function fetchTxAndFindScriptHex(network: string, txid: string, vout?: number): Promise<string> {
-	const headers: Record<string, string> = {}
-	if (WHATSONCHAIN_API_KEY) headers['woc-api-key'] = WHATSONCHAIN_API_KEY
-	const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`, { headers })
+	const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`, {
+		headers: buildWocHeaders(WHATSONCHAIN_API_KEY),
+	})
 	if (!res.ok) throw new Error(`Failed to fetch TX: ${res.status}`)
 	const j = await res.json()
 	const outs = Array.isArray(j?.vout) ? j.vout : []

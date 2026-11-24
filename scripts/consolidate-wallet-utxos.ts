@@ -6,11 +6,22 @@
  * Why this exists
  * ---------------
  * Repeated splits and broadcasts grind a wallet's inventory into hundreds of
- * thousands of dust-sized fragments (≤ ~2,000 sats each). Once every UTXO is
- * smaller than `BSV_UTXO_SPLIT_OUTPUT_SATS × 2 + fee + dust` (~4,156 sats by
- * default), the in-process splitter (`lib/utxo-maintainer.ts`) has no
- * splittable input and the system silently starves — even though the wallet's
- * total balance may still be substantial.
+ * thousands of dust-sized fragments (≤ ~BSV_UTXO_SPLIT_OUTPUT_SATS each). Once
+ * every UTXO is smaller than the splitter's minimum useful input, the
+ * in-process splitter (`lib/utxo-maintainer.ts`) has no splittable input and
+ * the system silently starves — even though the wallet's total balance may
+ * still be substantial.
+ *
+ * That minimum is not a fixed number: `estimateSplitRequirement(2)` in
+ * `lib/utxo-maintainer.ts` computes
+ *
+ *   2 × BSV_UTXO_SPLIT_OUTPUT_SATS + splitFee + 1
+ *
+ * i.e. two split outputs, the explicit fee for a 1-input / 3-output
+ * transaction at the splitter's fee rate, and one satoshi of headroom. Change
+ * either the configured output size or the fee rate and the threshold moves
+ * with it, so this script derives its own floor from the same constants rather
+ * than hard-coding a satoshi figure.
  *
  * This script consolidates many small UTXOs back into a small number of large
  * outputs the maintainer can split again. Each batched consolidation:
@@ -19,8 +30,10 @@
  *      first, and atomically marks them locked.
  *   2. Builds one `N inputs → 1 output` P2PKH transaction signed by that
  *      wallet's private key, with the explicit fee at `BSV_TX_FEE_RATE`.
- *   3. Broadcasts via the same ARC path used by the splitter (TAAL →
- *      GorillaPool → WoC fallback chain in `lib/broadcast-raw-tx.ts`).
+ *   3. Broadcasts via `broadcastSplitTransactionRaw(rawHex, efBytes)` in
+ *      `lib/broadcast-raw-tx.ts`: the BSV Broadcaster (Arcade) first, using the
+ *      transaction's BRC-30 EF bytes, then the legacy TAAL → GorillaPool → WoC
+ *      chain if the Broadcaster could not be reached.
  *   4. On `ok`: marks all N inputs `removed=true, spending_txid=<txid>` and
  *      admits the new big output as a `reserve` UTXO so the maintainer picks
  *      it up on its next cycle.
@@ -65,9 +78,9 @@
  *
  * Economically-spendable floor (--min-input-sats)
  * -----------------------------------------------
- * Each input costs ~SIGNED_P2PKH_INPUT_BYTES × feeRate sats to spend (~15.3
- * sats at 0.1025 sat/byte). UTXOs below ~2× this value are net-loss to
- * consolidate (you pay more in fees than the input is worth). The script
+ * Each input costs ~SIGNED_P2PKH_INPUT_BYTES × feeRate sats to spend (~22
+ * sats at the 0.15 sat/byte default). UTXOs below ~2× this value are net-loss
+ * to consolidate (you pay more in fees than the input is worth). The script
  * therefore filters them out of every batch by default. Override with
  * `--min-input-sats 0` to consolidate everything regardless of economics
  * (useful for cleaning up the inventory table even at a small BSV cost).
@@ -76,16 +89,20 @@
 import 'dotenv/config'
 import dotenv from 'dotenv'
 import path from 'node:path'
-import * as bsvLib from 'bsv'
-import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
+import { P2PKH, PrivateKey } from '@bsv/sdk'
 
 // Load production env so DB credentials / WIFs are present regardless of
 // how the script is invoked (npm script vs raw npx).
 dotenv.config({ path: path.join(process.cwd(), '.env'), override: true })
 
-import { bsvConfig } from '../lib/bsv-config'
+import { DEFAULT_TX_FEE_RATE, bsvConfig } from '../lib/bsv-config'
 import { attachClientErrorHandler, dbPool } from '../lib/db'
 import { broadcastSplitTransactionRaw } from '../lib/broadcast-raw-tx'
+import {
+  type TxInputSpec,
+  buildConsolidationTx as buildConsolidationTxFromLib,
+  buildPaymentTx,
+} from '../lib/broadcast/tx-builder'
 import { getTreasuryTopicForWallet } from '../lib/treasury-topics'
 import { getLockOwnerId } from '../lib/utxo-locks'
 import { withOverlayTransaction, refreshTopicCounts } from '../lib/overlay-repository'
@@ -147,7 +164,7 @@ function parseArgs(argv: string[]): CliOptions {
     takeValue(argv, '--fee-rate') ||
       process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ||
       process.env.BSV_TX_FEE_RATE ||
-      '0.105',
+      String(DEFAULT_TX_FEE_RATE),
   )
   if (!Number.isFinite(feeRateRaw) || feeRateRaw <= 0) {
     throw new Error(`--fee-rate must be > 0 (got ${feeRateRaw})`)
@@ -247,10 +264,12 @@ function deriveBindings(): WalletBinding[] {
     throw new Error('No BSV wallet private keys configured (BSV_WALLET_*_PRIVATE_KEY)')
   }
   return wifs.slice(0, 3).map((wif, walletIndex) => {
-    const sdkKey = SDKPrivateKey.fromWif(wif)
+    const sdkKey = PrivateKey.fromWif(wif)
     const address = sdkKey.toPublicKey().toAddress().toString()
-    const pubKeyHash = Buffer.from(sdkKey.toPublicKey().toHash()).toString('hex')
-    const outputScriptHex = `76a914${pubKeyHash}88ac`
+    const outputScriptHex = new P2PKH().lock(address).toHex().toLowerCase()
+    if (!/^76a914[0-9a-f]{40}88ac$/.test(outputScriptHex)) {
+      throw new Error(`Derived locking script for ${address} is not P2PKH: ${outputScriptHex}`)
+    }
     return {
       walletIndex,
       label: `W${walletIndex + 1}` as 'W1' | 'W2' | 'W3',
@@ -650,16 +669,65 @@ async function commitConsolidation(input: {
 
 interface BuiltTx {
   rawHex: string
+  /** BRC-30 EF bytes for the BSV Broadcaster. */
+  efBytes: Uint8Array
+  /** Double-SHA256 id of the signed transaction, for rejecting a mismatched echo. */
+  txid: string
   fee: number
   outputSats: number
   txSizeBytes: number
 }
 
-function buildConsolidationTx(
+/**
+ * Map locked overlay rows onto the builder's input specs.
+ *
+ * The parent transactions are never fetched: each input carries the satoshi
+ * amount and locking script already stored in `overlay_admitted_utxos`, which is
+ * exactly what the P2PKH unlocking template needs to build the signature
+ * preimage. `buildCore` rejects any input whose stored script is not the
+ * wallet's own P2PKH script — signing it would either produce an invalid
+ * transaction or, in the worst case, hand a signature to a script the wallet
+ * does not control.
+ */
+function toInputSpecs(binding: WalletBinding, inputs: LockedInput[]): TxInputSpec[] {
+  return inputs.map((input) => {
+    if (!Number.isInteger(input.vout) || input.vout < 0) {
+      throw new Error(`Wallet ${binding.label}: refusing input ${input.txid} with vout=${input.vout}`)
+    }
+    if (!Number.isSafeInteger(input.satoshis) || input.satoshis < 0) {
+      throw new Error(
+        `Wallet ${binding.label}: refusing input ${input.txid}:${input.vout} with satoshis=${input.satoshis}`,
+      )
+    }
+    const lockingScriptHex = String(input.output_script || '').trim().toLowerCase()
+    if (!lockingScriptHex) {
+      throw new Error(
+        `Wallet ${binding.label}: input ${input.txid}:${input.vout} has no stored locking script. Refusing to sign.`,
+      )
+    }
+    return {
+      txid: input.txid,
+      vout: input.vout,
+      satoshis: input.satoshis,
+      lockingScriptHex,
+    }
+  })
+}
+
+/**
+ * Build one `N inputs → 1 output` consolidation transaction.
+ *
+ * The explicit fee is the same worst-case-size estimate the rest of the spend
+ * path uses (`estimateTxSize`), passed to the builder so `--fee-rate` stays an
+ * operator control rather than a silent env-only setting. The builder signs,
+ * measures the signed size, and returns both the classic serialisation and the
+ * BRC-30 EF payload the Broadcaster requires.
+ */
+async function buildConsolidationTx(
   binding: WalletBinding,
   inputs: LockedInput[],
   feeRate: number,
-): BuiltTx {
+): Promise<BuiltTx> {
   const txSizeBytes = estimateTxSize(inputs.length, 1)
   const fee = Math.ceil(txSizeBytes * feeRate)
   const inputSum = inputs.reduce((acc, i) => acc + i.satoshis, 0)
@@ -670,34 +738,57 @@ function buildConsolidationTx(
     )
   }
 
-  const tx = new (bsvLib as any).Transaction()
-  tx.from(
-    inputs.map((i) => ({
-      txId: i.txid,
-      outputIndex: i.vout,
-      address: binding.address,
-      script: i.output_script,
-      satoshis: i.satoshis,
-    })),
-  )
-  tx.to(binding.address, outputSats)
-  // No change output: we already accounted for the entire input sum minus fee.
-  tx.fee(fee)
-  const signingKey = (bsvLib as any).PrivateKey.fromWIF(binding.wif)
-  tx.sign(signingKey)
-  const rawHex = tx.serialize()
-  return { rawHex, fee, outputSats, txSizeBytes }
+  // Single output carrying the whole input sum minus the explicit fee; there is
+  // no change output to compute.
+  const built = await buildConsolidationTxFromLib({
+    wif: binding.wif,
+    inputs: toInputSpecs(binding, inputs),
+    destinationAddress: binding.address,
+    explicitFeeSats: fee,
+  })
+  if (built.outputs.length !== 1 || built.outputs[0].satoshis !== outputSats) {
+    // A consolidation that emits change has consolidated nothing; a wrong value
+    // means the fee assumption no longer holds.
+    throw new Error(
+      `Wallet ${binding.label}: builder produced ${built.outputs.length} output(s) totalling ` +
+        `${built.outputs.reduce((sum, o) => sum + o.satoshis, 0)} sats, expected one of ${outputSats}.`,
+    )
+  }
+  return {
+    rawHex: built.rawHex,
+    efBytes: built.efBytes,
+    txid: built.txid,
+    fee: built.feeSats,
+    outputSats,
+    txSizeBytes: built.sizeBytes,
+  }
 }
 
 // ─── Tx builder: one input → two outputs (rebalance transfer) ────────────────
 
-function buildTransferTx(
+/**
+ * Build a transfer of `donateSats` from a donor wallet to a recipient address.
+ *
+ * Change is returned to the donor, not to the recipient. The builder emits
+ * requested outputs first and change last, so the recipient lands at vout 0 and
+ * the donor change at vout 1 — which is the ordering `commitTransfer` records in
+ * the overlay rows.
+ */
+async function buildTransferTx(
   donor: WalletBinding,
   recipientAddress: string,
   inputs: LockedInput[],
   donateSats: number,
   feeRate: number,
-): { rawHex: string; fee: number; donateSats: number; changeSats: number; txSizeBytes: number } {
+): Promise<{
+  rawHex: string
+  efBytes: Uint8Array
+  txid: string
+  fee: number
+  donateSats: number
+  changeSats: number
+  txSizeBytes: number
+}> {
   if (inputs.length === 0) throw new Error('buildTransferTx: no inputs')
   const txSizeBytes = estimateTxSize(inputs.length, 2)
   const fee = Math.ceil(txSizeBytes * feeRate)
@@ -708,23 +799,37 @@ function buildTransferTx(
       `Refusing to build transfer TX with changeSats=${changeSats} (inputSum=${inputSum} donate=${donateSats} fee=${fee}).`,
     )
   }
-  const tx = new (bsvLib as any).Transaction()
-  tx.from(
-    inputs.map((i) => ({
-      txId: i.txid,
-      outputIndex: i.vout,
-      address: donor.address,
-      script: i.output_script,
-      satoshis: i.satoshis,
-    })),
-  )
-  tx.to(recipientAddress, donateSats)
-  tx.to(donor.address, changeSats)
-  tx.fee(fee)
-  const signingKey = (bsvLib as any).PrivateKey.fromWIF(donor.wif)
-  tx.sign(signingKey)
-  const rawHex = tx.serialize()
-  return { rawHex, fee, donateSats, changeSats, txSizeBytes }
+
+  const built = await buildPaymentTx({
+    wif: donor.wif,
+    inputs: toInputSpecs(donor, inputs),
+    outputs: [{ address: recipientAddress, satoshis: donateSats }],
+    changeAddress: donor.address,
+    explicitFeeSats: fee,
+  })
+
+  const changeOutput = built.outputs.find((output) => output.isChange)
+  if (built.outputs.length !== 2 || !changeOutput || changeOutput.vout !== 1) {
+    throw new Error(
+      `Donor ${donor.label}: builder produced ${built.outputs.length} output(s); expected the donation at ` +
+        'vout 0 and donor change at vout 1.',
+    )
+  }
+  if (changeOutput.satoshis !== changeSats) {
+    throw new Error(
+      `Donor ${donor.label}: builder emitted ${changeOutput.satoshis} sats of change, expected ${changeSats}.`,
+    )
+  }
+
+  return {
+    rawHex: built.rawHex,
+    efBytes: built.efBytes,
+    txid: built.txid,
+    fee: built.feeSats,
+    donateSats,
+    changeSats,
+    txSizeBytes: built.sizeBytes,
+  }
 }
 
 // ─── Phase 1: per-wallet consolidation ───────────────────────────────────────
@@ -839,7 +944,7 @@ async function consolidateWallet(
 
     let built: BuiltTx
     try {
-      built = buildConsolidationTx(binding, inputs, options.feeRate)
+      built = await buildConsolidationTx(binding, inputs, options.feeRate)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       console.error(`  ❌ Batch #${batchNo}: build failed — ${message}. Releasing locks.`)
@@ -850,7 +955,7 @@ async function consolidateWallet(
 
     let txid: string
     try {
-      txid = await broadcastSplitTransactionRaw(built.rawHex)
+      txid = await broadcastSplitTransactionRaw(built.rawHex, built.efBytes)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const classified = classifyBroadcastError(message)
@@ -903,6 +1008,17 @@ async function consolidateWallet(
       }
       await new Promise((r) => setTimeout(r, classified.preBatchSleepMs))
       continue
+    }
+
+    // A broadcaster that echoes a different txid may be describing a different
+    // transaction. Locks are deliberately NOT released here: the transaction may
+    // be on chain, and releasing spent outpoints would let the next batch build a
+    // double spend.
+    if (txid.toLowerCase() !== built.txid) {
+      throw new Error(
+        `Wallet ${binding.label}: broadcaster returned ${txid} but the signed transaction hashes to ` +
+          `${built.txid}. Locks held. Verify on chain before re-running.`,
+      )
     }
 
     try {
@@ -1310,7 +1426,13 @@ async function rebalanceWallets(
 
     let built
     try {
-      built = buildTransferTx(richest.binding, poorest.binding.address, donorInputs, donateSats, options.feeRate)
+      built = await buildTransferTx(
+        richest.binding,
+        poorest.binding.address,
+        donorInputs,
+        donateSats,
+        options.feeRate,
+      )
     } catch (err) {
       console.error(
         `  ❌ Pass ${pass}: transfer build failed — ${err instanceof Error ? err.message : String(err)}. Releasing locks.`,
@@ -1321,7 +1443,7 @@ async function rebalanceWallets(
 
     let txid: string
     try {
-      txid = await broadcastSplitTransactionRaw(built.rawHex)
+      txid = await broadcastSplitTransactionRaw(built.rawHex, built.efBytes)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const transient = classifyBroadcastError(message)
@@ -1334,6 +1456,15 @@ async function rebalanceWallets(
       // Stop the rebalance loop — same-pass retry against the same surplus
       // would lock the same UTXOs and likely hit the same upstream issue.
       break
+    }
+
+    // Same rule as the consolidation path: a mismatched echo means the
+    // transaction may be on chain under an unknown id, so the locks stay held.
+    if (txid.toLowerCase() !== built.txid) {
+      throw new Error(
+        `Pass ${pass}: broadcaster returned ${txid} but the signed transfer hashes to ${built.txid}. ` +
+          'Locks held. Verify on chain before re-running.',
+      )
     }
 
     try {

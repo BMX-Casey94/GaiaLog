@@ -2,12 +2,33 @@ import { NextRequest, NextResponse } from 'next/server'
 import { validateGaiaLog, parsePushes } from '@/lib/opreturn-validator'
 import { promises as fs } from 'fs'
 import path from 'path'
+import { createHash } from 'crypto'
 import { getFamilyTitle, getKeyMetrics, getRenderableMetricEntries } from '@/lib/family-metrics'
 import { resolveAttributionText } from '@/lib/stream-registry'
 
 export const runtime = 'nodejs'
 
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY
+
+/**
+ * Build WoC request headers for the configured API key. Modern keys are
+ * prefixed `mainnet_`/`testnet_` and must travel in Authorization; legacy keys
+ * use the `woc-api-key` header.
+ */
+export function buildWocHeaders(apiKey: string | undefined | null): Record<string, string> {
+	if (!apiKey) return {}
+	const key = String(apiKey).trim()
+	if (!key) return {}
+	if (key.startsWith('mainnet_') || key.startsWith('testnet_')) {
+		return { Authorization: key }
+	}
+	return { 'woc-api-key': key }
+}
+
+/** Cache key: full SHA-256 of the script hex, never a truncated prefix. */
+export function hexCacheKey(scriptHex: string): string {
+	return createHash('sha256').update(scriptHex).digest('hex')
+}
 
 type Cached = { html: string; at: number }
 const CACHE_TTL_MS = 15 * 60 * 1000
@@ -63,7 +84,20 @@ function stat(label: string, value: unknown): string {
 	</div>`
 }
 
-function renderTypeSections(dataType: string, payload: any): string {
+/**
+ * Root-level GaiaLog document fields. `lib/blockchain.ts` promotes
+ * provider_id/dataset_id out of `payload` to the document root, so the renderer
+ * must read attribution from the root document as well as the payload.
+ */
+export interface GaiaLogRootContext {
+	provider_id?: string | null
+	dataset_id?: string | null
+	provider?: string | null
+	source?: string | null
+	data_type?: string | null
+}
+
+function renderTypeSections(dataType: string, payload: any, root?: GaiaLogRootContext | null): string {
 	const sections: string[] = []
 	const p = payload || {}
 
@@ -74,10 +108,17 @@ function renderTypeSections(dataType: string, payload: any): string {
 	const datePart = dateISO ? String(dateISO).slice(0, 10) : ''
 	const timePart = dateISO ? (dateISO.includes('T') ? String(dateISO).slice(11, 19) : '') : ''
 
+	// Attribution lives at the document root because blockchain.ts strips
+	// provider_id/dataset_id from the payload. Fall back to payload fields for
+	// legacy documents that still carry them inline.
+	const providerId = root?.provider_id ?? p.provider_id ?? null
+	const datasetId = root?.dataset_id ?? p.dataset_id ?? null
+	const sourceLabel = root?.provider ?? p.source ?? null
+
 	const primaryStats = getKeyMetrics(dataType, p, 12)
 	const secondaryStats = getRenderableMetricEntries(p, 24)
 		.filter(entry => !primaryStats.some(primary => primary.label === entry.label && primary.value === entry.value))
-	const attributionText = resolveAttributionText(p.provider_id, p.source)
+	const attributionText = resolveAttributionText(providerId, sourceLabel)
 
 	sections.push(`
 		<div class="gl-card">
@@ -86,8 +127,8 @@ function renderTypeSections(dataType: string, payload: any): string {
 				${chip('Location', loc)}
 				${chip('Date', datePart)}
 				${chip('Time', timePart)}
-				${chip('Provider', p.provider_id ?? p.source ?? '')}
-				${chip('Dataset', p.dataset_id ?? '')}
+				${chip('Provider', providerId ?? sourceLabel ?? '')}
+				${chip('Dataset', datasetId ?? '')}
 			</div>
 			<div class="gl-grid">
 				${(primaryStats.length > 0 ? primaryStats : secondaryStats).map(entry => stat(entry.label, entry.value)).join('')}
@@ -225,7 +266,7 @@ export function renderHtml(opts: {
 					<div class="gl-tagline">Immutable Earth data, stored on-chain.</div>
 				</div>
 			</div>
-			${renderTypeSections(String(json?.data_type ?? '').trim(), json?.payload)}
+			${renderTypeSections(String(json?.data_type ?? '').trim(), json?.payload, json)}
 			<div class="gl-footer">
 				<div class="gl-footer-meta">GaiaLog Data Decoder (Plugin) — v1.7</div>
 				${viewOnWoc}
@@ -509,9 +550,9 @@ export function renderErrorHtml(opts: {
 }
 
 async function fetchTxAndFindScriptHex(network: string, txid: string, vout?: number): Promise<string> {
-	const headers: Record<string, string> = {}
-	if (WHATSONCHAIN_API_KEY) headers['woc-api-key'] = WHATSONCHAIN_API_KEY
-	const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`, { headers })
+	const res = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`, {
+		headers: buildWocHeaders(WHATSONCHAIN_API_KEY),
+	})
 	if (!res.ok) throw new Error(`Failed to fetch TX: ${res.status}`)
 	const j = await res.json()
 	const outs = Array.isArray(j?.vout) ? j.vout : []
@@ -615,7 +656,7 @@ export async function GET(req: NextRequest) {
 			if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' } })
 			hex = await fetchTxAndFindScriptHex(network, txid, Number.isFinite(vout) ? vout : undefined)
 		} else {
-			key = `GET:hex:${hex.slice(0, 64)}`
+			key = `GET:hex:${hexCacheKey(hex)}`
 			const cached = getCache(key)
 			if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' } })
 		}
@@ -725,7 +766,7 @@ export async function POST(req: NextRequest) {
 			}
 		}
 
-		const key = `POST:${txid ?? 'hex'}:${hex.slice(0, 64)}`
+		const key = `POST:${txid ?? 'hex'}:${hexCacheKey(hex)}`
 		const cached = getCache(key)
 		if (cached) return new NextResponse(cached, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Vary': 'Accept' } })
 

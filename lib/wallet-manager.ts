@@ -67,7 +67,14 @@ export class WalletManager {
       })
 
       this.isInitialized = true
-      console.log(`✅ Wallet Manager initialized with ${this.wallets.length} wallet(s)`)
+      // A single treasury wallet is the target production configuration: every
+      // output belongs to one key, so there is no round-robin to balance and no
+      // per-wallet funding to track. Two or three wallets remain fully
+      // supported while an operator sweeps them into one.
+      const mode = this.wallets.length === 1
+        ? 'unified treasury wallet'
+        : `${this.wallets.length} wallets (transition mode)`
+      console.log(`✅ Wallet Manager initialised: ${mode}`)
     } catch (error) {
       console.error('❌ Failed to initialize Wallet Manager:', error)
       this.isInitialized = false
@@ -194,6 +201,15 @@ export class WalletManager {
   } {
     const wallets = Array.from(this.walletInfo.values())
     const totalTransactions = this.getTotalTransactionCount()
+    // With one wallet, or none configured, `reduce` over an empty array throws.
+    if (wallets.length === 0) {
+      return {
+        totalTransactions,
+        averageTransactionsPerWallet: 0,
+        mostUsedWallet: -1,
+        leastUsedWallet: -1,
+      }
+    }
     const averageTransactionsPerWallet = totalTransactions / wallets.length
 
     const mostUsedWallet = wallets.reduce((max, wallet) => 
@@ -210,6 +226,17 @@ export class WalletManager {
       mostUsedWallet,
       leastUsedWallet
     }
+  }
+
+  /**
+   * True when this deployment runs a single unified treasury wallet.
+   *
+   * Callers use it to skip per-wallet balancing work that has no meaning with
+   * one key: round-robin selection, per-wallet runway alerts, and the
+   * "wallet W2/W3 is under-funded" reports that only make sense mid-migration.
+   */
+  public isSingleWalletMode(): boolean {
+    return this.wallets.length === 1
   }
 
   private addAlert(alert: WalletAlert): void {

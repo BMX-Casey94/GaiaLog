@@ -9,14 +9,66 @@ import {
   type OverlayAdmittedUtxoRow,
 } from './overlay-repository'
 
-export type UtxoRole = 'pool' | 'reserve'
+/**
+ * Inventory classes.
+ *
+ *   - `pool`    — outputs a write can acquire directly.
+ *   - `reserve` — large confirmed outputs the splitter draws from.
+ *   - `dust`    — change below the floor a write can acquire, but above the
+ *                 floor auto-consolidation can profitably sweep. Tagging these
+ *                 separately keeps them out of `pool` (which would otherwise
+ *                 fill with rows no acquisition will ever take) while still
+ *                 making them findable by the consolidate sweep.
+ *
+ * The base row type in `overlay-repository.ts` predates `dust`; the role is
+ * widened here rather than there because this module is the one that admits
+ * and classifies inventory.
+ */
+export type UtxoRole = 'pool' | 'reserve' | 'dust'
 
-export interface InventoryUtxo extends OverlayAdmittedUtxoRow {
+export interface InventoryUtxo extends Omit<OverlayAdmittedUtxoRow, 'utxo_role'> {
   wallet_index: number
   utxo_role: UtxoRole
   locked: boolean
   locked_by: string | null
   locked_at: string | null
+}
+
+/** Postgres `check_violation`: a CHECK constraint refused the value. */
+function isCheckViolation(error: unknown): boolean {
+  return (
+    typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && (error as { code?: string }).code === '23514'
+  )
+}
+
+let dustRoleUnavailableWarned = false
+
+/**
+ * Warn once that `dust` cannot be written yet.
+ *
+ * A deployment that has upgraded its code but not run `npm run db:migrate`
+ * still has the 0016 CHECK (`pool`, `reserve`). Admitting a dust change would
+ * then fail the whole consume/admit transaction — the parent is already spent
+ * on-chain at that point, so the inventory row would be silently lost and the
+ * input re-offered later. Falling back to `pool` keeps every write working;
+ * the sats land in the class consolidation already reads.
+ */
+function warnDustRoleUnavailable(): void {
+  if (dustRoleUnavailableWarned) return
+  dustRoleUnavailableWarned = true
+  console.warn(
+    '⚠️  utxo_role="dust" is rejected by the current CHECK constraint (Postgres 23514): ' +
+      'db/migrations/0035_broadcaster_spv_and_dust_role.sql has not been applied. ' +
+      'Falling back to "pool" for sub-floor change so no write fails before ' +
+      '`npm run db:migrate` is run.',
+  )
+}
+
+function normaliseUtxoRole(role: UtxoRole | undefined): UtxoRole {
+  return role === 'reserve' || role === 'dust' ? role : 'pool'
 }
 
 // Propagation grace: a freshly admitted change/split output stays invisible to
@@ -125,14 +177,19 @@ export interface WalletInventorySummary {
   totalReserve: number
   confirmedReserve: number
   lockedReserve: number
+  /** Sub-floor change awaiting consolidation. */
+  totalDust: number
+  confirmedDust: number
+  lockedDust: number
 }
 
-function mapInventoryRow(row: InventoryUtxo): InventoryUtxo {
+function mapInventoryRow(row: OverlayAdmittedUtxoRow): InventoryUtxo {
+  const role = row.utxo_role as UtxoRole
   return {
     ...row,
     satoshis: Number(row.satoshis),
     wallet_index: Number(row.wallet_index),
-    utxo_role: row.utxo_role === 'reserve' ? 'reserve' : 'pool',
+    utxo_role: role === 'reserve' || role === 'dust' ? role : 'pool',
     locked: row.locked === true,
   }
 }
@@ -148,7 +205,25 @@ async function acquireInventoryUtxo(client: PoolClient, input: AcquireInventoryU
   // Both columns remain populated on disk for live rows in case future code
   // paths need them; they can be lazy-loaded by a follow-up SELECT keyed on
   // (topic, txid, vout) when actually required.
-  const res = await client.query<InventoryUtxo>(
+  //
+  // Ordering matters for spend-chain health, not just for size:
+  //
+  //   - Pool spends (!preferLargest) must spread across the whole pool. The
+  //     historical `satoshis ASC, admitted_at ASC` always picked the smallest
+  //     output, which after a split is the newest change — so every spend
+  //     descended from the previous spend's change and built an ever-deeper
+  //     unconfirmed ancestor chain (the pathology that trips ARC's mempool
+  //     chain limit). Confirmed-first, then oldest-admitted, then smallest
+  //     rotates the pool and keeps chains shallow.
+  //   - Reserve/maintainer spends (preferLargest) want the biggest confirmed
+  //     output: largest-first is what lets one input fund a split.
+  //
+  // `confirmed DESC` leads in both cases so a confirmed row is always chosen
+  // before an unconfirmed one, regardless of `confirmedOnly`.
+  const orderBy = preferLargest
+    ? 'confirmed DESC, satoshis DESC, admitted_at ASC, txid ASC, vout ASC'
+    : 'confirmed DESC, admitted_at ASC, satoshis ASC, txid ASC, vout ASC'
+  const res = await client.query<OverlayAdmittedUtxoRow>(
     `WITH candidate AS (
        SELECT topic, txid, vout
          FROM overlay_admitted_utxos
@@ -159,7 +234,7 @@ async function acquireInventoryUtxo(client: PoolClient, input: AcquireInventoryU
           AND satoshis >= $3
           AND ($4::boolean = false OR confirmed = true)
           AND acquirable_at <= now()
-        ORDER BY satoshis ${preferLargest ? 'DESC' : 'ASC'}, admitted_at ASC, txid ASC, vout ASC
+        ORDER BY ${orderBy}
         FOR UPDATE SKIP LOCKED
         LIMIT 1
      )
@@ -362,53 +437,102 @@ export async function consumeAndAdmitChange(input: ConsumeAndAdmitChangeInput): 
     let delta = -1
 
     if (input.change && input.change.satoshis >= 0) {
-      const admittedRole = input.change.utxoRole === 'reserve' ? 'reserve' : 'pool'
-      const phase = input.phase === undefined ? null : input.phase
-      const { sql: acquirableAtSql, graceMs } = resolveAcquirableAtSql(
-        input.change.confirmed,
-        phase,
-        10,
-      )
-      const params: any[] = [
-        input.topic,
-        input.spendingTxid,
-        input.change.vout,
-        input.change.satoshis,
-        input.change.outputScript,
-        input.rawTx,
-        input.change.confirmed === true,
-        input.walletIndex,
-        admittedRole,
-      ]
-      if (graceMs !== null) params.push(graceMs)
-      await client.query(
-        `INSERT INTO overlay_admitted_utxos (
-           topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed,
-           wallet_index, utxo_role, locked, locked_by, locked_at, removed, removed_at, spending_txid,
-           acquirable_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, false, NULL, NULL, false, NULL, NULL, ${acquirableAtSql})
-         ON CONFLICT (topic, txid, vout) DO UPDATE SET
-           satoshis = EXCLUDED.satoshis,
-           output_script = EXCLUDED.output_script,
-           raw_tx = EXCLUDED.raw_tx,
-           confirmed = CASE WHEN EXCLUDED.confirmed THEN true ELSE overlay_admitted_utxos.confirmed END,
-           wallet_index = EXCLUDED.wallet_index,
-           utxo_role = EXCLUDED.utxo_role,
-           removed = false,
-           removed_at = NULL,
-           spending_txid = NULL,
-           locked = false,
-           locked_by = NULL,
-           locked_at = NULL,
-           acquirable_at = EXCLUDED.acquirable_at`,
-        params,
-      )
+      await insertAdmittedOutput(client, {
+        topic: input.topic,
+        spendingTxid: input.spendingTxid,
+        vout: input.change.vout,
+        satoshis: input.change.satoshis,
+        outputScript: input.change.outputScript,
+        rawTx: input.rawTx,
+        confirmed: input.change.confirmed,
+        walletIndex: input.walletIndex,
+        role: input.change.utxoRole,
+        phase: input.phase === undefined ? null : input.phase,
+      })
       delta += 1
     }
 
     await refreshTopicCounts(client, input.topic, delta)
   })
+}
+
+/**
+ * Admit one output row inside an open transaction.
+ *
+ * The `dust` role exists only once migration 0035 has widened the 0016 CHECK.
+ * On an un-migrated database the INSERT raises 23514, which — inside
+ * `consumeAndAdmitChange` — would roll back the *consume* as well, leaving a
+ * spent outpoint marked live. Falling back to `pool` keeps the row correct and
+ * the parent spent; the only cost is that the sub-floor change is counted as
+ * pool inventory until `npm run db:migrate` runs.
+ */
+async function insertAdmittedOutput(
+  client: PoolClient,
+  input: {
+    topic: string
+    spendingTxid: string
+    vout: number
+    satoshis: number
+    outputScript: string
+    rawTx: string
+    confirmed?: boolean
+    walletIndex: number
+    role?: UtxoRole
+    phase: ArcPhase | null
+  },
+): Promise<void> {
+  const role = normaliseUtxoRole(input.role)
+  const { sql: acquirableAtSql, graceMs } = resolveAcquirableAtSql(
+    input.confirmed,
+    input.phase,
+    10,
+  )
+
+  const run = async (utxoRole: UtxoRole): Promise<void> => {
+    const params: any[] = [
+      input.topic,
+      input.spendingTxid,
+      input.vout,
+      input.satoshis,
+      input.outputScript,
+      input.rawTx,
+      input.confirmed === true,
+      input.walletIndex,
+      utxoRole,
+    ]
+    if (graceMs !== null) params.push(graceMs)
+    await client.query(
+      `INSERT INTO overlay_admitted_utxos (
+         topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed,
+         wallet_index, utxo_role, locked, locked_by, locked_at, removed, removed_at, spending_txid,
+         acquirable_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, false, NULL, NULL, false, NULL, NULL, ${acquirableAtSql})
+       ON CONFLICT (topic, txid, vout) DO UPDATE SET
+         satoshis = EXCLUDED.satoshis,
+         output_script = EXCLUDED.output_script,
+         raw_tx = EXCLUDED.raw_tx,
+         confirmed = CASE WHEN EXCLUDED.confirmed THEN true ELSE overlay_admitted_utxos.confirmed END,
+         wallet_index = EXCLUDED.wallet_index,
+         utxo_role = EXCLUDED.utxo_role,
+         removed = false,
+         removed_at = NULL,
+         spending_txid = NULL,
+         locked = false,
+         locked_by = NULL,
+         locked_at = NULL,
+         acquirable_at = EXCLUDED.acquirable_at`,
+      params,
+    )
+  }
+
+  try {
+    await run(role)
+  } catch (error) {
+    if (role !== 'dust' || !isCheckViolation(error)) throw error
+    warnDustRoleUnavailable()
+    await run('pool')
+  }
 }
 
 export async function admitSplitOutputs(input: AdmitSplitOutputsInput): Promise<void> {
@@ -434,47 +558,18 @@ export async function admitSplitOutputs(input: AdmitSplitOutputsInput): Promise<
     }
 
     for (const output of input.outputs.filter(candidate => candidate.satoshis >= 0)) {
-      const admittedRole = output.utxoRole === 'reserve' ? 'reserve' : 'pool'
-      const { sql: acquirableAtSql, graceMs } = resolveAcquirableAtSql(
-        output.confirmed,
+      await insertAdmittedOutput(client, {
+        topic: input.topic,
+        spendingTxid: input.spendingTxid,
+        vout: output.vout,
+        satoshis: output.satoshis,
+        outputScript: output.outputScript,
+        rawTx: input.rawTx,
+        confirmed: output.confirmed,
+        walletIndex: input.walletIndex,
+        role: output.utxoRole,
         phase,
-        10,
-      )
-      const params: any[] = [
-        input.topic,
-        input.spendingTxid,
-        output.vout,
-        output.satoshis,
-        output.outputScript,
-        input.rawTx,
-        output.confirmed === true,
-        input.walletIndex,
-        admittedRole,
-      ]
-      if (graceMs !== null) params.push(graceMs)
-      await client.query(
-        `INSERT INTO overlay_admitted_utxos (
-           topic, txid, vout, satoshis, output_script, raw_tx, beef, confirmed,
-           wallet_index, utxo_role, locked, locked_by, locked_at, removed, removed_at, spending_txid,
-           acquirable_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, false, NULL, NULL, false, NULL, NULL, ${acquirableAtSql})
-         ON CONFLICT (topic, txid, vout) DO UPDATE SET
-           satoshis = EXCLUDED.satoshis,
-           output_script = EXCLUDED.output_script,
-           raw_tx = EXCLUDED.raw_tx,
-           confirmed = CASE WHEN EXCLUDED.confirmed THEN true ELSE overlay_admitted_utxos.confirmed END,
-           wallet_index = EXCLUDED.wallet_index,
-           utxo_role = EXCLUDED.utxo_role,
-           removed = false,
-           removed_at = NULL,
-           spending_txid = NULL,
-           locked = false,
-           locked_by = NULL,
-           locked_at = NULL,
-           acquirable_at = EXCLUDED.acquirable_at`,
-        params,
-      )
+      })
     }
   })
 }
@@ -647,6 +742,9 @@ export async function getWalletInventorySummary(walletIndex: number): Promise<Wa
       total_reserve: string
       confirmed_reserve: string
       locked_reserve: string
+      total_dust: string
+      confirmed_dust: string
+      locked_dust: string
     }>(
       `SELECT
          COUNT(*) FILTER (WHERE utxo_role = 'pool')::text AS total_pool,
@@ -654,7 +752,10 @@ export async function getWalletInventorySummary(walletIndex: number): Promise<Wa
          COUNT(*) FILTER (WHERE utxo_role = 'pool' AND locked = true)::text AS locked_pool,
          COUNT(*) FILTER (WHERE utxo_role = 'reserve')::text AS total_reserve,
          COUNT(*) FILTER (WHERE utxo_role = 'reserve' AND confirmed = true)::text AS confirmed_reserve,
-         COUNT(*) FILTER (WHERE utxo_role = 'reserve' AND locked = true)::text AS locked_reserve
+         COUNT(*) FILTER (WHERE utxo_role = 'reserve' AND locked = true)::text AS locked_reserve,
+         COUNT(*) FILTER (WHERE utxo_role = 'dust')::text AS total_dust,
+         COUNT(*) FILTER (WHERE utxo_role = 'dust' AND confirmed = true)::text AS confirmed_dust,
+         COUNT(*) FILTER (WHERE utxo_role = 'dust' AND locked = true)::text AS locked_dust
        FROM overlay_admitted_utxos
       WHERE wallet_index = $1
         AND removed = false`,
@@ -671,5 +772,8 @@ export async function getWalletInventorySummary(walletIndex: number): Promise<Wa
     totalReserve: Number(result?.total_reserve || '0'),
     confirmedReserve: Number(result?.confirmed_reserve || '0'),
     lockedReserve: Number(result?.locked_reserve || '0'),
+    totalDust: Number(result?.total_dust || '0'),
+    confirmedDust: Number(result?.confirmed_dust || '0'),
+    lockedDust: Number(result?.locked_dust || '0'),
   }
 }

@@ -1,10 +1,20 @@
 /* OP_RETURN parsing and GaiaLog envelope validation */
 
+import { gunzipSync } from 'zlib'
+import { createHash } from 'crypto'
+
 export type ParseResult = {
 	pushes: Buffer[]
 	isFalseReturn: boolean
 	isTrueReturn: boolean
 	isPlainReturn: boolean
+}
+
+export type GaiaLogValidation = {
+	json: any
+	spendable: boolean
+	hasHash: boolean
+	gzip: boolean
 }
 
 function readPush(buf: Buffer, offset: number): { data: Buffer; next: number } | null {
@@ -18,6 +28,7 @@ function readPush(buf: Buffer, offset: number): { data: Buffer; next: number } |
 		return { data: buf.subarray(start, end), next: end }
 	}
 	if (op === 0x4c) {
+		if (offset + 1 >= buf.length) return null
 		const len = buf[offset + 1]
 		const start = offset + 2
 		const end = start + len
@@ -25,6 +36,7 @@ function readPush(buf: Buffer, offset: number): { data: Buffer; next: number } |
 		return { data: buf.subarray(start, end), next: end }
 	}
 	if (op === 0x4d) {
+		if (offset + 2 >= buf.length) return null
 		const len = buf.readUInt16LE(offset + 1)
 		const start = offset + 3
 		const end = start + len
@@ -32,6 +44,7 @@ function readPush(buf: Buffer, offset: number): { data: Buffer; next: number } |
 		return { data: buf.subarray(start, end), next: end }
 	}
 	if (op === 0x4e) {
+		if (offset + 4 >= buf.length) return null
 		const len = buf.readUInt32LE(offset + 1)
 		const start = offset + 5
 		const end = start + len
@@ -69,66 +82,61 @@ export function parsePushes(scriptHex: string): ParseResult {
 	return { pushes, isFalseReturn: isFalse, isTrueReturn: isTrue, isPlainReturn: isPlain }
 }
 
-export function validateGaiaLog(scriptHex: string): {
-	json: any
-	spendable: boolean
-	hasHash: boolean
-	gzip: boolean
-} {
-	const { pushes } = parsePushes(scriptHex)
+export function validateGaiaLog(scriptHex: string): GaiaLogValidation {
+	const { pushes, isTrueReturn } = parsePushes(scriptHex)
 
-	// Envelope path: "GaiaLog", "v1", <payload>, [extras...]
+	// Envelope path: "GaiaLog", "v1", <payload>, [payload_sha256?], ["encoding=gzip"?]
 	let payload: Buffer | null = null
 	let gzip = false
-	let hasHash = false
+	let hashPush: Buffer | undefined
+
 	if (pushes.length >= 3) {
 		const p1 = pushes[0].toString('utf8')
 		const p2 = pushes[1].toString('utf8')
 		if (p1 === 'GaiaLog' && p2 === 'v1') {
 			payload = pushes[2]
-			for (let idx = 3; idx < pushes.length; idx++) {
-				const x = pushes[idx]
-				if (x.length === 32) hasHash = true
-				const asText = safeText(x)
-				if (asText.includes('encoding=gzip')) gzip = true
+			let idx = 3
+			if (idx < pushes.length && pushes[idx].length === 32) {
+				hashPush = pushes[idx]
+				idx++
+			}
+			for (; idx < pushes.length; idx++) {
+				if (pushes[idx].toString('utf8') === 'encoding=gzip') gzip = true
 			}
 		}
 	}
+
 	// Fallback legacy: single JSON push with app:"GaiaLog"
 	if (!payload && pushes.length === 1) {
 		const only = pushes[0]
 		try {
 			const j = JSON.parse(only.toString('utf8'))
 			if (String(j?.app) === 'GaiaLog') {
-				return { json: j, spendable: false, hasHash: false, gzip: false }
+				return { json: j, spendable: isTrueReturn, hasHash: false, gzip: false }
 			}
 		} catch {}
 	}
 	if (!payload) throw new Error('Missing required pushes')
 
+	// Verify the embedded SHA-256 digest before trusting the payload.
+	if (hashPush) {
+		const digest = createHash('sha256').update(payload).digest()
+		if (!digest.equals(hashPush)) throw new Error('payload_sha256 mismatch')
+	}
+
 	// Decompress if needed
 	let raw = payload
 	if (gzip || (raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b)) {
-		const { gunzipSync } = require('zlib') as typeof import('zlib')
 		raw = gunzipSync(raw)
 		gzip = true
 	}
+
 	let json: any
 	try {
 		json = JSON.parse(raw.toString('utf8'))
-	} catch (e: any) {
+	} catch {
 		throw new Error('Invalid GaiaLog JSON payload')
 	}
-	return { json, spendable: false, hasHash, gzip }
+
+	return { json, spendable: isTrueReturn, hasHash: !!hashPush, gzip }
 }
-
-function safeText(b: Buffer): string {
-	try {
-		return b.toString('utf8')
-	} catch {
-		return ''
-	}
-}
-
-
-

@@ -1,4 +1,4 @@
-import { P2PKH, PrivateKey as SDKPrivateKey, Transaction } from '@bsv/sdk'
+import { MerklePath, P2PKH, PrivateKey as SDKPrivateKey, Transaction } from '@bsv/sdk'
 import { z } from 'zod'
 
 import { bsvConfig } from './bsv-config'
@@ -113,6 +113,8 @@ const submitEnvelopeSchema = z.object({
   mapiResponses: z.unknown().optional(),
   beef: z.unknown().optional(),
   proof: z.unknown().optional(),
+  merklePath: z.unknown().optional(),
+  blockHeight: z.unknown().optional(),
   rawTxEnvelope: z.object({
     txid: z.string().optional(),
     rawTx: z.string().optional(),
@@ -120,6 +122,8 @@ const submitEnvelopeSchema = z.object({
     mapiResponses: z.unknown().optional(),
     beef: z.unknown().optional(),
     proof: z.unknown().optional(),
+    merklePath: z.unknown().optional(),
+    blockHeight: z.unknown().optional(),
   }).passthrough().optional(),
 }).passthrough()
 
@@ -231,21 +235,134 @@ function getBindingScriptMap(): Map<string, WalletBinding> {
   return map
 }
 
-function inferConfirmed(mapiResponses: unknown, beefOrProof: unknown): boolean {
-  if (beefOrProof != null) return true
+/**
+ * Upper bound on a merkle path hex string (~1 MB). A real BUMP for a very large
+ * block is tens of KB; anything past this is a malformed or hostile payload and
+ * must never reach the parser.
+ */
+const MAX_MERKLE_PATH_HEX_CHARS = 2_000_000
 
-  const candidates = Array.isArray(mapiResponses)
-    ? mapiResponses
-    : (mapiResponses ? [mapiResponses] : [])
+/**
+ * Pull a candidate merkle path hex string out of the various shapes a caller
+ * may send. Only an actual hex BUMP is ever returned — a BEEF payload is not
+ * accepted here, because parsing one as a MerklePath would either throw (fine)
+ * or, worse, produce a path whose root we would be asserting on no evidence.
+ */
+function extractMerklePathHex(value: unknown, depth = 0): string | null {
+  if (value == null || depth > 3) return null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed.length < 2 || trimmed.length > MAX_MERKLE_PATH_HEX_CHARS) return null
+    return /^[0-9a-fA-F]+$/.test(trimmed) ? trimmed : null
+  }
+  if (typeof value !== 'object') return null
+  const record = value as Record<string, unknown>
+  for (const key of ['merklePath', 'bump', 'merkle_path'] as const) {
+    const nested = record[key]
+    if (typeof nested === 'string') {
+      const hex = extractMerklePathHex(nested, depth + 1)
+      if (hex) return hex
+    }
+  }
+  return null
+}
 
-  return candidates.some((entry: any) => {
-    const status = String(entry?.txStatus || entry?.status || '').trim().toUpperCase()
-    return status === 'MINED' ||
-      status === 'CONFIRMED' ||
-      entry?.blockHash != null ||
-      entry?.block_height != null ||
-      entry?.blockHeight != null
-  })
+function extractMerklePathFromResponses(responses: unknown): string | null {
+  const candidates = Array.isArray(responses) ? responses : responses ? [responses] : []
+  for (const entry of candidates) {
+    const record = entry as { merklePath?: unknown; bump?: unknown; proof?: unknown } | null
+    for (const key of ['merklePath', 'bump', 'proof'] as const) {
+      const hex = extractMerklePathHex(record?.[key])
+      if (hex) return hex
+    }
+  }
+  return null
+}
+
+function extractBlockHeightFromResponses(responses: unknown): number | null {
+  const candidates = Array.isArray(responses) ? responses : responses ? [responses] : []
+  for (const entry of candidates) {
+    if (!entry || typeof entry !== 'object') continue
+    const record = entry as { blockHeight?: unknown; block_height?: unknown }
+    const raw = record.blockHeight ?? record.block_height
+    const height = typeof raw === 'number' ? raw : Number(raw)
+    if (Number.isInteger(height) && height > 0) return height
+  }
+  return null
+}
+
+function coerceBlockHeight(value: unknown): number | null {
+  if (value == null) return null
+  const height = typeof value === 'number' ? value : Number(value)
+  return Number.isInteger(height) && height > 0 ? height : null
+}
+
+/**
+ * Decide whether a submission is already mined — cryptographically, or not at
+ * all.
+ *
+ * Previously this returned true for ANY non-null `beef` or `proof`, and for any
+ * MAPI entry claiming a `blockHash` or height. Both are unauthenticated: a
+ * broadcaster (or anyone POSTing to the overlay endpoint) could mark an
+ * unconfirmed — or entirely imaginary — output as confirmed, which then feeds
+ * BSV_MIN_SPEND_CONFIRMATIONS and the explorer's confirmed-only view.
+ *
+ * The only accepted evidence is a BEEF-style merkle path (BUMP) that actually
+ * commits to this txid at the stated block height. `computeRoot(txid)` throws
+ * when the txid is not a leaf of the path, so a path belonging to a different
+ * transaction cannot pass. When the caller states a height, the BUMP's own
+ * `blockHeight` must agree.
+ *
+ * Note the limit of this check: it proves the proof commits to the txid at that
+ * height. It does not prove that block is on the winning chain (that needs a
+ * ChainTracker against block headers). Admission treats it as confirmed
+ * because a broadcaster only produces a BUMP for a block it built or accepted;
+ * the confirmation worker re-verifies against the chain later.
+ */
+function inferConfirmed(input: {
+  txid: string | null
+  merklePathHex: string | null
+  blockHeight: number | null
+  mapiResponses: unknown
+  proofEnvelope?: unknown
+}): boolean {
+  const { txid, mapiResponses } = input
+  if (!txid || !/^[0-9a-fA-F]{64}$/.test(txid)) return false
+
+  // A path supplied alongside the envelope, one carried by a MAPI response, or
+  // one nested under `proof` (ARC's callback shape).
+  const merklePathHex = input.merklePathHex
+    || extractMerklePathFromResponses(mapiResponses)
+    || extractMerklePathHex(input.proofEnvelope)
+  if (!merklePathHex) return false
+
+  const blockHeight = input.blockHeight ?? extractBlockHeightFromResponses(mapiResponses)
+
+  try {
+    const merklePath = MerklePath.fromHex(merklePathHex)
+    if (!Number.isInteger(merklePath.blockHeight) || merklePath.blockHeight <= 0) return false
+    // A caller-claimed height that disagrees with the proof is a contradiction,
+    // not a confirmation.
+    if (blockHeight != null && blockHeight !== merklePath.blockHeight) return false
+
+    // Reject the single-leaf short circuit. MerklePath.computeRoot returns the
+    // txid itself when the path is `[[{offset:0, hash:txid}]]` — the shape
+    // MerklePath.fromCoinbaseTxidAndHeight produces for a one-transaction
+    // block. That makes the "root" trivially equal to any txid the attacker
+    // names, so it proves nothing and must never confirm an output. (A genuine
+    // one-transaction block has the same problem for any proof-only scheme;
+    // it is left to the confirmation worker, which checks the chain.)
+    if (merklePath.path.length < 1 || (merklePath.path[0]?.length ?? 0) < 2) return false
+
+    const root = merklePath.computeRoot(txid.toLowerCase())
+    if (typeof root !== 'string' || !/^[0-9a-fA-F]{64}$/.test(root)) return false
+    // Defence in depth: a root equal to the txid means the path collapsed to
+    // the leaf, which is not evidence of inclusion in anything.
+    return root.toLowerCase() !== txid.toLowerCase()
+  } catch {
+    // Unparseable path, illegal offsets, or the txid is not in the tree.
+    return false
+  }
 }
 
 function normaliseSubmitBody(input: unknown): {
@@ -256,7 +373,9 @@ function normaliseSubmitBody(input: unknown): {
   prevouts: unknown | null
   mapiResponses: unknown | null
   beef: unknown | null
-  confirmed: boolean
+  merklePathHex: string | null
+  blockHeight: number | null
+  proof: unknown
 } {
   const parsed = submitEnvelopeSchema.parse(input)
   const rawTxEnvelope = parsed.rawTxEnvelope || {}
@@ -278,7 +397,9 @@ function normaliseSubmitBody(input: unknown): {
     prevouts: parsed.prevouts ?? rawTxEnvelope.prevouts ?? null,
     mapiResponses,
     beef,
-    confirmed: inferConfirmed(mapiResponses, proof),
+    merklePathHex: extractMerklePathHex(parsed.merklePath ?? rawTxEnvelope.merklePath),
+    blockHeight: coerceBlockHeight(parsed.blockHeight ?? rawTxEnvelope.blockHeight),
+    proof,
   }
 }
 
@@ -312,6 +433,17 @@ export async function submitOverlayTransaction(input: unknown): Promise<OverlayS
   if (normalized.txid && normalized.txid.toLowerCase() !== computedTxid) {
     throw new Error(`txid mismatch: expected ${normalized.txid.toLowerCase()} but parsed ${computedTxid}`)
   }
+
+  // Verification runs against the txid derived from the raw transaction, not
+  // the one the caller typed: the raw transaction is what actually gets
+  // admitted, so the proof must commit to THAT hash.
+  const confirmed = inferConfirmed({
+    txid: computedTxid,
+    merklePathHex: normalized.merklePathHex,
+    blockHeight: normalized.blockHeight,
+    mapiResponses: normalized.mapiResponses,
+    proofEnvelope: normalized.proof,
+  })
 
   const requestId = normalized.clientRequestId || computedTxid
   const bindingScriptMap = getBindingScriptMap()
@@ -355,7 +487,7 @@ export async function submitOverlayTransaction(input: unknown): Promise<OverlayS
             output.vout,
             normalized.rawTx,
             normalized.beef,
-            normalized.confirmed,
+            confirmed,
           )
           coinsToRetain.push({
             txid: existing.txid,
@@ -364,7 +496,7 @@ export async function submitOverlayTransaction(input: unknown): Promise<OverlayS
             satoshis: Number(existing.satoshis),
             rawTx: normalized.rawTx,
             beef: normalized.beef ?? existing.beef ?? null,
-            confirmed: existing.confirmed || normalized.confirmed,
+            confirmed: existing.confirmed || confirmed,
             admittedAt: existing.admitted_at,
           })
           continue
@@ -378,7 +510,7 @@ export async function submitOverlayTransaction(input: unknown): Promise<OverlayS
           output_script: output.outputScript,
           raw_tx: normalized.rawTx,
           beef: normalized.beef,
-          confirmed: normalized.confirmed,
+          confirmed,
           wallet_index: getBindingForTopic(topic).walletIndex,
           utxo_role: 'pool',
         })

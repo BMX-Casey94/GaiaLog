@@ -11,10 +11,14 @@
  * Opt out: BSV_ARC_STATUS_POLL_DISABLED=true
  * Interval: BSV_ARC_STATUS_POLL_INTERVAL_MS (default 15000, min 5000)
  * Batch: BSV_ARC_STATUS_POLL_BATCH (default 20, min 1)
+ * 404 budget: BSV_ARC_POLL_MAX_404_MISSES (default 10, min 1) — after this many
+ *   consecutive 404s the row is polled with capped exponential backoff (max
+ *   1 hour) instead of every cycle. It is never dropped: a dropped row would
+ *   strand its change outputs at acquirable_at = 'infinity'.
  */
 
-import { upsertArcBroadcastStatus } from './arc-broadcast-status'
 import {
+  arcBroadcastPhaseForDb,
   arcFollowUp,
   classifyArcTxStatus,
   shouldPersistArcPhase,
@@ -27,6 +31,16 @@ import { refreshTopicCounts, withOverlayTransaction } from './overlay-repository
 const ENABLED = !envBool('BSV_ARC_STATUS_POLL_DISABLED', false)
 const INTERVAL_MS = envInt('BSV_ARC_STATUS_POLL_INTERVAL_MS', 15_000, 5_000)
 const BATCH_SIZE = envInt('BSV_ARC_STATUS_POLL_BATCH', 20, 1)
+/**
+ * Number of consecutive HTTP 404s after which a txid stops being polled every
+ * cycle. 404 is usually ARC having pruned the transaction from its store —
+ * sometimes because it was never broadcast through this endpoint — but it is
+ * not authoritative, so the row is backed off rather than dropped: dropping it
+ * would leave its change outputs at acquirable_at = 'infinity' forever.
+ */
+const MAX_404_MISSES = envInt('BSV_ARC_POLL_MAX_404_MISSES', 10, 1)
+/** Bound on the per-txid 404 counter map; oldest entries are evicted first. */
+const MAX_404_TRACKED_TXIDS = 5_000
 const GET_GAP_MS = 200
 const GET_TIMEOUT_MS = 8_000
 const RATE_LIMIT_COOLDOWN_MS = 60_000
@@ -42,6 +56,13 @@ let timer: NodeJS.Timeout | null = null
 let running = false
 let cooldownUntil = 0
 let missingTableLogged = false
+/**
+ * Consecutive HTTP 404 counts per txid, bounded so a long-running worker
+ * cannot leak memory. Insertion order is eviction order (Map semantics).
+ */
+const notFoundMisses = new Map<string, number>()
+/** Upper bound on the growth of a single txid's 404 backoff. */
+const MAX_404_BACKOFF_MS = 60 * 60_000
 
 function envInt(name: string, fallback: number, min = 0): number {
   const raw = process.env[name]
@@ -66,6 +87,59 @@ function isUndefinedTable(err: unknown): boolean {
   )
 }
 
+/**
+ * Record one consecutive 404 for a txid.
+ *
+ * The map is bounded (MAX_404_TRACKED_TXIDS) and evicts the oldest entry, so a
+ * worker with a long uptime cannot accumulate unbounded state. It holds counts
+ * only: the *schedule* lives in the database (see scheduleNextPoll), so a
+ * restart cannot cause a stampede on rows that were mid-backoff.
+ *
+ * A 404 is a definite "ARC does not have it", but ARC's store is not
+ * authoritative for a transaction that may still be mined elsewhere, so the row
+ * is never dropped: its change outputs would otherwise stay at
+ * acquirable_at = 'infinity' forever.
+ */
+function recordNotFound(txid: string): { misses: number; backoffMs: number } {
+  const previous = notFoundMisses.get(txid) || 0
+  const misses = Math.min(previous + 1, MAX_404_MISSES + 8)
+  // Below the budget the row simply rotates and is retried next cycle. At the
+  // budget it starts at 8 intervals (2 min at the default 15 s cadence) and
+  // doubles, so the row settles at one poll per hour rather than one per
+  // cycle — without ever being dropped.
+  const backoffMs = misses < MAX_404_MISSES
+    ? 0
+    : Math.min(MAX_404_BACKOFF_MS, INTERVAL_MS * 8 * 2 ** (misses - MAX_404_MISSES))
+
+  notFoundMisses.delete(txid)
+  notFoundMisses.set(txid, misses)
+  while (notFoundMisses.size > MAX_404_TRACKED_TXIDS) {
+    const oldest = notFoundMisses.keys().next()
+    if (oldest.done) break
+    notFoundMisses.delete(oldest.value)
+  }
+  return { misses, backoffMs }
+}
+
+/** Clear a txid's miss count after ARC answered for it again. */
+function clearNotFound(txid: string): void {
+  notFoundMisses.delete(txid)
+}
+
+/**
+ * Push a backed-off row to the back of the open-batch queue (which is ordered
+ * by `updated_at ASC`) instead of writing it once per cycle. One statement per
+ * threshold crossing rather than one every 15 seconds per stranded txid.
+ */
+async function scheduleNextPoll(txid: string, delayMs: number): Promise<void> {
+  await query(
+    `UPDATE arc_broadcast_status
+        SET updated_at = now() + ($2::bigint * interval '1 millisecond')
+      WHERE txid = $1`,
+    [txid, Math.max(1, Math.floor(delayMs))],
+  )
+}
+
 interface OpenBroadcastRow {
   txid: string
   phase: ArcPhase
@@ -81,6 +155,36 @@ function endpointFor(acceptedVia: string): { endpoint: string; apiKey: string } 
 
 async function bumpUpdatedAt(txid: string): Promise<void> {
   await query(`UPDATE arc_broadcast_status SET updated_at = now() WHERE txid = $1`, [txid])
+}
+
+/**
+ * Persist the new phase, clamped to what `arc_broadcast_status.phase`'s CHECK
+ * constraint accepts (db/migrations/0032 — no `immutable`). `arcBroadcastPhaseForDb`
+ * maps `immutable` → `mined`, which every reader already treats as confirmed
+ * and which keeps the row out of this poller's open-batch index.
+ *
+ * Guard mirrors lib/arc-broadcast-status.ts: a `mined` row is only replaced by
+ * another confirmation or a reorg, so a late duplicate poll cannot regress it.
+ */
+async function persistArcPhase(
+  txid: string,
+  txStatus: string,
+  acceptedVia: string,
+  phase: ArcPhase,
+): Promise<void> {
+  const dbPhase = arcBroadcastPhaseForDb(phase)
+  await query(
+    `INSERT INTO arc_broadcast_status (txid, tx_status, phase, accepted_via, updated_at)
+     VALUES ($1, $2, $3, $4, now())
+     ON CONFLICT (txid) DO UPDATE SET
+       tx_status = EXCLUDED.tx_status,
+       phase = EXCLUDED.phase,
+       accepted_via = EXCLUDED.accepted_via,
+       updated_at = now()
+     WHERE arc_broadcast_status.phase <> 'mined'
+        OR EXCLUDED.phase IN ('mined', 'reorg')`,
+    [txid, txStatus, dbPhase, acceptedVia],
+  )
 }
 
 async function unlockChangeOutputs(txid: string): Promise<void> {
@@ -99,15 +203,23 @@ async function applySeen(txid: string): Promise<void> {
 }
 
 async function applyMined(txid: string, blockHeight: number): Promise<void> {
-  await unlockChangeOutputs(txid)
-  await query(
-    `UPDATE overlay_admitted_utxos
-        SET confirmed = true
-      WHERE txid = $1
-        AND removed = false
-        AND confirmed = false`,
-    [txid],
-  )
+  // One atomic UPDATE inside a single transaction: `confirmed` and a
+  // spendable `acquirable_at` must land together or not at all. Previously a
+  // separate unlockChangeOutputs ran first, so a crash between the two left
+  // the change unspendable; and a concurrent reorg pass could interleave and
+  // leave confirmed=true with acquirable_at='infinity'.
+  await withOverlayTransaction(async (client) => {
+    await client.query(
+      `UPDATE overlay_admitted_utxos
+          SET confirmed = true,
+              acquirable_at = LEAST(acquirable_at, now())
+        WHERE txid = $1
+          AND removed = false
+          AND (confirmed = false OR acquirable_at > now())`,
+      [txid],
+    )
+  })
+
   await confirmReading(txid, blockHeight, null)
   try {
     await query(
@@ -243,6 +355,7 @@ async function applyFollowUp(
 
 type GetResult =
   | { kind: 'rate-limited' }
+  | { kind: 'not-found' }
   | { kind: 'transport' }
   | { kind: 'ok'; txStatus: string; blockHeight: number }
 
@@ -263,6 +376,9 @@ async function getArcTxStatus(acceptedVia: string, txid: string): Promise<GetRes
     })
 
     if (res.status === 429) return { kind: 'rate-limited' }
+    // 404 is a definite answer ("ARC does not know this txid"), which is a
+    // different situation from a transport failure that says nothing at all.
+    if (res.status === 404) return { kind: 'not-found' }
     if (res.status !== 200) return { kind: 'transport' }
 
     const body = await res.json().catch(() => null)
@@ -293,10 +409,14 @@ async function getArcTxStatus(acceptedVia: string, txid: string): Promise<GetRes
 async function fetchOpenBatch(): Promise<OpenBroadcastRow[] | null> {
   try {
     const result = await query<OpenBroadcastRow>(
+      // `updated_at <= now()` is what makes per-row 404 backoff real: a row
+      // pushed into the future (scheduleNextPoll) is skipped entirely rather
+      // than re-picked immediately when the open set is smaller than BATCH_SIZE.
       `SELECT txid, phase, accepted_via
          FROM arc_broadcast_status
         WHERE phase IN ('orphan', 'pending', 'seen', 'reorg')
           AND accepted_via IN ('taal_arc', 'gorillapool_arc')
+          AND updated_at <= now()
         ORDER BY updated_at ASC
         LIMIT $1`,
       [BATCH_SIZE],
@@ -339,6 +459,35 @@ async function runCycle(): Promise<void> {
         break
       }
 
+      if (result.kind === 'not-found') {
+        const { misses, backoffMs } = recordNotFound(row.txid)
+        try {
+          if (backoffMs === 0) {
+            // Below the threshold: ordinary rotation, next cycle retries.
+            await bumpUpdatedAt(row.txid)
+          } else {
+            // At/over the threshold: push the row out of the hot window. One
+            // write per threshold crossing, not one per cycle.
+            await scheduleNextPoll(row.txid, backoffMs)
+            if (misses === MAX_404_MISSES) {
+              console.warn(
+                `[arc-status-poller] ${row.txid.substring(0, 12)}…: ${MAX_404_MISSES} consecutive 404s. ` +
+                  `Backing off (max ${Math.round(MAX_404_BACKOFF_MS / 60_000)} min between polls); the row ` +
+                  `stays open so a later confirmation is still picked up. Tune with ` +
+                  `BSV_ARC_POLL_MAX_404_MISSES.`,
+              )
+            }
+          }
+        } catch (err) {
+          console.warn(
+            `[arc-status-poller] 404 bookkeeping for ${row.txid.substring(0, 12)}… failed: ${
+              err instanceof Error ? err.message : err
+            }`,
+          )
+        }
+        continue
+      }
+
       if (result.kind === 'transport') {
         try {
           await bumpUpdatedAt(row.txid)
@@ -352,7 +501,10 @@ async function runCycle(): Promise<void> {
         continue
       }
 
-      const next = classifyArcTxStatus(result.txStatus)
+      clearNotFound(row.txid)
+      // ARC's own status endpoint: DOUBLE_SPEND_ATTEMPTED here means ARC has
+      // seen a competing spend, not that this transaction lost. Keep holding.
+      const next = classifyArcTxStatus(result.txStatus, 'arc')
       try {
         if (!shouldPersistArcPhase(row.phase, next)) {
           await bumpUpdatedAt(row.txid)
@@ -360,11 +512,7 @@ async function runCycle(): Promise<void> {
         }
 
         await applyFollowUp(arcFollowUp(next), row.txid, result.blockHeight)
-        await upsertArcBroadcastStatus({
-          txid: row.txid,
-          txStatus: result.txStatus,
-          acceptedVia: row.accepted_via,
-        })
+        await persistArcPhase(row.txid, result.txStatus, row.accepted_via, next)
       } catch (err) {
         console.warn(
           `[arc-status-poller] apply(${row.txid.substring(0, 12)}… → ${next}) failed: ${

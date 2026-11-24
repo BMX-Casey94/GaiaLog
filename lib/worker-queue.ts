@@ -1,9 +1,14 @@
-import { bsvTransactionService, BSVTransactionData } from './bsv-transaction-service'
-import { blockchainService } from './blockchain'
+import type { BSVTransactionData } from './bsv-transaction-service'
+import {
+  blockchainService,
+  isEndpointBackoffError,
+  isFeeTooLowBroadcastError,
+  isTerminalBroadcastError,
+} from './blockchain'
 import { bsvConfig } from './bsv-config'
 import { walletManager } from './wallet-manager'
-import { setAdvancedTxId, setAirQualityTxId, setSeismicTxId, setWaterLevelTxId, hasAirQualityTxId, hasWaterLevelTxId, hasSeismicTxId, hasAdvancedTxId } from './repositories'
-import { ensureQueueTable, enqueueQueueItem, claimPendingQueueItems, reclaimStuckQueueItems, markQueueItemCompleted, markQueueItemFailed, markQueueItemsProcessing, requeueQueueItem, cleanupOldFailedItems } from './queue-repository'
+import { setAdvancedTxId, setAirQualityTxId, setSeismicTxId, setWaterLevelTxId, hasAirQualityTxId, hasWaterLevelTxId, hasSeismicTxId, hasAdvancedTxId, hasWrittenReading, recordWrittenReading } from './repositories'
+import { ensureQueueTable, enqueueQueueItem, claimPendingQueueItems, reclaimStuckQueueItems, markQueueItemCompleted, markQueueItemFailed, markQueueItemsProcessing, requeueQueueItem, cleanupOldFailedItems, setQueueItemBroadcastTxid } from './queue-repository'
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getOverlayFallbackConfig } from './overlay-config'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet } from './spend-source'
@@ -11,6 +16,25 @@ import { getQueueGateMinConfirmations } from './utxo-spend-policy'
 import { normaliseDataFamily, resolveSourceLabel } from './stream-registry'
 import { throughputObservability } from './throughput-observability'
 import { isWritePausedForFunding } from './write-dry-mode'
+
+/**
+ * A broadcast txid: 32 bytes as 64 hex characters.
+ *
+ * Used to gate `markQueueItemCompleted`. The blockchain service used to return
+ * the sentinel string 'blockchain-not-configured' when no signing key was
+ * present, and any non-empty string was accepted as a completed broadcast —
+ * so readings were marked on-chain without a transaction existing.
+ */
+const TXID_PATTERN = /^[0-9a-fA-F]{64}$/
+
+/**
+ * Upper bound on the in-memory failed-item list.
+ *
+ * Nothing drains it: a failed item is retained for the lifetime of the process
+ * for diagnostics only. At production failure rates that is unbounded growth in
+ * the same process the heap guard is trying to keep stable.
+ */
+const MAX_FAILED_ITEMS_IN_MEMORY = 500
 
 export interface QueueItem {
   id: string
@@ -388,9 +412,14 @@ export class WorkerQueue {
         return
       }
 
-      if (!bsvTransactionService.isReady()) {
-        if (this.shouldLogQueueSkip('txServiceNotReady')) {
-          console.warn(`🔍 [queue-debug] Skipping processQueue: bsvTransactionService not ready (items=${totalItems})`)
+      // Readiness gate: writes go through `blockchainService.writeToChain`,
+      // which needs a signing key and therefore a usable wallet manager.
+      // `bsvTransactionService` was never on that path — it is a deprecated
+      // façade kept alive only for `/api/bsv/stats`, so gating on it meant the
+      // queue could stall on a service that performs no work.
+      if (!walletManager.isReady()) {
+        if (this.shouldLogQueueSkip('walletNotReady')) {
+          console.warn(`🔍 [queue-debug] Skipping processQueue: walletManager not ready (items=${totalItems})`)
         }
         return
       }
@@ -524,15 +553,64 @@ export class WorkerQueue {
       // Prefer direct on-chain write via blockchain service
       const stream = this.mapTypeToStream(item.data.family || item.data.type)
       const payload = this.buildPayloadFromItem(item)
-      // Hard idempotency guard: if DB already has a txid for this reading, skip
-      try {
-        const sourceHash = item.data.source_hash
-        if (typeof sourceHash === 'string' && sourceHash.length > 0) {
-          let alreadyOnChain = false
-          if (stream === 'air_quality') alreadyOnChain = await hasAirQualityTxId(sourceHash)
-          else if (stream === 'water_levels') alreadyOnChain = await hasWaterLevelTxId(sourceHash)
-          else if (stream === 'seismic_activity') alreadyOnChain = await hasSeismicTxId(sourceHash)
-          else if (stream === 'advanced_metrics') alreadyOnChain = await hasAdvancedTxId(sourceHash)
+      // Hard idempotency guard: if this reading already has a broadcast txid
+      // recorded, skip it. Three sources of that record:
+      //
+      //   1. the queue row's own `broadcastTxid` — set the instant a broadcast
+      //      returned, before the durable records below. Covers a crash in the
+      //      window between the broadcast and those records.
+      //   2. written_readings — covers all 17 families, written immediately
+      //      after a successful broadcast, before the queue row is cleared.
+      //   3. the four legacy per-family txid columns — still consulted for
+      //      readings broadcast before written_readings existed, and as a
+      //      backstop if the ledger write was lost.
+      //
+      // Any match means a txid already exists for this content, so broadcasting
+      // again would pay twice for the same reading.
+
+      // (1) is a local field, so it cannot fail and is checked outside the
+      // try/catch below.
+      const guardSourceHash = item.data.source_hash
+      const broadcastTxid = (item.data as any)?.broadcastTxid
+      if (typeof broadcastTxid === 'string' && TXID_PATTERN.test(broadcastTxid)) {
+        if (typeof guardSourceHash === 'string' && guardSourceHash.length > 0) {
+          // Backfill the durable records this row never got to write.
+          try {
+            await recordWrittenReading(stream, guardSourceHash, broadcastTxid)
+          } catch {}
+        }
+        throughputObservability.recordAlreadyOnChainDropped({
+          family: item.data.family || stream,
+          providerId: item.data.providerId,
+          datasetId: item.data.datasetId,
+          queueLane: item.data.queueLane,
+        })
+        if (bsvConfig.logging.level !== 'error') {
+          console.log(
+            `⏭️  Item ${item.id} was already broadcast (${broadcastTxid.slice(0, 12)}...) before a crash; ` +
+              `recording and completing without re-broadcasting`,
+          )
+        }
+        this.completedCount++
+        this.stats.totalProcessed++
+        markQueueItemCompleted(item.id).catch(() => {})
+        return
+      }
+
+      // (2) and (3) are database reads. They fail closed: if the lookup errors
+      // for any reason other than the table not existing yet, the item is
+      // retried rather than broadcast. The previous `catch {}` treated a failed
+      // lookup as "not on chain", so a database blip during the check converted
+      // straight into a duplicate broadcast that had already been paid for.
+      if (typeof guardSourceHash === 'string' && guardSourceHash.length > 0) {
+        try {
+          let alreadyOnChain = await hasWrittenReading(stream, guardSourceHash)
+          if (!alreadyOnChain) {
+            if (stream === 'air_quality') alreadyOnChain = await hasAirQualityTxId(guardSourceHash)
+            else if (stream === 'water_levels') alreadyOnChain = await hasWaterLevelTxId(guardSourceHash)
+            else if (stream === 'seismic_activity') alreadyOnChain = await hasSeismicTxId(guardSourceHash)
+            else if (stream === 'advanced_metrics') alreadyOnChain = await hasAdvancedTxId(guardSourceHash)
+          }
           if (alreadyOnChain) {
             throughputObservability.recordAlreadyOnChainDropped({
               family: item.data.family || stream,
@@ -548,10 +626,18 @@ export class WorkerQueue {
             markQueueItemCompleted(item.id).catch(() => {})
             return
           }
+        } catch (guardErr) {
+          const msg = guardErr instanceof Error ? guardErr.message : String(guardErr)
+          console.warn(`⚠️ Idempotency lookup failed for item ${item.id}; not broadcasting: ${msg}`)
+          await this.handleFailedItem(item, `Idempotency lookup failed: ${msg}`)
+          return
         }
-      } catch {}
+      }
+      // writeToChain throwing is handled above, so reaching here means the call
+      // returned. The old `wasBroadcast` flag and its else-branch were dead:
+      // the flag was set on the line after the await, and the only way to skip
+      // it was the throw that already returned.
       let resultTxid: string | null = null
-      let wasBroadcast = false
       try {
         if (this.shouldLogQueueSkip('writeToChainEnter')) {
           console.log(`🔍 [queue-debug] Entering writeToChain for item ${item.id} (stream=${stream})`)
@@ -566,7 +652,6 @@ export class WorkerQueue {
           traceId: item.id,
           payload,
         })
-        wasBroadcast = true
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Unknown error'
         if (this.shouldLogQueueSkip('writeToChainError')) {
@@ -583,50 +668,100 @@ export class WorkerQueue {
         return
       }
 
-      if (resultTxid && wasBroadcast) {
-        // Success - move to completed
-        this.completedCount++
-        this.stats.totalProcessed++
-        this.processedCountSinceLastSample++
-        if (bsvConfig.logging.level === 'debug') {
-          console.log(`✅ Processed transaction: ${item.id} -> ${resultTxid}`)
-        }
-        markQueueItemCompleted(item.id).catch(() => {})
-        // Try to link txid back to reading row via source_hash when available
-        try {
-          const s = stream
-          const sourceHash = item.data.source_hash
-          if (sourceHash && typeof sourceHash === 'string') {
-            const providerLabel = resolveSourceLabel(
-              item.data.providerId,
-              item.data.datasetId,
-              item.data.sourceLabel || item.data.measurement?.source || null,
-            )
-            if (s === 'air_quality') {
-              await setAirQualityTxId(sourceHash, resultTxid)
-              try { const { upsertAirQualityOnchain } = await import('./repositories'); await upsertAirQualityOnchain(resultTxid, providerLabel, new Date(item.data.timestamp), item.data) } catch {}
-            } else if (s === 'water_levels') {
-              await setWaterLevelTxId(sourceHash, resultTxid)
-              try { const { upsertWaterLevelsOnchain } = await import('./repositories'); await upsertWaterLevelsOnchain(resultTxid, providerLabel, new Date(item.data.timestamp), item.data) } catch {}
-            } else if (s === 'seismic_activity') {
-              await setSeismicTxId(sourceHash, resultTxid)
-              try { const { upsertSeismicOnchain } = await import('./repositories'); await upsertSeismicOnchain(resultTxid, providerLabel, new Date(item.data.timestamp), item.data) } catch {}
-            } else if (s === 'advanced_metrics') {
-              await setAdvancedTxId(sourceHash, resultTxid)
-              try { const { upsertAdvancedOnchain } = await import('./repositories'); await upsertAdvancedOnchain(resultTxid, providerLabel, new Date(item.data.timestamp), item.data) } catch {}
-            }
-          }
-        } catch (linkErr) {
-          console.warn('txid link (worker-queue) error:', linkErr)
-        }
-      } else if (!wasBroadcast) {
-        // Placeholder path used: schedule retry to attempt real broadcast later
-        await this.handleFailedItem(item, 'placeholder_fallback_used')
+      // A broadcast is only complete when the network returned a real 64-hex
+      // transaction id. Anything else — 'blockchain-not-configured', a provider
+      // error string, a truncated hash — is a failure that must retry, not a
+      // success that marks the reading as written. Previously any non-empty
+      // string counted as a completed broadcast, which recorded a reading as
+      // on-chain when no transaction existed.
+      if (!TXID_PATTERN.test(resultTxid)) {
+        await this.handleFailedItem(
+          item,
+          `Broadcast returned a non-txid result (${String(resultTxid).slice(0, 64)})`,
+        )
         return
-      } else {
-        // Failed - handle retry logic
-        await this.handleFailedItem(item, 'Unknown error')
       }
+
+      // Mark this reading as broadcast before doing anything fallible.
+      //
+      // Two places, for two different reasons:
+      //   - the in-memory item, so any retry within this process takes the
+      //     broadcastTxid branch of the idempotency guard and completes rather
+      //     than broadcasting a second, separately-paid transaction;
+      //   - the queue row, so the same holds across a restart or another worker
+      //     reclaiming the row.
+      //
+      // Awaited: if the row write fails we still hold the in-memory marker, and
+      // logging it is enough — blocking completion here would trade one risk
+      // (a duplicate broadcast) for a worse one (a reading broadcast but never
+      // recorded).
+      ;(item.data as any).broadcastTxid = resultTxid
+      try {
+        await setQueueItemBroadcastTxid(item.id, resultTxid)
+      } catch (markErr) {
+        console.warn(
+          `⚠️ Could not record broadcast txid on queue row ${item.id}:`,
+          markErr instanceof Error ? markErr.message : markErr,
+        )
+      }
+
+      // Order matters. The durable records of "this reading is on-chain" are
+      // written first: written_readings (all families) and the legacy
+      // per-family txid column. Only then is the queue row removed.
+      //
+      // markQueueItemCompleted deletes the row, so doing it first leaves a
+      // window where the row is gone and the reading is unrecorded. A crash
+      // in that window loses the reading silently — the dedupe gate has
+      // nothing to match, and the item cannot be re-collected because the
+      // collector's dedupe store may still hold its key. In this order a
+      // crash instead leaves the queue row for reclaim, which then sees the
+      // recorded txid and skips the re-broadcast.
+      try {
+        const sourceHash = item.data.source_hash
+        if (sourceHash && typeof sourceHash === 'string') {
+          try {
+            await recordWrittenReading(stream, sourceHash, resultTxid)
+          } catch (ledgerErr) {
+            // Do NOT complete the item on a ledger failure: without the
+            // record, the reclaim path would broadcast this reading a second
+            // time. Retry instead.
+            const msg = ledgerErr instanceof Error ? ledgerErr.message : String(ledgerErr)
+            await this.handleFailedItem(item, `written_readings record failed: ${msg}`)
+            return
+          }
+
+          const providerLabel = resolveSourceLabel(
+            item.data.providerId,
+            item.data.datasetId,
+            item.data.sourceLabel || item.data.measurement?.source || null,
+          )
+          const s = stream
+          if (s === 'air_quality') {
+            await setAirQualityTxId(sourceHash, resultTxid)
+            try { const { upsertAirQualityOnchain } = await import('./repositories'); await upsertAirQualityOnchain(resultTxid, providerLabel, new Date(item.data.timestamp), item.data) } catch {}
+          } else if (s === 'water_levels') {
+            await setWaterLevelTxId(sourceHash, resultTxid)
+            try { const { upsertWaterLevelsOnchain } = await import('./repositories'); await upsertWaterLevelsOnchain(resultTxid, providerLabel, new Date(item.data.timestamp), item.data) } catch {}
+          } else if (s === 'seismic_activity') {
+            await setSeismicTxId(sourceHash, resultTxid)
+            try { const { upsertSeismicOnchain } = await import('./repositories'); await upsertSeismicOnchain(resultTxid, providerLabel, new Date(item.data.timestamp), item.data) } catch {}
+          } else if (s === 'advanced_metrics') {
+            await setAdvancedTxId(sourceHash, resultTxid)
+            try { const { upsertAdvancedOnchain } = await import('./repositories'); await upsertAdvancedOnchain(resultTxid, providerLabel, new Date(item.data.timestamp), item.data) } catch {}
+          }
+        }
+      } catch (linkErr) {
+        console.warn('txid link (worker-queue) error:', linkErr)
+      }
+
+      // Success - the reading is recorded on-chain, so the queue row can go.
+      this.completedCount++
+      this.stats.totalProcessed++
+      this.processedCountSinceLastSample++
+      if (bsvConfig.logging.level === 'debug') {
+        console.log(`✅ Processed transaction: ${item.id} -> ${resultTxid}`)
+      }
+      markQueueItemCompleted(item.id).catch(() => {})
 
     } catch (error) {
       await this.handleFailedItem(item, error instanceof Error ? error.message : 'Unknown error')
@@ -767,14 +902,54 @@ export class WorkerQueue {
     this.stats.totalRetries++
     const errorUpper = String(error || '').toUpperCase()
 
-    if (item.retryCount <= item.maxRetries) {
+    // The row is about to go back to 'queued' (retry) or 'failed' (terminal). In
+    // both cases this worker's claim on it is over, so the flag must be cleared.
+    //
+    // Leaving it set was a live bug: processQueue treats dbClaimed=true as "I
+    // already own this row" and skips markQueueItemsProcessing. A retried item
+    // therefore re-entered the batch still claiming ownership of a row it no
+    // longer held, and could be broadcast without ever re-winning the claim —
+    // which is exactly the double-broadcast the claim exists to prevent.
+    item.dbClaimed = false
+
+    // A deterministic rejection must not consume the retry budget.
+    //
+    // `TERMINAL_BROADCAST_ERROR` means the broadcaster parsed the transaction
+    // and judged it invalid — a bad script, a bad signature, a competing spend.
+    // Every host validates the same bytes against the same consensus rules, so
+    // the identical transaction cannot become valid on a later attempt.
+    // Retrying it burns attempts, delays the queue behind it, and buries the
+    // real cause under retry noise. It goes straight to the permanent-failure
+    // branch, where the durable row keeps the full error text.
+    //
+    // Classification comes from `lib/blockchain.ts` rather than a second copy of
+    // the tags, so the producer and the consumer of these errors cannot drift.
+    const terminalRejection = isTerminalBroadcastError(error)
+
+    if (!terminalRejection && item.retryCount <= item.maxRetries) {
       // Determine retry strategy based on error type
       let delay = bsvConfig.transaction.retryDelayMs * Math.pow(2, item.retryCount - 1)
       let shouldForceUtxoRefresh = false
       let retryMessage = ''
 
+      const feeTooLow = isFeeTooLowBroadcastError(error)
+      const endpointBackoff = isEndpointBackoffError(error)
+
       // Enhanced error-specific retry strategies
-      if (/MEMPOOL_CONFLICT|TXN-MEMPOOL-CONFLICT|DOUBLE_SPEND|DOUBLE_SPEND_ATTEMPTED/.test(errorUpper)) {
+      if (feeTooLow) {
+        // The transaction was rebuilt once at a higher multiplier and still
+        // under-paid, so the policy rate moved again. A longer backoff lets the
+        // cached rate expire; the next attempt rebuilds from a fresh read.
+        delay = Math.max(delay, 60000)
+        shouldForceUtxoRefresh = false
+        retryMessage = 'fee below broadcaster policy, waiting for the rate to settle'
+      } else if (endpointBackoff) {
+        // The endpoint asked for a delay. Nothing was learned about the
+        // transaction, so the input reservation must stay intact.
+        delay = Math.max(delay, 30000)
+        shouldForceUtxoRefresh = false
+        retryMessage = 'broadcaster backpressure, retrying after its requested delay'
+      } else if (/MEMPOOL_CONFLICT|TXN-MEMPOOL-CONFLICT|DOUBLE_SPEND|DOUBLE_SPEND_ATTEMPTED/.test(errorUpper)) {
         // Mempool conflict: wait longer and force UTXO refresh to use different inputs
         delay = Math.max(delay, 30000) // At least 30 seconds
         shouldForceUtxoRefresh = true
@@ -855,12 +1030,29 @@ export class WorkerQueue {
       requeueQueueItem(item.id, item.retryCount, delay).catch(() => {})
       this.retryScheduledCount++
     } else {
-      // Max retries exceeded - move to failed
+      // Max retries exceeded - move to failed.
+      //
+      // Retained for diagnostics only, so it is bounded: the oldest entry is
+      // dropped once the cap is reached. The durable record of the failure is
+      // the worker_queue row, which markQueueItemFailed writes with the full
+      // error text.
       this.failedItems.push(item)
+      while (this.failedItems.length > MAX_FAILED_ITEMS_IN_MEMORY) {
+        this.failedItems.shift()
+      }
       this.stats.totalFailed++
       this.failedCountSinceLastSample++
       if (bsvConfig.logging.level !== 'error') {
-        console.error(`❌ Failed item ${item.id} after ${item.maxRetries} retries: ${error}`)
+        if (terminalRejection) {
+          // Named once, with the code: this reading needs a code change or an
+          // operator, not another attempt.
+          console.error(
+            `❌ Permanently rejected by the broadcaster (not retried, attempt ${item.retryCount}/${item.maxRetries}): ` +
+              `${item.id}: ${error.substring(0, 400)}`,
+          )
+        } else {
+          console.error(`❌ Failed item ${item.id} after ${item.maxRetries} retries: ${error}`)
+        }
       }
       markQueueItemFailed(item.id, error).catch(() => {})
     }

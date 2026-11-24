@@ -3563,75 +3563,265 @@ export interface AisVesselPosition {
   destination: string
 }
 
+const AIS_BUFFER_MAX = 10000
+// Defaults match the operational contract (30s heartbeat, 5s->120s backoff).
+// Both are env-overridable so operators can tune them without a code change and
+// so the reconnect/heartbeat paths can be exercised in tests.
+const AIS_HEARTBEAT_MS = Math.max(50, Number(process.env.AISSTREAM_HEARTBEAT_MS) || 30_000)
+const AIS_BACKOFF_BASE_MS = Math.max(50, Number(process.env.AISSTREAM_BACKOFF_BASE_MS) || 5_000)
+const AIS_BACKOFF_MAX_MS = Math.max(AIS_BACKOFF_BASE_MS, Number(process.env.AISSTREAM_BACKOFF_MAX_MS) || 120_000)
+// Overridable so deployments can point at a regional relay or a mirror without
+// a code change. Defaults to the public AISStream endpoint.
+const AIS_DEFAULT_URL = 'wss://stream.aisstream.io/v0/stream'
+
+function getAisStreamUrl(): string {
+  const configured = (process.env.AISSTREAM_WS_URL || '').trim()
+  return configured || AIS_DEFAULT_URL
+}
+
 const _aisBuffer: AisVesselPosition[] = []
 let _aisConnected = false
+let _aisSocket: AisSocket | null = null
+let _aisReconnectTimer: ReturnType<typeof setTimeout> | null = null
+let _aisHeartbeatTimer: ReturnType<typeof setInterval> | null = null
+let _aisAwaitingPong = false
+let _aisBackoffMs = AIS_BACKOFF_BASE_MS
+let _aisStopped = false
+let _aisLoadErrorLogged = false
+
+// Minimal structural type for the ws socket, so this module does not need a
+// hard build-time dependency on @types/ws for its public API.
+type AisSocket = {
+  on(event: 'open', handler: () => void): void
+  on(event: 'message', handler: (raw: any) => void): void
+  on(event: 'close', handler: (code?: number, reason?: any) => void): void
+  on(event: 'error', handler: (error: any) => void): void
+  on(event: 'pong', handler: () => void): void
+  send(data: string): void
+  ping(): void
+  terminate(): void
+  close(): void
+  readyState?: number
+}
+
+/**
+ * Resolve the `ws` constructor lazily so a missing dependency degrades to a
+ * clear log line instead of a module-load crash.
+ */
+async function loadWebSocketCtor(): Promise<(new (url: string) => AisSocket) | null> {
+  try {
+    const mod: any = await import('ws')
+    const ctor = mod?.default ?? mod?.WebSocket ?? mod
+    return typeof ctor === 'function' ? ctor : null
+  } catch (error) {
+    if (!_aisLoadErrorLogged) {
+      _aisLoadErrorLogged = true
+      console.error(
+        '❌ AISStream disabled: the "ws" package is not installed or failed to load. ' +
+        'Run `npm install` to restore WebSocket support.',
+        error instanceof Error ? error.message : error,
+      )
+    }
+    return null
+  }
+}
 
 export function getAisBufferSnapshot(limit: number = 500): AisVesselPosition[] {
   const snapshot = _aisBuffer.splice(0, limit)
   return snapshot
 }
 
-export function startAisStream(): void {
-  const apiKey = process.env.AISSTREAM_API_KEY
-  if (!apiKey || _aisConnected) return
+/** True only while the AISStream WebSocket is actually open. */
+export function isAisStreamConnected(): boolean {
+  return _aisConnected
+}
 
-  _aisConnected = true
+function clearAisTimers(): void {
+  if (_aisHeartbeatTimer) {
+    clearInterval(_aisHeartbeatTimer)
+    _aisHeartbeatTimer = null
+  }
+  _aisAwaitingPong = false
+}
 
-  const connectWs = () => {
-    try {
-      const WebSocket = require('ws')
-      const ws = new WebSocket('wss://stream.aisstream.io/v0/stream')
+function stopAisHeartbeat(): void {
+  clearAisTimers()
+}
 
-      ws.on('open', () => {
-        ws.send(JSON.stringify({
-          APIKey: apiKey,
-          BoundingBoxes: [[[-90, -180], [90, 180]]],
-          FilterMessageTypes: ['PositionReport', 'ShipStaticData'],
-        }))
-      })
-
-      ws.on('message', (raw: Buffer) => {
-        try {
-          const msg = JSON.parse(raw.toString())
-          const meta = msg?.MetaData
-          if (!meta) return
-
-          const pos: AisVesselPosition = {
-            timestamp: meta.time_utc ? new Date(meta.time_utc).getTime() : Date.now(),
-            source: 'AISStream',
-            mmsi: String(meta.MMSI || ''),
-            vesselName: meta.ShipName || '',
-            shipType: meta.ShipType || 0,
-            latitude: meta.latitude || 0,
-            longitude: meta.longitude || 0,
-            heading: msg?.Message?.PositionReport?.TrueHeading || 0,
-            course: msg?.Message?.PositionReport?.Cog || 0,
-            speed: msg?.Message?.PositionReport?.Sog || 0,
-            destination: msg?.Message?.ShipStaticData?.Destination || '',
-          }
-
-          if (_aisBuffer.length < 10000) {
-            _aisBuffer.push(pos)
-          }
-        } catch { /* malformed message */ }
-      })
-
-      ws.on('close', () => {
-        _aisConnected = false
-        setTimeout(connectWs, 30000)
-      })
-
-      ws.on('error', () => {
-        _aisConnected = false
-        setTimeout(connectWs, 60000)
-      })
-    } catch {
-      _aisConnected = false
+function startAisHeartbeat(socket: AisSocket): void {
+  clearAisTimers()
+  _aisHeartbeatTimer = setInterval(() => {
+    if (socket !== _aisSocket) {
+      clearAisTimers()
+      return
     }
+    if (_aisAwaitingPong) {
+      console.warn('⚠️ AISStream heartbeat missed; terminating socket')
+      stopAisHeartbeat()
+      try { socket.terminate() } catch { /* already gone */ }
+      return
+    }
+    _aisAwaitingPong = true
+    try {
+      socket.ping()
+    } catch {
+      stopAisHeartbeat()
+      try { socket.terminate() } catch { /* already gone */ }
+    }
+  }, AIS_HEARTBEAT_MS)
+  // Do not hold the event loop open solely for the heartbeat.
+  if (typeof _aisHeartbeatTimer.unref === 'function') _aisHeartbeatTimer.unref()
+}
+
+// Exactly one pending reconnect at a time. Both 'close' and 'error' funnel
+// through here, so a socket that errors then closes cannot schedule two
+// overlapping connections.
+function scheduleAisReconnect(reason: string): void {
+  if (_aisStopped) return
+  if (_aisReconnectTimer) return
+
+  const base = _aisBackoffMs
+  const jitterMs = Math.floor(Math.random() * Math.min(base, 5000))
+  const delay = Math.min(AIS_BACKOFF_MAX_MS, base + jitterMs)
+  _aisBackoffMs = Math.min(AIS_BACKOFF_MAX_MS, base * 2)
+
+  console.warn(`⚠️ AISStream reconnect in ${Math.round(delay / 1000)}s (${reason})`)
+  _aisReconnectTimer = setTimeout(() => {
+    _aisReconnectTimer = null
+    void connectAisStream()
+  }, delay)
+  if (typeof _aisReconnectTimer.unref === 'function') _aisReconnectTimer.unref()
+}
+
+async function connectAisStream(): Promise<void> {
+  if (_aisStopped || _aisSocket) return
+  const apiKey = process.env.AISSTREAM_API_KEY
+  if (!apiKey) return
+
+  const WebSocketCtor = await loadWebSocketCtor()
+  if (!WebSocketCtor) {
+    _aisConnected = false
+    return
+  }
+  if (_aisStopped || _aisSocket) return
+
+  let socket: AisSocket
+  try {
+    socket = new WebSocketCtor(getAisStreamUrl())
+  } catch (error) {
+    _aisConnected = false
+    scheduleAisReconnect(`connect failed: ${error instanceof Error ? error.message : String(error)}`)
+    return
+  }
+  _aisSocket = socket
+
+  let opened = false
+  let settled = false
+
+  // Releases the single socket slot and schedules at most one reconnect.
+  const releaseAndSchedule = (reason: string) => {
+    if (settled) return
+    settled = true
+    stopAisHeartbeat()
+    if (_aisSocket === socket) _aisSocket = null
+    _aisConnected = false
+    scheduleAisReconnect(reason)
   }
 
-  connectWs()
+  socket.on('open', () => {
+    opened = true
+    _aisConnected = true
+    _aisBackoffMs = AIS_BACKOFF_BASE_MS
+    if (_aisReconnectTimer) {
+      clearTimeout(_aisReconnectTimer)
+      _aisReconnectTimer = null
+    }
+    try {
+      socket.send(JSON.stringify({
+        APIKey: apiKey,
+        BoundingBoxes: [[[-90, -180], [90, 180]]],
+        FilterMessageTypes: ['PositionReport', 'ShipStaticData'],
+      }))
+    } catch (error) {
+      console.error('AISStream subscribe failed:', error)
+      releaseAndSchedule('subscribe failed')
+      try { socket.terminate() } catch { /* already gone */ }
+      return
+    }
+    startAisHeartbeat(socket)
+  })
+
+  socket.on('pong', () => {
+    _aisAwaitingPong = false
+  })
+
+  socket.on('message', (raw: any) => {
+    try {
+      const msg = JSON.parse(raw.toString())
+      const meta = msg?.MetaData
+      if (!meta) return
+
+      const pos: AisVesselPosition = {
+        timestamp: meta.time_utc ? new Date(meta.time_utc).getTime() : Date.now(),
+        source: 'AISStream',
+        mmsi: String(meta.MMSI || ''),
+        vesselName: meta.ShipName || '',
+        shipType: meta.ShipType || 0,
+        latitude: meta.latitude || 0,
+        longitude: meta.longitude || 0,
+        heading: msg?.Message?.PositionReport?.TrueHeading || 0,
+        course: msg?.Message?.PositionReport?.Cog || 0,
+        speed: msg?.Message?.PositionReport?.Sog || 0,
+        destination: msg?.Message?.ShipStaticData?.Destination || '',
+      }
+
+      // Ring buffer: keep the newest positions rather than dropping them.
+      if (_aisBuffer.length >= AIS_BUFFER_MAX) {
+        _aisBuffer.shift()
+      }
+      _aisBuffer.push(pos)
+    } catch { /* malformed message */ }
+  })
+
+  socket.on('close', () => {
+    releaseAndSchedule(opened ? 'socket closed' : 'closed before open')
+  })
+
+  socket.on('error', (error: any) => {
+    releaseAndSchedule(`socket error: ${error?.message || String(error)}`)
+  })
 }
+
+export function startAisStream(): void {
+  const apiKey = process.env.AISSTREAM_API_KEY
+  if (!apiKey) {
+    console.warn('⚠️ AISStream not started: AISSTREAM_API_KEY is not configured')
+    _aisConnected = false
+    return
+  }
+  if (_aisSocket || _aisReconnectTimer) return
+
+  _aisStopped = false
+  _aisBackoffMs = AIS_BACKOFF_BASE_MS
+  void connectAisStream()
+}
+
+/** Stops reconnecting and closes the socket, for graceful shutdown. */
+export function stopAisStream(): void {
+  _aisStopped = true
+  _aisConnected = false
+  if (_aisReconnectTimer) {
+    clearTimeout(_aisReconnectTimer)
+    _aisReconnectTimer = null
+  }
+  stopAisHeartbeat()
+  const socket = _aisSocket
+  _aisSocket = null
+  if (socket) {
+    try { socket.close() } catch { /* already gone */ }
+  }
+}
+
 
 // ─── Movebank Animal Tracking ────────────────────────────────────────────────
 // Aligned with Movebank REST API: https://github.com/movebank/movebank-api-doc
