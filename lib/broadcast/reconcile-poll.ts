@@ -65,10 +65,10 @@ interface MinedRow {
 
 const ENABLED = !envBool('BSV_BROADCAST_RECONCILE_DISABLED', false)
 const INTERVAL_MS = envInt('BSV_BROADCAST_RECONCILE_INTERVAL_MS', 20_000, 5_000)
-const BATCH_SIZE = envInt('BSV_BROADCAST_RECONCILE_BATCH', 25, 1)
+const BATCH_SIZE = envInt('BSV_BROADCAST_RECONCILE_BATCH', 75, 1)
 const SPV_BATCH_SIZE = envInt('BSV_BROADCAST_SPV_BATCH', 25, 1)
 const GET_TIMEOUT_MS = envInt('BSV_BROADCAST_RECONCILE_TIMEOUT_MS', 8_000, 1_000)
-const GET_GAP_MS = envInt('BSV_BROADCAST_RECONCILE_GAP_MS', 150, 0)
+const GET_GAP_MS = envInt('BSV_BROADCAST_RECONCILE_GAP_MS', 60, 0)
 const MAX_404_MISSES = envInt('BSV_BROADCAST_MAX_404_MISSES', 12, 1)
 const MAX_404_BACKOFF_MS = 60 * 60_000
 const MAX_TRACKED_TXIDS = 5_000
@@ -371,7 +371,7 @@ async function fetchOpenBatch(): Promise<OpenRow[] | null> {
         WHERE provider = 'broadcaster'
           AND phase IN ('orphan', 'pending', 'seen', 'reorg')
           AND updated_at <= now()
-        ORDER BY updated_at ASC
+        ORDER BY CASE WHEN phase IN ('pending', 'orphan') THEN 0 ELSE 1 END, updated_at ASC
         LIMIT $1`,
       [BATCH_SIZE],
     )

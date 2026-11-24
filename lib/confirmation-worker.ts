@@ -75,7 +75,7 @@ const WOC_FALLBACK_INTERVAL_MS = 1_000
 
 const ENABLED = !envBool('BSV_CONFIRMATION_WORKER_DISABLED', false)
 const INTERVAL_MS = envInt('BSV_CONFIRMATION_INTERVAL_MS', 30_000, 5_000)
-const BATCH_SIZE = envInt('BSV_CONFIRMATION_BATCH_SIZE', 30, 1)
+const BATCH_SIZE = envInt('BSV_CONFIRMATION_BATCH_SIZE', 60, 1)
 const MIN_AGE_SECONDS = envInt('BSV_CONFIRMATION_MIN_AGE_SECONDS', 60, 0)
 const MAX_AGE_HOURS = envInt('BSV_CONFIRMATION_MAX_AGE_HOURS', 72, 1)
 // Residual catch-up for rows that aged out of the primary window while still
@@ -85,8 +85,11 @@ const MAX_AGE_HOURS = envInt('BSV_CONFIRMATION_MAX_AGE_HOURS', 72, 1)
 // backfill script — a 400-day residual scan competed with that work and
 // helped peg Supabase compute at ~100%.
 const CATCHUP_DAYS = envInt('BSV_CONFIRMATION_CATCHUP_DAYS', 14, 1)
-const REQ_INTERVAL_MS = envInt('BSV_CONFIRMATION_REQ_INTERVAL_MS', 400, 200)
+const REQ_INTERVAL_MS = envInt('BSV_CONFIRMATION_REQ_INTERVAL_MS', 250, 100)
 const BACKOFF_MS = envInt('BSV_CONFIRMATION_BACKOFF_MS', 120_000, 5_000)
+const UNCONFIRMED_COOLDOWN_MS = envInt('BSV_CONFIRMATION_UNCONFIRMED_COOLDOWN_MS', 5 * 60_000, 30_000)
+const NOT_FOUND_COOLDOWN_MS = envInt('BSV_CONFIRMATION_NOT_FOUND_COOLDOWN_MS', 30 * 60_000, 60_000)
+const MAX_DEFERRED_TXIDS = 10_000
 const ARC_STATUS_POLL_DISABLED = envBool('BSV_ARC_STATUS_POLL_DISABLED', false)
 
 const ARC_OWNED_EXCLUSION = `
@@ -104,6 +107,41 @@ let lastRequestAt = 0
 let lastWocAt = 0
 /** Remember 42P01 for the process lifetime so we stop appending the ARC exclusion. */
 let arcStatusTableMissing = false
+/**
+ * Per-txid re-check cooldown (txid → epoch ms).
+ *
+ * Without this, 30 unmined or rejected transactions at the head of the
+ * `admitted_at ASC` window are re-queried every cycle for 72 hours, starving
+ * every newer mined transaction behind them.
+ */
+const deferredUntil = new Map<string, number>()
+
+function deferTxid(txid: string, cooldownMs: number): void {
+  const now = Date.now()
+  if (deferredUntil.size >= MAX_DEFERRED_TXIDS) {
+    for (const [key, until] of deferredUntil) {
+      if (until <= now) deferredUntil.delete(key)
+    }
+    if (deferredUntil.size >= MAX_DEFERRED_TXIDS) {
+      const oldestKey = deferredUntil.keys().next().value
+      if (oldestKey !== undefined) deferredUntil.delete(oldestKey)
+    }
+  }
+  deferredUntil.set(txid, now + cooldownMs)
+}
+
+function getActiveDeferredTxids(): string[] {
+  const now = Date.now()
+  const active: string[] = []
+  for (const [txid, until] of deferredUntil) {
+    if (until <= now) {
+      deferredUntil.delete(txid)
+    } else if (active.length < 2_000) {
+      active.push(txid)
+    }
+  }
+  return active
+}
 
 function envInt(name: string, fallback: number, min = 0): number {
   const raw = process.env[name]
@@ -159,8 +197,13 @@ async function fetchCandidatesWithExclusion(excludeArcOwned: boolean): Promise<C
   const minAge = `${MIN_AGE_SECONDS} seconds`
   const maxAge = `${MAX_AGE_HOURS} hours`
   const exclusion = excludeArcOwned ? ARC_OWNED_EXCLUSION : ''
+  const deferred = getActiveDeferredTxids()
+  const deferredClause = deferred.length > 0 ? `AND NOT (txid = ANY($4::text[]))` : ''
 
   // Primary window: recent unconfirmed broadcasts the worker actively chases.
+  const primaryParams: unknown[] = deferred.length > 0
+    ? [minAge, maxAge, BATCH_SIZE, deferred]
+    : [minAge, maxAge, BATCH_SIZE]
   const primary = await query<CandidateTxid>(
     `SELECT txid
        FROM overlay_explorer_readings
@@ -168,9 +211,10 @@ async function fetchCandidatesWithExclusion(excludeArcOwned: boolean): Promise<C
         AND admitted_at < now() - $1::interval
         AND admitted_at > now() - $2::interval
         ${exclusion}
+        ${deferredClause}
       ORDER BY admitted_at ASC
       LIMIT $3`,
-    [minAge, maxAge, BATCH_SIZE],
+    primaryParams,
   )
 
   const primaryRows = primary.rows || []
@@ -181,6 +225,9 @@ async function fetchCandidatesWithExclusion(excludeArcOwned: boolean): Promise<C
   // for multi-month backlogs use scripts/backfill-explorer-confirmations.ts.
   const residual = BATCH_SIZE - primaryRows.length
   const catchup = `${CATCHUP_DAYS} days`
+  const staleParams: unknown[] = deferred.length > 0
+    ? [maxAge, catchup, residual, deferred]
+    : [maxAge, catchup, residual]
   const stale = await query<CandidateTxid>(
     `SELECT txid
        FROM overlay_explorer_readings
@@ -188,9 +235,10 @@ async function fetchCandidatesWithExclusion(excludeArcOwned: boolean): Promise<C
         AND admitted_at <= now() - $1::interval
         AND admitted_at > now() - $2::interval
         ${exclusion}
+        ${deferredClause}
       ORDER BY admitted_at DESC
       LIMIT $3`,
-    [maxAge, catchup, residual],
+    staleParams,
   )
 
   const seen = new Set(primaryRows.map((r) => r.txid))
@@ -449,6 +497,22 @@ async function applyConfirmation(txid: string, status: TxConfirmation): Promise<
   } catch (err) {
     void err
   }
+
+  // Close any open Broadcaster/ARC status row so reconcile-poll stops
+  // querying transactions that Bitails has already proven mined.
+  try {
+    await query(
+      `UPDATE arc_broadcast_status
+          SET phase = 'mined',
+              tx_status = 'MINED',
+              updated_at = now()
+        WHERE txid = $1
+          AND phase NOT IN ('mined', 'immutable')`,
+      [txid],
+    )
+  } catch (err) {
+    void err
+  }
 }
 
 async function runCycle(): Promise<void> {
@@ -491,16 +555,26 @@ async function runCycle(): Promise<void> {
 
       if (result.kind === 'error') {
         errors++
+        deferTxid(txid, UNCONFIRMED_COOLDOWN_MS)
         if (errors <= 5) {
           console.warn(`[confirmation-worker] lookup ${txid.substring(0, 12)}…: ${result.detail}`)
         }
         continue
       }
 
-      // 'unconfirmed' and 'not-found' are both legitimate "not mined yet"
-      // outcomes: the txid stays unconfirmed and is re-chased next cycle.
-      if (result.kind !== 'mined') continue
+      // 'unconfirmed' and 'not-found' are legitimate "not mined yet" outcomes.
+      // Defer them so the next cycle moves past them instead of re-querying
+      // the same 30–60 oldest rows for 72 hours.
+      if (result.kind === 'not-found') {
+        deferTxid(txid, NOT_FOUND_COOLDOWN_MS)
+        continue
+      }
+      if (result.kind !== 'mined') {
+        deferTxid(txid, UNCONFIRMED_COOLDOWN_MS)
+        continue
+      }
 
+      deferredUntil.delete(txid)
       try {
         await applyConfirmation(txid, result.status)
         confirmed++
