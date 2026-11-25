@@ -891,9 +891,11 @@ export class WorkerQueue {
     return {
       location: t.location,
       timestamp: iso,
+      ...(t.sourceLabel ? { source: t.sourceLabel } : {}),
       ...(t.coordinates ? { latitude: t.coordinates.lat, longitude: t.coordinates.lon } : {}),
       ...(t.stationId ? { station_id: t.stationId } : {}),
       ...t.measurement,
+      ...(t.source_hash ? { source_hash: t.source_hash } : {}),
     }
   }
 
