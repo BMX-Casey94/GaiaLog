@@ -157,23 +157,23 @@ export async function searchReadings(params: SearchParams): Promise<{
   const { whereSql, sqlParams } = buildWhereClause(params)
   const whereParams = [...sqlParams]
 
-  sqlParams.push(pageSize + 1, offset)
-  const limitIdx = sqlParams.length - 1
-  const offsetIdx = sqlParams.length
+  // A family filter (with or without a date range) must not use
+  // `data_family = ANY(...)`. That plan gathers every row in the family and
+  // sorts it before LIMIT, which blows the deadline on large families such as
+  // planning_development. One equality branch per family value lets Postgres
+  // walk oer_family_reading_ts_asc_idx backwards and stop after one page.
+  const indexedFamilySql = !params.q?.trim() && params.dataType
+    ? buildIndexedFamilyPageSql(params, pageSize + 1, offset)
+    : null
+
+  const rowSql = indexedFamilySql ?? buildOffsetPageSql(whereSql, sqlParams, pageSize + 1, offset)
 
   // Rows and total run in parallel.  Fetching pageSize + 1 lets us determine
   // hasMore accurately even if a slow filtered COUNT(*) hits its deadline.
   const [result, rawTotal] = await Promise.all([
     queryWithDeadline<any>(
-      `SELECT
-         txid, data_family, location, lat, lon,
-         reading_ts, provider_id, block_height, block_time,
-         confirmed, metrics_preview
-       FROM overlay_explorer_readings
-       ${whereSql}
-       ORDER BY reading_ts DESC
-       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
-      sqlParams,
+      rowSql.sql,
+      rowSql.params,
       { timeoutMs: 10_000, label: 'explorer_search_rows' },
     ),
     countSearchTotal(params, whereSql, whereParams),
@@ -624,6 +624,84 @@ function parseCoordinateQuery(q: string): { lat: number; lon: number } | null {
 }
 
 const COORD_SEARCH_RADIUS_DEG = 0.5
+
+const FAMILY_PAGE_COLUMNS = `txid, data_family, location, lat, lon,
+         reading_ts, provider_id, block_height, block_time,
+         confirmed, metrics_preview`
+
+/**
+ * One index-ordered branch per stored family value.
+ * `oer_family_reading_ts_asc_idx (data_family, reading_ts)` is read backwards,
+ * so each branch stops after `fetchLimit` rows instead of sorting the family.
+ */
+function buildIndexedFamilyPageSql(
+  params: SearchParams,
+  fetchLimit: number,
+  offset: number,
+): { sql: string; params: unknown[] } | null {
+  const families = params.dataType ? getDataFamilyFilterValues(params.dataType) : []
+  if (families.length === 0) return null
+
+  const sqlParams: unknown[] = []
+  const dateFilters: string[] = []
+  if (params.from) {
+    sqlParams.push(new Date(params.from).toISOString())
+    dateFilters.push(`reading_ts >= $${sqlParams.length}`)
+  }
+  if (params.to) {
+    sqlParams.push(new Date(params.to).toISOString())
+    dateFilters.push(`reading_ts <= $${sqlParams.length}`)
+  }
+
+  sqlParams.push(fetchLimit + offset)
+  const innerLimitIdx = sqlParams.length
+
+  const branches = families.map((family) => {
+    sqlParams.push(family)
+    const familyIdx = sqlParams.length
+    const filters = [`data_family = $${familyIdx}`, ...dateFilters]
+    return `(
+      SELECT ${FAMILY_PAGE_COLUMNS}
+      FROM overlay_explorer_readings
+      WHERE ${filters.join(' AND ')}
+      ORDER BY reading_ts DESC
+      LIMIT $${innerLimitIdx}
+    )`
+  })
+
+  sqlParams.push(fetchLimit, offset)
+  const outerLimitIdx = sqlParams.length - 1
+  const outerOffsetIdx = sqlParams.length
+
+  return {
+    sql: `SELECT ${FAMILY_PAGE_COLUMNS}
+      FROM (
+        ${branches.join('\nUNION ALL\n')}
+      ) AS family_hits
+      ORDER BY reading_ts DESC
+      LIMIT $${outerLimitIdx} OFFSET $${outerOffsetIdx}`,
+    params: sqlParams,
+  }
+}
+
+function buildOffsetPageSql(
+  whereSql: string,
+  whereParams: unknown[],
+  fetchLimit: number,
+  offset: number,
+): { sql: string; params: unknown[] } {
+  const sqlParams = [...whereParams, fetchLimit, offset]
+  const limitIdx = sqlParams.length - 1
+  const offsetIdx = sqlParams.length
+  return {
+    sql: `SELECT ${FAMILY_PAGE_COLUMNS}
+       FROM overlay_explorer_readings
+       ${whereSql}
+       ORDER BY reading_ts DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+    params: sqlParams,
+  }
+}
 
 function buildWhereClause(params: SearchParams): { whereSql: string; sqlParams: unknown[] } {
   const parts: string[] = []
