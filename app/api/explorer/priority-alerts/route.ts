@@ -13,8 +13,11 @@ import { getPriorityAlerts } from '@/lib/overlay-explorer-service'
 import { DATA_FAMILY_DESCRIPTORS } from '@/lib/stream-registry'
 import type { DataFamily } from '@/lib/stream-registry'
 import { applyPublicReadCacheHeaders } from '@/lib/cache-headers'
+import { ServerSwrCache } from '@/lib/server-swr-cache'
 
 export const dynamic = 'force-dynamic'
+
+const priorityAlertsCache = new ServerSwrCache<Array<Record<string, unknown>>>(20_000)
 
 function jsonWithCache(body: unknown, init?: ResponseInit): NextResponse {
   return applyPublicReadCacheHeaders(NextResponse.json(body, init))
@@ -119,36 +122,40 @@ export async function GET(req: NextRequest) {
     const limitParam = req.nextUrl.searchParams.get('limit')
     const limit = Math.min(50, Math.max(1, parseInt(limitParam || '8', 10)) || 8)
 
-    const rows = await getPriorityAlerts(limit)
+    // Cache top 50 alerts in memory and slice to the requested limit.
+    const { value: allAlerts, cached, stale } = await priorityAlertsCache.get(async () => {
+      const rows = await getPriorityAlerts(50)
+      return rows.map((row) => {
+        const metrics = (row.metrics_preview && typeof row.metrics_preview === 'object')
+          ? row.metrics_preview as Record<string, unknown>
+          : {}
+        const desc = DATA_FAMILY_DESCRIPTORS[row.data_family as DataFamily]
+        const severity = computeSeverityScore(row.data_family, metrics)
+        const value = getPrimaryValue(row.data_family, metrics)
 
-    const alerts = rows.map((row) => {
-      const metrics = (row.metrics_preview && typeof row.metrics_preview === 'object')
-        ? row.metrics_preview as Record<string, unknown>
-        : {}
-      const desc = DATA_FAMILY_DESCRIPTORS[row.data_family as DataFamily]
-      const severity = computeSeverityScore(row.data_family, metrics)
-      const value = getPrimaryValue(row.data_family, metrics)
-
-      return {
-        txid: row.txid,
-        family: row.data_family,
-        label: desc?.label ?? row.data_family,
-        severity,
-        value,
-        location: row.location ?? 'Unknown',
-        lat: row.lat,
-        lon: row.lon,
-        timestamp: row.reading_ts,
-        blockHeight: row.block_height,
-        confirmed: row.confirmed,
-        metrics,
-      }
+        return {
+          txid: row.txid,
+          family: row.data_family,
+          label: desc?.label ?? row.data_family,
+          severity,
+          value,
+          location: row.location ?? 'Unknown',
+          lat: row.lat,
+          lon: row.lon,
+          timestamp: row.reading_ts,
+          blockHeight: row.block_height,
+          confirmed: row.confirmed,
+          metrics,
+        }
+      })
     })
 
     return jsonWithCache({
       success: true,
-      alerts,
+      alerts: allAlerts.slice(0, limit),
       source: 'overlay',
+      cached,
+      stale,
     })
   } catch (error) {
     console.error('Priority alerts error:', error)

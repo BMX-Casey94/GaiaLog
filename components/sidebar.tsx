@@ -24,8 +24,8 @@ const sidebarItems = [
 
 export function Sidebar({ activeSection, onSectionChange }: SidebarProps) {
   return (
-    <div className="w-64 h-full bg-sidebar border-r border-sidebar-border flex flex-col">
-      <div className="p-6 border-b border-sidebar-border">
+    <div className="flex h-full w-64 flex-col border-r border-sidebar-border bg-sidebar">
+      <div className="border-b border-sidebar-border p-6">
         <div className="flex items-center gap-3">
           <Image
             src="/gaialog-logo-128.png"
@@ -35,13 +35,13 @@ export function Sidebar({ activeSection, onSectionChange }: SidebarProps) {
             className="rounded-md"
           />
           <div>
-            <h1 className="font-display text-xl font-bold text-sidebar-foreground leading-tight">GaiaLog</h1>
+            <p className="font-display text-xl font-bold leading-tight text-sidebar-foreground">GaiaLog</p>
             <p className="text-xs text-muted-foreground">Environmental Blockchain Monitor</p>
           </div>
         </div>
       </div>
 
-      <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
+      <nav aria-label="Dashboard sections" className="flex-1 space-y-1 overflow-y-auto p-4">
         {sidebarItems.map((item) => {
           const Icon = item.icon
           const isActive = activeSection === item.id
@@ -49,23 +49,24 @@ export function Sidebar({ activeSection, onSectionChange }: SidebarProps) {
             <Button
               key={item.id}
               variant="ghost"
+              aria-current={isActive ? "page" : undefined}
               className={cn(
-                "w-full justify-start gap-3 h-10 rounded-lg transition-colors",
+                "h-10 w-full justify-start gap-3 rounded-lg transition-colors",
                 isActive
                   ? "bg-sidebar-accent text-sidebar-accent-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
                   : "text-sidebar-foreground/80 hover:bg-sidebar-primary hover:text-sidebar-foreground",
               )}
               onClick={() => onSectionChange(item.id)}
             >
-              <Icon className="h-4 w-4" />
+              <Icon className="h-4 w-4" aria-hidden />
               {item.label}
             </Button>
           )
         })}
       </nav>
 
-      <div className="p-4 border-t border-sidebar-border">
-        <p className="text-[10px] text-muted-foreground leading-relaxed">
+      <div className="border-t border-sidebar-border p-4">
+        <p className="text-[10px] leading-relaxed text-muted-foreground">
           Data recorded immutably on the BSV blockchain.
         </p>
       </div>

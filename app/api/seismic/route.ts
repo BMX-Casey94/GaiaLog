@@ -1,71 +1,69 @@
 import { NextResponse } from "next/server"
-import { query } from "@/lib/db"
+import { getLatestSeismic } from "@/lib/latest-environmental"
 import { applyPublicReadCacheHeaders } from "@/lib/cache-headers"
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
+export const maxDuration = 10
 
 /**
  * GET /api/seismic
  *
- * PUBLIC read endpoint. `components/panels/overview-panel.tsx` (via
- * `hooks/use-environmental-data.ts` -> `lib/api-client.ts`) polls this every
- * 15 minutes, so it must stay unauthenticated.
+ * PUBLIC read endpoint consumed by `components/panels/overview-panel.tsx` via
+ * `hooks/use-environmental-data.ts` -> `lib/api-client.ts`, so it stays
+ * unauthenticated.
  *
- * It serves the newest reading already persisted by the collector workers and
- * no longer calls `dataCollector.collectSeismicData()`. That call queried
- * upstream seismic APIs, inserted a row, and invoked `writeToBlockchain()`, so
- * an anonymous GET could trigger an on-chain write whenever the serving process
- * ran with `GAIALOG_WORKER_PROCESS=1`. Collection belongs to the workers
- * process and the authenticated `POST /api/data/collect`.
+ * It serves the newest reading the collector workers have already persisted and
+ * never calls `dataCollector.collectSeismicData()`. That path queried the
+ * upstream seismic feeds and attempted an on-chain write, and returned `null`
+ * on any upstream failure — which this route reported as 502 Bad Gateway. The
+ * read path is now a bounded database query with an overlay fallback behind a
+ * stale-while-revalidate cache.
+ *
+ * Status contract: 200 whenever the endpoint itself is healthy, with
+ * `available: false` when no reading exists yet.
  */
 export async function GET() {
   try {
-    const result = await query<any>(
-      `SELECT provider, event_id, location, magnitude, depth_km, lat, lon, collected_at
-         FROM seismic_readings
-        ORDER BY collected_at DESC
-        LIMIT 1`,
-    )
+    const { value, cached, stale } = await getLatestSeismic()
 
-    const seismic = result.rows?.[0]
-    if (!seismic) {
-      return NextResponse.json({ error: "No seismic data" }, { status: 502 })
-    }
-
-    const timestamp = toIsoTimestamp(seismic.collected_at)
-
-    // Response shape preserved from the previous live-collector version.
-    return applyPublicReadCacheHeaders(NextResponse.json({
-      timestamp,
-      recent_events: [
-        {
-          id: seismic.event_id || null,
-          magnitude: toNumber(seismic.magnitude, 0),
-          location: seismic.location || "Unknown",
-          depth: toNumber(seismic.depth_km, 0),
-          time: timestamp,
-          coordinates: {
-            lat: toNumber(seismic.lat, 0),
-            lon: toNumber(seismic.lon, 0),
+    return applyPublicReadCacheHeaders(
+      NextResponse.json({
+        available: true,
+        timestamp: value.collectedAt,
+        recent_events: [
+          {
+            id: value.eventId,
+            // Null, not 0: a null magnitude would otherwise publish "M0.0".
+            magnitude: value.magnitude,
+            location: value.location || "Unknown",
+            depth: value.depthKm,
+            time: value.collectedAt,
+            coordinates:
+              value.lat != null && value.lon != null
+                ? { lat: value.lat, lon: value.lon }
+                : null,
           },
-        },
-      ],
-      status: "active",
-      source: seismic.provider || "Unknown",
-    }))
+        ],
+        status: "active",
+        source: value.provider || "Unknown",
+        cache: { cached, stale, source: value.origin },
+      }),
+    )
   } catch (error) {
-    console.error("Seismic API error:", error)
-    return NextResponse.json({ error: "Failed to fetch seismic data" }, { status: 500 })
+    console.warn(
+      "Seismic API: no reading available:",
+      error instanceof Error ? error.message : error,
+    )
+    const response = NextResponse.json({
+      available: false,
+      timestamp: null,
+      recent_events: [],
+      status: "unavailable",
+      source: "Unknown",
+      error: "No seismic reading has been collected yet",
+    })
+    response.headers.set('Cache-Control', 'no-store')
+    return response
   }
-}
-
-function toNumber(value: unknown, fallback: number): number {
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : fallback
-}
-
-function toIsoTimestamp(value: unknown): string {
-  const date = value instanceof Date ? value : new Date(String(value ?? ""))
-  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString()
 }

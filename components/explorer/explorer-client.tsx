@@ -152,10 +152,24 @@ export function ExplorerClient() {
     setSelectedType(null)
   }, [selectedType, stats.byType])
 
-  // Initial search on mount
+  // Initial search on mount.
+  //
+  // Seeded from `?q=` so the `SearchAction` advertised in the homepage JSON-LD
+  // actually runs a search. Read from `window.location` inside the effect
+  // rather than `useSearchParams`, which would force this statically rendered
+  // page to become dynamic or require a Suspense boundary.
   const mountedRef = useRef(false)
   useEffect(() => {
-    handleSearch(1)
+    const initialQuery = new URLSearchParams(window.location.search).get("q") ?? ""
+    if (initialQuery) {
+      // Suppress the debounced auto-search that would otherwise fire a second,
+      // identical request when `searchQuery` changes below.
+      suppressAutoSearchUntilRef.current = Date.now() + 900
+      setSearchQuery(initialQuery)
+      handleSearch(1, initialQuery)
+    } else {
+      handleSearch(1)
+    }
     mountedRef.current = true
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -192,6 +206,7 @@ export function ExplorerClient() {
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-black via-slate-950 to-black pt-0 pb-44 sm:pb-28">
+      <main>
       {/* ─── Hero Section ─── */}
       <section className="relative overflow-hidden pt-28 sm:pt-32 pb-10 sm:pb-16 px-4 sm:px-6 lg:px-8">
         <div
@@ -270,7 +285,10 @@ export function ExplorerClient() {
       </section>
 
       {/* ─── Results Section ─── */}
-      <section className="pt-8 pb-16 px-4 sm:px-6 lg:px-8 relative">
+      <section className="pt-8 pb-16 px-4 sm:px-6 lg:px-8 relative" aria-labelledby="explorer-results-heading">
+        <h2 id="explorer-results-heading" className="sr-only">
+          Environmental readings
+        </h2>
         <div className="absolute inset-0 bg-gradient-to-b from-slate-950/50 via-slate-900/30 to-black/80 pointer-events-none" />
         <div className="relative max-w-7xl mx-auto">
           {/* Error */}
@@ -344,6 +362,7 @@ export function ExplorerClient() {
           )}
         </div>
       </section>
+      </main>
 
       <Footer />
       <NodeExplorerPromoBar />

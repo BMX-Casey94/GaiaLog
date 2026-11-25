@@ -142,7 +142,10 @@ export function NavBar({ items, className }: NavBarProps) {
   }, [items, pathname, sectionIdToName])
 
   return (
-    <div className={cn("fixed bottom-0 sm:top-0 left-1/2 -translate-x-1/2 z-50 mb-6 sm:pt-5 pointer-events-none", className)}>
+    <nav
+      aria-label="Primary"
+      className={cn("fixed bottom-0 sm:top-0 left-1/2 -translate-x-1/2 z-50 mb-6 sm:pt-5 pointer-events-none", className)}
+    >
       <div className="flex items-center gap-1 md:gap-1.5 lg:gap-2 bg-[#0b0618]/75 border border-purple-500/20 backdrop-blur-xl py-1.5 px-1.5 rounded-full shadow-lg shadow-purple-950/40 pointer-events-auto max-w-[calc(100vw-1.5rem)] overflow-x-auto">
         {items.map((item) => {
           const Icon = item.icon
@@ -153,7 +156,7 @@ export function NavBar({ items, className }: NavBarProps) {
           const lampAndLabel = (
             <>
               <span className="hidden md:inline whitespace-nowrap">{item.name}</span>
-              <span className="md:hidden flex items-center justify-center">
+              <span className="md:hidden flex items-center justify-center" aria-hidden="true">
                 <Icon size={18} strokeWidth={2.5} />
               </span>
               {isActive && (
@@ -190,6 +193,7 @@ export function NavBar({ items, className }: NavBarProps) {
               <Link
                 key={item.name}
                 href={item.url}
+                aria-label={item.name}
                 onClick={(e) => {
                   e.preventDefault()
                   setActiveTab(item.name)
@@ -227,6 +231,7 @@ export function NavBar({ items, className }: NavBarProps) {
             <a
               key={item.name}
               href={item.url}
+              aria-label={item.name}
               className={linkClassName}
             >
               {lampAndLabel}
@@ -234,6 +239,6 @@ export function NavBar({ items, className }: NavBarProps) {
           )
         })}
       </div>
-    </div>
+    </nav>
   )
 }

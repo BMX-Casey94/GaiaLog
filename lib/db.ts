@@ -208,6 +208,145 @@ export async function query<T extends PgQueryResultRow = any>(text: string, para
   throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Unknown database error'))
 }
 
+/**
+ * Deadline for a single public-read statement, in milliseconds.
+ *
+ * Public read endpoints must answer before the reverse proxy gives up. The
+ * pool's own `statement_timeout` is 0 (disabled) by default because long
+ * retention/broadcast statements legitimately need minutes; that default must
+ * not be inherited by request-scoped reads, or a slow plan turns into a hung
+ * HTTP request and the proxy reports 502.
+ */
+const DEFAULT_READ_DEADLINE_MS = Math.max(
+  500,
+  Number(process.env.PG_READ_DEADLINE_MS || 4000),
+)
+
+export interface QueryDeadlineOptions {
+  /** Hard cap for this statement. Defaults to `PG_READ_DEADLINE_MS` (4000ms). */
+  timeoutMs?: number
+  /** Included in timeout messages so the log names the failing read. */
+  label?: string
+}
+
+/** Bound for the best-effort ROLLBACK issued after a failed read. */
+const ROLLBACK_GRACE_MS = 250
+
+/**
+ * Run a single read-only statement under a hard deadline.
+ *
+ * The deadline covers the whole operation — pool checkout, BEGIN, the statement
+ * and COMMIT — because any of those can stall:
+ *
+ *   1. `SET LOCAL statement_timeout` makes Postgres abort the statement itself,
+ *      so a runaway plan stops consuming CPU even after the caller has left.
+ *   2. A client-side race guarantees the caller is unblocked even when the
+ *      socket stalls and the server never replies at all, and it also covers a
+ *      checkout that waits on an exhausted pool.
+ *
+ * Failure handling is deliberately non-blocking. A ROLLBACK is attempted under
+ * its own short grace period and the client is then released *with* the error,
+ * which makes `pg-pool` destroy the connection instead of returning it to the
+ * pool. Without that, a timed-out read would hand a connection with an open
+ * transaction to the next caller, and awaiting the ROLLBACK itself would hang
+ * on exactly the dead socket that caused the timeout.
+ *
+ * Use this for request-path reads only. Workers, migrations and retention
+ * sweeps keep using `query()` with their own statement timeouts.
+ */
+export async function queryWithDeadline<T extends PgQueryResultRow = any>(
+  text: string,
+  params: any[] = [],
+  options: QueryDeadlineOptions = {},
+): Promise<QueryResult<T>> {
+  if (DB_DISABLED) {
+    if (!dbWarned) {
+      console.warn('🗄️ Database disabled via GAIALOG_NO_DB=true. All queries return empty rows.')
+      dbWarned = true
+    }
+    return { rows: [] as T[], rowCount: 0, command: 'DISABLED' }
+  }
+
+  const timeoutMs = Math.max(100, Math.floor(options.timeoutMs ?? DEFAULT_READ_DEADLINE_MS))
+  const label = options.label || 'query'
+
+  let timer: NodeJS.Timeout | undefined
+  let deadlineFired = false
+  // Held in an object because TypeScript narrows a `let` assigned only inside a
+  // closure to `never` at the catch/finally sites, even though the closure has
+  // run by then.
+  const held: { client: PoolClient | null } = { client: null }
+
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      deadlineFired = true
+      reject(new Error(`${label} exceeded its ${timeoutMs}ms deadline`))
+    }, timeoutMs)
+    timer.unref?.()
+  })
+
+  // Never let the race's losing branch surface as an unhandled rejection.
+  deadline.catch(() => {})
+
+  const work = (async (): Promise<QueryResult<T>> => {
+    const checkedOut = await dbPool.connect()
+    held.client = checkedOut
+    attachClientErrorHandler(checkedOut)
+
+    if (deadlineFired) {
+      // The race was already lost while this checkout was pending. Give the
+      // connection straight back untouched rather than running the statement
+      // for nobody, and make sure the catch below does not destroy it.
+      held.client = null
+      checkedOut.release()
+      throw new Error(`${label} abandoned before the statement started`)
+    }
+
+    // An explicit transaction so `SET LOCAL` scopes the statement timeout to
+    // this statement and never leaks onto the pooled session.
+    await checkedOut.query('BEGIN')
+    await checkedOut.query(`SET LOCAL statement_timeout = ${timeoutMs}`)
+
+    const res = await checkedOut.query<T>(text, params)
+    await checkedOut.query('COMMIT')
+    return {
+      rows: res.rows,
+      rowCount: typeof res.rowCount === 'number' ? res.rowCount : res.rows.length,
+      command: res.command || 'SELECT',
+    }
+  })()
+  // The race may be lost while this work is still in flight, leaving its
+  // eventual rejection unobserved. Node 22 terminates the process on an
+  // unhandled rejection, so the chain is always marked handled here as well.
+  work.catch(() => {})
+
+  try {
+    return await Promise.race([work, deadline])
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error))
+    const checkedOut = held.client
+    if (checkedOut) {
+      held.client = null
+      await Promise.race([
+        checkedOut.query('ROLLBACK').catch(() => {}),
+        new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, ROLLBACK_GRACE_MS)
+          t.unref?.()
+        }),
+      ])
+      // Releasing with the error destroys the connection, so a half-consumed
+      // or abandoned session never reaches the next caller.
+      checkedOut.release(failure)
+    }
+    throw failure
+  } finally {
+    if (timer) clearTimeout(timer)
+    // A checkout that resolves after we have already thrown is released here
+    // rather than leaked; it was never used for a statement.
+    held.client?.release()
+  }
+}
+
 export async function ensureConnected(): Promise<void> {
   if (DB_DISABLED) return
   await query('SELECT 1')

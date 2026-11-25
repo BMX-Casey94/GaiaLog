@@ -2,9 +2,16 @@ import { NextResponse } from 'next/server'
 import { walletManager } from '@/lib/wallet-manager'
 import { getBSVAddressUrl } from '@/lib/utils'
 import { bsvConfig } from '@/lib/bsv-config'
+import { ServerSwrCache } from '@/lib/server-swr-cache'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+
+const walletFundingCache = new ServerSwrCache<{
+  generatedAt: string
+  totalSats: number
+  wallets: WalletFundingRow[]
+}>(45_000)
 
 /**
  * Lightweight public funding strip for the homepage.
@@ -62,48 +69,57 @@ function resolveWallets(): Array<{ index: number; address: string }> {
 
 export async function GET() {
   const network = bsvConfig.network === 'mainnet' ? 'main' : 'test'
-  const wallets = resolveWallets()
 
-  const rows: WalletFundingRow[] = await Promise.all(
-    wallets.map(async (w) => {
-      const label = `W${w.index + 1}`
-      try {
-        const bal = await fetchBitailsBalance(w.address)
-        const totalSats = bal.confirmed + bal.unconfirmed
-        return {
-          index: w.index,
-          label,
-          address: w.address,
-          confirmedSats: bal.confirmed,
-          unconfirmedSats: bal.unconfirmed,
-          totalSats,
-          explorerUrl: getBSVAddressUrl(w.address, network as 'main' | 'test'),
+  const { value, cached, stale } = await walletFundingCache.get(async () => {
+    const wallets = resolveWallets()
+    const rows: WalletFundingRow[] = await Promise.all(
+      wallets.map(async (w) => {
+        const label = `W${w.index + 1}`
+        try {
+          const bal = await fetchBitailsBalance(w.address)
+          const totalSats = bal.confirmed + bal.unconfirmed
+          return {
+            index: w.index,
+            label,
+            address: w.address,
+            confirmedSats: bal.confirmed,
+            unconfirmedSats: bal.unconfirmed,
+            totalSats,
+            explorerUrl: getBSVAddressUrl(w.address, network as 'main' | 'test'),
+          }
+        } catch (err) {
+          return {
+            index: w.index,
+            label,
+            address: w.address,
+            confirmedSats: 0,
+            unconfirmedSats: 0,
+            totalSats: 0,
+            explorerUrl: getBSVAddressUrl(w.address, network as 'main' | 'test'),
+            error: err instanceof Error ? err.message : 'balance unavailable',
+          }
         }
-      } catch (err) {
-        return {
-          index: w.index,
-          label,
-          address: w.address,
-          confirmedSats: 0,
-          unconfirmedSats: 0,
-          totalSats: 0,
-          explorerUrl: getBSVAddressUrl(w.address, network as 'main' | 'test'),
-          error: err instanceof Error ? err.message : 'balance unavailable',
-        }
-      }
-    }),
-  )
+      }),
+    )
 
-  const totalSats = rows.reduce((sum, r) => sum + r.totalSats, 0)
+    const totalSats = rows.reduce((sum, r) => sum + r.totalSats, 0)
+    return {
+      generatedAt: new Date().toISOString(),
+      totalSats,
+      wallets: rows,
+    }
+  })
 
   return NextResponse.json(
     {
       ok: true,
-      generatedAt: new Date().toISOString(),
+      generatedAt: value.generatedAt,
       source: 'bitails',
       network: bsvConfig.network,
-      totalSats,
-      wallets: rows,
+      totalSats: value.totalSats,
+      wallets: value.wallets,
+      cached,
+      stale,
     },
     {
       headers: {

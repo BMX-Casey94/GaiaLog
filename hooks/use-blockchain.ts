@@ -1,13 +1,24 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
+/**
+ * Live BSV blockchain state for the admin dashboard.
+ *
+ * - `/api/blockchain/recent-readings` — the latest broadcast transaction per
+ *   data family, already persisted and validated server-side.
+ * - `/api/bsv/stats` — wallet, queue and worker service statistics.
+ *
+ * Mainnet only: this application never records to or reads from a test network.
+ */
+
+import { useCallback, useEffect, useRef, useState } from "react"
+import { getExplorerUrl, isValidTxid } from "@/lib/bsv-links"
 
 export interface BlockchainTransaction {
   txid: string
   dataType: string
+  /** ISO timestamp of the reading, or of the broadcast when no reading time exists. */
   timestamp: string
-  status: string
-  location: string | null
+  status: "pending" | "confirmed" | "failed"
   provider: string | null
 }
 
@@ -18,80 +29,116 @@ export interface BlockchainConnectionStatus {
   errorRate: number
   queueSize: number
   runningWorkers: number
+  /** Why the connection is considered down, when it is. */
+  reason: string | null
 }
 
-const BSV_NETWORK_PARAM = "main"
+const REFRESH_MS = 45_000
 
-export function getExplorerUrl(txid: string): string {
-  return `https://whatsonchain.com/tx/${txid}?network=${BSV_NETWORK_PARAM}`
+function normaliseStatus(value: unknown): BlockchainTransaction["status"] {
+  if (value === "pending" || value === "failed" || value === "confirmed") return value
+  return "confirmed"
 }
 
-/**
- * Reads live blockchain state from the real service APIs:
- * - /api/blockchain/recent-readings — latest broadcast TX per data family
- * - /api/bsv/stats — wallet/queue/worker service statistics
- */
-export function useBlockchain() {
+export interface BlockchainFeed {
+  transactions: BlockchainTransaction[]
+  connectionStatus: BlockchainConnectionStatus | null
+  loading: boolean
+  error: string | null
+  refresh: () => Promise<void>
+}
+
+export function useBlockchainFeed(): BlockchainFeed {
   const [transactions, setTransactions] = useState<BlockchainTransaction[]>([])
   const [connectionStatus, setConnectionStatus] = useState<BlockchainConnectionStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const mountedRef = useRef(true)
 
   const refresh = useCallback(async () => {
-    try {
-      setError(null)
-      const [readingsRes, statsRes] = await Promise.allSettled([
-        fetch('/api/blockchain/recent-readings'),
-        fetch('/api/bsv/stats'),
-      ])
+    const [readingsResult, statsResult] = await Promise.allSettled([
+      fetch("/api/blockchain/recent-readings", { cache: "no-store" }),
+      fetch("/api/bsv/stats", { cache: "no-store" }),
+    ])
 
-      if (readingsRes.status === 'fulfilled' && readingsRes.value.ok) {
-        const data = await readingsRes.value.json()
-        if (data?.success && Array.isArray(data.readings)) {
-          setTransactions(
-            data.readings.map((r: any) => ({
-              txid: r.txid,
-              dataType: r.type,
-              timestamp: r.timestamp,
-              status: r.status || 'confirmed',
-              location: r.location ?? null,
-              provider: r.data?.provider ?? null,
-            }))
-          )
-        }
+    if (!mountedRef.current) return
+
+    let readingsProblem: string | null = null
+    if (readingsResult.status === "fulfilled" && readingsResult.value.ok) {
+      try {
+        const data = await readingsResult.value.json()
+        const readings = Array.isArray(data?.readings) ? data.readings : []
+        setTransactions(
+          readings
+            .filter((reading: any) => isValidTxid(reading?.txid))
+            .map((reading: any) => ({
+              txid: reading.txid as string,
+              dataType: typeof reading.type === "string" ? reading.type : "unknown",
+              timestamp: typeof reading.timestamp === "string" ? reading.timestamp : "",
+              status: normaliseStatus(reading.status),
+              provider: typeof reading.data?.provider === "string" ? reading.data.provider : null,
+            })),
+        )
+      } catch {
+        readingsProblem = "Recent readings returned an unreadable response"
       }
+    } else {
+      readingsProblem =
+        readingsResult.status === "rejected"
+          ? "Recent readings are unavailable"
+          : `Recent readings failed (${readingsResult.value.status})`
+    }
 
-      if (statsRes.status === 'fulfilled' && statsRes.value.ok) {
-        const stats = await statsRes.value.json()
+    let statsProblem: string | null = null
+    if (statsResult.status === "fulfilled" && statsResult.value.ok) {
+      try {
+        const stats = await statsResult.value.json()
+        const totalTransactions = Number(stats?.totalTransactions) || 0
+        const errorRate = Number(stats?.errorRate) || 0
         setConnectionStatus({
           connected: stats?.success !== false,
-          totalTransactions: Number(stats?.totalTransactions) || 0,
+          totalTransactions,
           processingRate: Number(stats?.processingRate) || 0,
-          errorRate: Number(stats?.errorRate) || 0,
+          errorRate,
           queueSize: Number(stats?.queueSize) || 0,
           runningWorkers: Number(stats?.runningWorkers) || 0,
+          reason: stats?.success === false ? "The BSV stats service reported an error" : null,
         })
-      } else {
-        setConnectionStatus((prev) => prev ? { ...prev, connected: false } : {
-          connected: false,
-          totalTransactions: 0,
-          processingRate: 0,
-          errorRate: 0,
-          queueSize: 0,
-          runningWorkers: 0,
-        })
+      } catch {
+        statsProblem = "BSV statistics returned an unreadable response"
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch blockchain status')
-    } finally {
-      setLoading(false)
+    } else {
+      statsProblem =
+        statsResult.status === "rejected"
+          ? "The BSV stats service is unreachable"
+          : `BSV statistics failed (${statsResult.value.status})`
     }
+
+    if (statsProblem) {
+      setConnectionStatus((previous) => ({
+        connected: false,
+        totalTransactions: previous?.totalTransactions ?? 0,
+        processingRate: previous?.processingRate ?? 0,
+        errorRate: previous?.errorRate ?? 0,
+        queueSize: previous?.queueSize ?? 0,
+        runningWorkers: previous?.runningWorkers ?? 0,
+        reason: statsProblem,
+      }))
+    }
+
+    const problem = statsProblem ?? readingsProblem
+    setError(problem)
+    setLoading(false)
   }, [])
 
   useEffect(() => {
-    refresh()
-    const interval = setInterval(refresh, 45000)
-    return () => clearInterval(interval)
+    mountedRef.current = true
+    void refresh()
+    const id = setInterval(() => void refresh(), REFRESH_MS)
+    return () => {
+      mountedRef.current = false
+      clearInterval(id)
+    }
   }, [refresh])
 
   return {
@@ -100,6 +147,5 @@ export function useBlockchain() {
     loading,
     error,
     refresh,
-    getExplorerUrl,
   }
 }

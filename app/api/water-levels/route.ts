@@ -1,88 +1,85 @@
 import { NextResponse } from "next/server"
-import { query } from "@/lib/db"
+import { getLatestWaterLevel } from "@/lib/latest-environmental"
 import { applyPublicReadCacheHeaders } from "@/lib/cache-headers"
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
+export const maxDuration = 10
 
 /**
  * GET /api/water-levels
  *
- * PUBLIC read endpoint. `components/panels/overview-panel.tsx` (via
- * `hooks/use-environmental-data.ts` -> `lib/api-client.ts`) polls this every
- * 15 minutes, so it must stay unauthenticated.
+ * PUBLIC read endpoint consumed by `components/panels/overview-panel.tsx` via
+ * `hooks/use-environmental-data.ts` -> `lib/api-client.ts`, so it stays
+ * unauthenticated.
  *
- * It serves the newest reading already persisted by the collector workers and
- * no longer calls `dataCollector.collectWaterLevelData()`. That call issued a
- * dozen NOAA requests, inserted a row, and invoked `writeToBlockchain()`, which
- * let an anonymous GET trigger an on-chain write whenever the serving process
- * ran with `GAIALOG_WORKER_PROCESS=1`. Collection is the job of the workers
- * process and the authenticated `POST /api/data/collect`.
+ * It serves the newest reading the collector workers have already persisted and
+ * never calls `dataCollector.collectWaterLevelData()`. That path issued a dozen
+ * NOAA requests and an on-chain write, and returned `null` whenever NOAA was
+ * slow — which this route reported as 502 Bad Gateway. The read path is now a
+ * bounded database query with an overlay fallback behind a
+ * stale-while-revalidate cache.
+ *
+ * Status contract: 200 whenever the endpoint itself is healthy, with
+ * `available: false` when no reading exists yet.
  */
 export async function GET() {
   try {
-    const result = await query<any>(
-      `SELECT provider, station_code, location, lat, lon, level_m, tide_height_m,
-              wave_height_m, salinity_psu, dissolved_oxygen_mg_l, turbidity_ntu,
-              current_speed_ms, current_direction_deg, wind_kph, wind_deg,
-              collected_at
-         FROM water_level_readings
-        ORDER BY collected_at DESC
-        LIMIT 1`,
+    const { value, cached, stale } = await getLatestWaterLevel()
+
+    // Shape preserved from the live-collector version. Fields with no persisted
+    // column (water temperature, wave proximity, pH) are returned as null rather
+    // than omitted so consumers can rely on the keys.
+    return applyPublicReadCacheHeaders(
+      NextResponse.json({
+        available: true,
+        timestamp: value.collectedAt,
+        stations: [
+          {
+            id: value.stationCode || "unknown",
+            name: value.location || value.stationCode || "Unknown station",
+            // Null, not 0: a station that reported no surface level has not
+            // measured a flat calm sea.
+            level: value.levelM,
+            unit: "m",
+            status: value.levelM == null ? "unknown" : "normal",
+            trend: "stable",
+            tide_height: value.tideHeightM,
+            water_temperature: null,
+            wave_height: value.waveHeightM,
+            wave_height_is_nearby: null,
+            wave_nearby_distance_km: null,
+            wave_nearby_station: null,
+            salinity: value.salinityPsu,
+            ph: null,
+            dissolved_oxygen: value.dissolvedOxygenMgL,
+            turbidity: value.turbidityNtu,
+            current_speed: value.currentSpeedMs,
+            current_direction: value.currentDirectionDeg,
+            wind_speed: value.windKph,
+            wind_direction: value.windDeg,
+          },
+        ],
+        source: value.provider || "Unknown",
+        coordinates:
+          value.lat != null && value.lon != null ? { lat: value.lat, lon: value.lon } : null,
+        cache: { cached, stale, source: value.origin },
+      }),
     )
-
-    const water = result.rows?.[0]
-    if (!water) {
-      return NextResponse.json({ error: "No water level data" }, { status: 502 })
-    }
-
-    // Response shape preserved from the previous live-collector version. Fields
-    // with no persisted column (ph, wave proximity, gust, visibility…) are
-    // returned as null rather than omitted so consumers can rely on the keys.
-    return applyPublicReadCacheHeaders(NextResponse.json({
-      timestamp: toIsoTimestamp(water.collected_at),
-      stations: [
-        {
-          id: water.station_code || "unknown",
-          name: water.location || water.station_code || "Unknown station",
-          level: toNumber(water.level_m, 0),
-          unit: "m",
-          status: "normal",
-          trend: "stable",
-          tide_height: nullableNumber(water.tide_height_m),
-          water_temperature: null,
-          wave_height: nullableNumber(water.wave_height_m),
-          wave_height_is_nearby: null,
-          wave_nearby_distance_km: null,
-          wave_nearby_station: null,
-          salinity: nullableNumber(water.salinity_psu),
-          ph: null,
-          dissolved_oxygen: nullableNumber(water.dissolved_oxygen_mg_l),
-          turbidity: nullableNumber(water.turbidity_ntu),
-          wind_speed: nullableNumber(water.wind_kph),
-          wind_direction: nullableNumber(water.wind_deg),
-        },
-      ],
-      source: water.provider || "Unknown",
-    }))
   } catch (error) {
-    console.error("Water levels API error:", error)
-    return NextResponse.json({ error: "Failed to fetch water level data" }, { status: 500 })
+    console.warn(
+      "Water levels API: no reading available:",
+      error instanceof Error ? error.message : error,
+    )
+    const response = NextResponse.json({
+      available: false,
+      timestamp: null,
+      stations: [],
+      source: "Unknown",
+      coordinates: null,
+      error: "No water level reading has been collected yet",
+    })
+    response.headers.set('Cache-Control', 'no-store')
+    return response
   }
-}
-
-function toNumber(value: unknown, fallback: number): number {
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : fallback
-}
-
-function nullableNumber(value: unknown): number | null {
-  if (value == null) return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-function toIsoTimestamp(value: unknown): string {
-  const date = value instanceof Date ? value : new Date(String(value ?? ""))
-  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString()
 }

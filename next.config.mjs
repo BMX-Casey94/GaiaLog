@@ -75,6 +75,14 @@ const nextConfig = {
   },
   async rewrites() {
     return [
+      // `app/llms.txt` cannot be a route directory: Next treats a dotted
+      // segment as a Pages Router page and the build fails on `/_document`.
+      // The handler lives at `/llms-txt` and is served at the conventional
+      // `/llms.txt` path instead.
+      {
+        source: '/llms.txt',
+        destination: '/llms-txt',
+      },
       // WOC Data Plugin style endpoints -> Next.js API route
       {
         source: '/data-decode/:network/gaialog/:txid/:vout',
