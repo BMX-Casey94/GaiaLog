@@ -47,7 +47,7 @@ function heroAlertStyle(severity: MetricSeverity) {
         badge: 'bg-red-500/15 text-red-200 border-red-400/35',
         dot: 'bg-red-400',
         value: 'text-red-200',
-        iconWrap: 'bg-red-500/15 text-red-300 border-red-400/25',
+        icon: 'text-red-300',
         Icon: AlertOctagon,
       }
     case 'high':
@@ -57,7 +57,7 @@ function heroAlertStyle(severity: MetricSeverity) {
         badge: 'bg-orange-500/15 text-orange-200 border-orange-400/35',
         dot: 'bg-orange-400',
         value: 'text-orange-200',
-        iconWrap: 'bg-orange-500/15 text-orange-300 border-orange-400/25',
+        icon: 'text-orange-300',
         Icon: AlertTriangle,
       }
     case 'moderate':
@@ -67,7 +67,7 @@ function heroAlertStyle(severity: MetricSeverity) {
         badge: 'bg-amber-500/15 text-amber-200 border-amber-400/35',
         dot: 'bg-amber-400',
         value: 'text-amber-200',
-        iconWrap: 'bg-amber-500/15 text-amber-300 border-amber-400/25',
+        icon: 'text-amber-300',
         Icon: AlertCircle,
       }
     default:
@@ -77,7 +77,7 @@ function heroAlertStyle(severity: MetricSeverity) {
         badge: 'bg-emerald-500/15 text-emerald-200 border-emerald-400/30',
         dot: 'bg-emerald-400',
         value: 'text-emerald-200',
-        iconWrap: 'bg-emerald-500/15 text-emerald-300 border-emerald-400/25',
+        icon: 'text-emerald-300',
         Icon: CheckCircle2,
       }
   }
@@ -111,10 +111,12 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
   useEffect(() => {
     const fetchStats = async (forceRefresh = false) => {
       try {
-        const [explorerRes, readingsRes] = await Promise.allSettled([
+        const [explorerRes, readingsRes, providersRes] = await Promise.allSettled([
           fetchJsonDeduplicated<any>('/api/explorer/stats', { ttlMs: 15_000, forceRefresh }),
           // Genuine sensor metrics only — never on-chain event/priority alerts.
           fetchJsonDeduplicated<any>('/api/explorer/latest-readings', { ttlMs: 15_000, forceRefresh }),
+          // Catalogue only. Long TTL so the 45s stats poll does not re-run provider health probes.
+          fetchJsonDeduplicated<any>('/api/providers/status', { ttlMs: 5 * 60_000, forceRefresh: false }),
         ])
 
         if (explorerRes.status === 'fulfilled') {
@@ -141,6 +143,17 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
             ...prev,
             topAlert: top ? { ...metricAlertToHeroDisplay(top), severity: top.severity } : null,
           }))
+        }
+
+        if (providersRes.status === 'fulfilled') {
+          const list = providersRes.value?.controls?.providers
+          if (Array.isArray(list)) {
+            const count = list.filter((p: { enabled?: boolean; rolloutEnabled?: boolean }) => p.enabled && p.rolloutEnabled).length
+            setStats((prev) => ({
+              ...prev,
+              overlay: { ...prev.overlay, providerCount: count },
+            }))
+          }
         }
       } catch (error) {
         if (!(error instanceof Error && error.name === 'AbortError')) {
@@ -267,9 +280,7 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
                     />
                     <div className="flex items-center justify-between gap-2 mb-4">
                       <div className="flex items-center gap-2.5 min-w-0">
-                        <span className={`inline-flex items-center justify-center w-8 h-8 rounded-xl border ${alertStyle.iconWrap}`}>
-                          <AlertIcon className="h-4 w-4" />
-                        </span>
+                        <AlertIcon className={`h-4 w-4 shrink-0 ${alertStyle.icon}`} />
                         <span className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-300/90 truncate">Top Alert</span>
                       </div>
                       <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wider border shrink-0 ${alertStyle.badge}`}>
@@ -315,9 +326,7 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
                 />
                 <div className="flex items-center justify-between gap-2 mb-4">
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-purple-500/15 border border-purple-400/25 text-purple-300">
-                      <Shield className="h-4 w-4" />
-                    </span>
+                    <Shield className="h-4 w-4 shrink-0 text-purple-300" />
                     <span className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-300/90 truncate">Total Data Records</span>
                   </div>
                   <span className="text-[10px] font-medium uppercase tracking-wider text-purple-300/80 bg-purple-500/10 border border-purple-400/20 rounded-full px-2 py-0.5 shrink-0">
@@ -348,9 +357,7 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
                 />
                 <div className="flex items-center justify-between gap-2 mb-4">
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-indigo-500/15 border border-indigo-400/25 text-indigo-300">
-                      <Globe className="h-4 w-4" />
-                    </span>
+                    <Globe className="h-4 w-4 shrink-0 text-indigo-300" />
                     <span className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-300/90 truncate">Data Sources</span>
                   </div>
                   <span className="inline-flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-emerald-300/90 bg-emerald-500/10 border border-emerald-400/20 rounded-full px-2 py-0.5 shrink-0">
