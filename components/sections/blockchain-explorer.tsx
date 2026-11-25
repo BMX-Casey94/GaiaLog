@@ -164,13 +164,13 @@ export function BlockchainExplorer() {
 
                 return (
                   <GlowCard key={descriptor.id} glowColor="purple" customSize className="h-full flex flex-col justify-between">
-                    <div className="flex items-start gap-3 min-w-0">
-                      <div className="w-10 h-10 shrink-0 rounded-xl bg-purple-500/10 border border-purple-400/20 flex items-center justify-center">
-                        <Hash className="h-5 w-5 text-purple-300" />
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-start justify-between gap-2 mb-1.5">
-                          <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                    <div className="flex items-start justify-between gap-3 -mx-4 -mt-4 min-w-0">
+                      <div className="flex items-start gap-3 min-w-0 flex-1">
+                        <div className="w-12 h-12 shrink-0 rounded-tl-2xl rounded-br-xl bg-purple-500/10 border-b border-r border-purple-400/20 flex items-center justify-center">
+                          <Hash className="h-5 w-5 text-purple-300" />
+                        </div>
+                        <div className="min-w-0 flex-1 pt-3 pr-1">
+                          <div className="flex items-center gap-2 min-w-0 flex-wrap mb-1.5">
                             <span className="font-semibold text-white">{descriptor.label}</span>
                             <Badge
                               variant="secondary"
@@ -180,18 +180,6 @@ export function BlockchainExplorer() {
                               {badge.label}
                             </Badge>
                           </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-purple-200 hover:text-white bg-purple-500/10 hover:bg-purple-500/20 border border-purple-400/20 rounded-lg shrink-0 h-auto px-2.5 py-1 text-xs"
-                            onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
-                          >
-                            <span className="inline-flex items-center whitespace-nowrap">
-                              View TX
-                              <ExternalLink className="ml-1 h-3 w-3" />
-                            </span>
-                          </Button>
-                        </div>
                         <div className="text-sm text-slate-300/90 mb-1.5 line-clamp-2">
                           {description}
                         </div>
@@ -201,7 +189,18 @@ export function BlockchainExplorer() {
                             <span className="min-w-0 line-clamp-2 break-words">{tx.location}</span>
                           </div>
                         )}
+                        </div>
                       </div>
+                      <button
+                        type="button"
+                        className="shrink-0 self-start rounded-tr-2xl rounded-bl-xl border-b border-l border-purple-400/20 bg-purple-500/10 px-3 py-2.5 text-xs font-medium text-purple-200 transition-colors hover:bg-purple-500/20 hover:text-white"
+                        onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
+                      >
+                        <span className="inline-flex items-center whitespace-nowrap">
+                          View TX
+                          <ExternalLink className="ml-1 h-3 w-3" />
+                        </span>
+                      </button>
                     </div>
                     <div className="flex items-center justify-between flex-wrap gap-2 text-xs text-slate-400 border-t border-white/5 pt-2.5 mt-3">
                       <span className="inline-flex items-center gap-1.5">
