@@ -3081,6 +3081,161 @@ export class AisStreamWorker extends BaseWorker {
   }
 }
 
+// ─── OpenAQ v3 Worker ────────────────────────────────────────────────────────
+
+export class OpenAqWorker extends BaseWorker {
+  constructor() {
+    super('OpenAQ')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.openaq_air_quality?.cadence.intervalMs || 5 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.openaq_air_quality
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const { collectOpenAqAirQuality } = await import('./collectors/backup-providers')
+      const batch = await collectOpenAqAirQuality(config.chunkSize || 200)
+      for (const item of batch) {
+        const ts = typeof item.timestamp === 'number' ? item.timestamp : Date.parse(String(item.timestamp))
+        data.push({
+          type: 'air-quality',
+          timestamp: Number.isFinite(ts) ? ts : Date.now(),
+          location: item.location,
+          measurement: {
+            aqi: item.aqi,
+            pm25: item.pm25,
+            pm10: item.pm10,
+            co: item.co,
+            no2: item.no2,
+            o3: item.o3,
+            so2: (item as any).so2 ?? 0,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'air_quality',
+          providerId: 'openaq',
+          datasetId: 'openaq_air_quality',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: item.coordinates,
+          stationId: item.station_id,
+        })
+      }
+    } catch (error) {
+      console.error('Error processing OpenAQ data:', error)
+    }
+    return data
+  }
+}
+
+// ─── adsb.lol Worker ─────────────────────────────────────────────────────────
+
+export class AdsbLolWorker extends BaseWorker {
+  constructor() {
+    super('ADSB-lol')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.adsb_lol_aircraft?.cadence.intervalMs || 5 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.adsb_lol_aircraft
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const { collectAdsbLolStates } = await import('./collectors/backup-providers')
+      const batch = await collectAdsbLolStates(config.chunkSize || 200)
+      for (const item of batch) {
+        data.push({
+          type: 'transport',
+          timestamp: item.timestamp,
+          location: item.callsign || item.icao24,
+          measurement: {
+            icao24: item.icao24,
+            callsign: item.callsign,
+            origin_country: item.originCountry,
+            altitude_m: item.altitudeM,
+            velocity_ms: item.velocityMs,
+            heading: item.heading,
+            on_ground: item.onGround,
+            squawk: item.squawk,
+            registration: item.registration,
+            aircraft_type: item.aircraftType,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'transport_tracking',
+          providerId: 'adsb_lol',
+          datasetId: 'adsb_lol_aircraft',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error processing adsb.lol data:', error)
+    }
+    return data
+  }
+}
+
+// ─── Digitraffic AIS Worker ──────────────────────────────────────────────────
+
+export class DigitrafficAisWorker extends BaseWorker {
+  constructor() {
+    super('Digitraffic-AIS')
+  }
+
+  protected getIntervalMs(): number {
+    return datasetConfigs.digitraffic_ais_vessels?.cadence.intervalMs || 2 * 60 * 1000
+  }
+
+  protected async collectData(): Promise<EnvironmentalData[]> {
+    const config = datasetConfigs.digitraffic_ais_vessels
+    if (!config?.enabled) return []
+
+    const data: EnvironmentalData[] = []
+    try {
+      const { collectDigitrafficAisVessels } = await import('./collectors/backup-providers')
+      const batch = await collectDigitrafficAisVessels(config.chunkSize || 300)
+      for (const item of batch) {
+        data.push({
+          type: 'transport',
+          timestamp: item.timestamp,
+          location: item.mmsi,
+          measurement: {
+            mmsi: item.mmsi,
+            sog: item.sog,
+            cog: item.cog,
+            heading: item.heading,
+            nav_stat: item.navStat,
+            speed: item.speed,
+            course: item.course,
+          },
+          source: item.source,
+          priority: 'normal',
+          family: 'transport_tracking',
+          providerId: 'digitraffic_ais',
+          datasetId: 'digitraffic_ais_vessels',
+          queueLane: config.queueLane,
+          maxInFlight: config.maxInFlight,
+          coordinates: { lat: item.latitude, lon: item.longitude },
+        })
+      }
+    } catch (error) {
+      console.error('Error processing Digitraffic AIS data:', error)
+    }
+    return data
+  }
+}
+
 // ─── Movebank Worker ─────────────────────────────────────────────────────────
 
 export class MovebankWorker extends BaseWorker {
@@ -3579,6 +3734,9 @@ export class WorkerManager {
       this.workers.set('usgs-mrds', mrdsWorker)
       this.workers.set('opensky', openskyWorker)
       this.workers.set('aisstream', aisWorker)
+      this.workers.set('openaq', new OpenAqWorker())
+      this.workers.set('adsb-lol', new AdsbLolWorker())
+      this.workers.set('digitraffic-ais', new DigitrafficAisWorker())
       this.workers.set('movebank', movebankWorker)
       this.workers.set('international-planning', internationalPlanningWorker)
       this.workers.set('open-meteo', openMeteoWorker)

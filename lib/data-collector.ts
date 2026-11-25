@@ -3497,12 +3497,8 @@ const _openskyWm = { ts: 0 }
 
 export async function collectOpenSkyStates(limit: number = 1000): Promise<OpenSkyState[]> {
   const url = 'https://opensky-network.org/api/states/all'
-  const headers: Record<string, string> = {}
-  const user = process.env.OPENSKY_USERNAME
-  const pass = process.env.OPENSKY_PASSWORD
-  if (user && pass) {
-    headers['Authorization'] = `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`
-  }
+  const { getOpenSkyAuthHeaders } = await import('./opensky-auth')
+  const headers: Record<string, string> = await getOpenSkyAuthHeaders()
 
   const data = await fetchJsonWithRetry<any>(url, { retries: 1, providerId: 'opensky', timeoutMs: 30000, headers })
   const states = Array.isArray(data?.states) ? data.states : []

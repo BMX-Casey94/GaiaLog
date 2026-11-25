@@ -327,6 +327,21 @@ const PROVIDER_ENV_OVERRIDES: Partial<Record<ProviderId, {
     perDayEnv: 'HUBEAU_FRANCE_PER_DAY',
     intervalEnv: 'HUBEAU_FRANCE_WORKER_INTERVAL_MS',
   },
+  openaq: {
+    rpsEnv: 'OPENAQ_RPS',
+    perDayEnv: 'OPENAQ_PER_DAY',
+    intervalEnv: 'OPENAQ_WORKER_INTERVAL_MS',
+  },
+  adsb_lol: {
+    rpsEnv: 'ADSB_LOL_RPS',
+    perDayEnv: 'ADSB_LOL_PER_DAY',
+    intervalEnv: 'ADSB_LOL_WORKER_INTERVAL_MS',
+  },
+  digitraffic_ais: {
+    rpsEnv: 'DIGITRAFFIC_AIS_RPS',
+    perDayEnv: 'DIGITRAFFIC_AIS_PER_DAY',
+    intervalEnv: 'DIGITRAFFIC_AIS_WORKER_INTERVAL_MS',
+  },
 }
 
 const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
@@ -370,6 +385,9 @@ const DEFAULT_RATE_LIMITS: Record<ProviderId, BudgetLimits> = {
   reliefweb: { perSecond: 1, perDay: 1000 },
   met_no: { perSecond: 2, perDay: 20000 },
   hubeau_france: { perSecond: 5, perDay: 50000 },
+  openaq: { perSecond: 1, perDay: 2000 },
+  adsb_lol: { perSecond: 1, perDay: 500 },
+  digitraffic_ais: { perSecond: 1, perDay: 10000 },
 }
 
 const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
@@ -403,7 +421,8 @@ const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
   usgs_mrds: 7 * 24 * 60 * 60 * 1000,
   // Anonymous OpenSky allows ~100 /states/all calls per day (4 credits each,
   // ~400 credit budget); 15 min ≈ 96/day.  Override via
-  // OPENSKY_WORKER_INTERVAL_MS once OPENSKY_USERNAME/PASSWORD are configured.
+  // OPENSKY_WORKER_INTERVAL_MS once OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET
+  // (OAuth2 client credentials) are configured.
   opensky: 15 * 60 * 1000,
   aisstream: 60 * 1000,
   movebank: 6 * 60 * 60 * 1000,
@@ -416,6 +435,9 @@ const DEFAULT_INTERVALS_MS: Record<ProviderId, number> = {
   reliefweb: 60 * 60 * 1000,
   met_no: 60 * 60 * 1000,
   hubeau_france: 15 * 60 * 1000,
+  openaq: 5 * 60 * 1000,
+  adsb_lol: 5 * 60 * 1000,
+  digitraffic_ais: 2 * 60 * 1000,
 }
 
 const PROVIDER_KEY_ENV: Partial<Record<ProviderId, string>> = {
@@ -427,6 +449,9 @@ const PROVIDER_KEY_ENV: Partial<Record<ProviderId, string>> = {
   aisstream: 'AISSTREAM_API_KEY',
   movebank: 'MOVEBANK_API_KEY',
   nsw_planning: 'PLANNING_ALERTS_AU_API_KEY',
+  // Optional. Anonymous OpenSky stays enabled; OAuth2 (OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET) raises the quota.
+  opensky: 'OPENSKY_CLIENT_ID',
+  openaq: 'OPENAQ_API_KEY',
 }
 
 function getProviderEnvOverride(providerId: ProviderId) {
@@ -550,6 +575,9 @@ const PROVIDER_ROLLOUT_RULES: Record<ProviderId, RolloutRule> = {
   reliefweb: { phase: 2, minimumGate: 'gate_c', note: 'Keyless humanitarian disasters feed (UN OCHA ReliefWeb).' },
   met_no: { phase: 1, minimumGate: 'gate_b', note: 'Keyless European weather forecasts from MET Norway (User-Agent only).' },
   hubeau_france: { phase: 2, minimumGate: 'gate_c', note: 'Keyless French river observations (Hub\'Eau / Eau France).' },
+  openaq: { phase: 2, minimumGate: 'gate_b', note: 'OpenAQ air-quality measurements. Requires OPENAQ_API_KEY.' },
+  adsb_lol: { phase: 3, minimumGate: 'gate_d', note: 'Keyless community ADS-B aircraft positions (adsb.lol).' },
+  digitraffic_ais: { phase: 3, minimumGate: 'gate_d', note: 'Keyless Finnish AIS vessel positions (Digitraffic / Fintraffic).' },
 }
 
 function buildProviderConfigs(): Record<ProviderId, ProviderConfig> {
