@@ -3,13 +3,15 @@
 import { useEffect, useState } from "react"
 import dynamic from "next/dynamic"
 import { Button } from "@/components/ui/button"
-import { ArrowRight, AlertTriangle, Shield, Globe } from "lucide-react"
+import { ArrowRight, AlertTriangle, AlertOctagon, AlertCircle, Shield, Globe, MapPin, CheckCircle2 } from "lucide-react"
 import {
   metricAlertToHeroDisplay,
   pickTopMetricAlert,
   processDataIntoAlerts,
   readingsToEnvironmentalData,
+  type MetricSeverity,
 } from "@/lib/metric-alerts"
+import { fetchJsonDeduplicated } from "@/lib/client-fetch-cache"
 
 // Heavy canvas visuals are decorative — defer them so they never block first paint.
 const SparklesCore = dynamic(
@@ -32,7 +34,49 @@ interface HeroStats {
     value: string
     location: string
     timestamp: string
+    severity: MetricSeverity
   } | null
+}
+
+function heroAlertStyle(severity: MetricSeverity) {
+  switch (severity) {
+    case 'critical':
+      return {
+        card: 'border-red-500/40 bg-red-950/25 hover:border-red-400/60 hover:bg-red-950/35',
+        badge: 'bg-red-500/20 text-red-300 border-red-500/40',
+        dot: 'bg-red-400',
+        value: 'text-red-300',
+        iconWrap: 'bg-red-500/15 text-red-400',
+        Icon: AlertOctagon,
+      }
+    case 'high':
+      return {
+        card: 'border-orange-500/35 bg-orange-950/20 hover:border-orange-400/55 hover:bg-orange-950/30',
+        badge: 'bg-orange-500/20 text-orange-300 border-orange-500/40',
+        dot: 'bg-orange-400',
+        value: 'text-orange-300',
+        iconWrap: 'bg-orange-500/15 text-orange-400',
+        Icon: AlertTriangle,
+      }
+    case 'moderate':
+      return {
+        card: 'border-amber-500/35 bg-amber-950/20 hover:border-amber-400/55 hover:bg-amber-950/30',
+        badge: 'bg-amber-500/20 text-amber-300 border-amber-500/40',
+        dot: 'bg-amber-400',
+        value: 'text-amber-300',
+        iconWrap: 'bg-amber-500/15 text-amber-400',
+        Icon: AlertCircle,
+      }
+    default:
+      return {
+        card: 'border-emerald-500/30 bg-emerald-950/15 hover:border-emerald-400/50 hover:bg-emerald-950/25',
+        badge: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/35',
+        dot: 'bg-emerald-400',
+        value: 'text-emerald-300',
+        iconWrap: 'bg-emerald-500/15 text-emerald-400',
+        Icon: CheckCircle2,
+      }
+  }
 }
 
 function formatRelativeTime(fromMs: number, nowMs: number): string {
@@ -46,9 +90,9 @@ function formatRelativeTime(fromMs: number, nowMs: number): string {
   return `${diffDays} day${diffDays === 1 ? "" : "s"} ago`
 }
 
-export function Hero() {
+export function Hero({ initialProviderCount }: { initialProviderCount?: number } = {}) {
   const [stats, setStats] = useState<HeroStats>({
-    overlay: { totalReadings: null, providerCount: null },
+    overlay: { totalReadings: null, providerCount: initialProviderCount ?? null },
     lastRecordAt: null,
     topAlert: null,
   })
@@ -61,18 +105,16 @@ export function Hero() {
   }, [])
 
   useEffect(() => {
-    const fetchStats = async () => {
+    const fetchStats = async (forceRefresh = false) => {
       try {
-        const [explorerRes, readingsRes, providersRes] = await Promise.allSettled([
-          fetch('/api/explorer/stats', { cache: 'no-store' }),
+        const [explorerRes, readingsRes] = await Promise.allSettled([
+          fetchJsonDeduplicated<any>('/api/explorer/stats', { ttlMs: 15_000, forceRefresh }),
           // Genuine sensor metrics only — never on-chain event/priority alerts.
-          fetch('/api/explorer/latest-readings', { cache: 'no-store' }),
-          fetch('/api/providers/status', { cache: 'no-store' }),
+          fetchJsonDeduplicated<any>('/api/explorer/latest-readings', { ttlMs: 15_000, forceRefresh }),
         ])
 
-        if (explorerRes.status === 'fulfilled' && explorerRes.value.ok) {
-          const explorer = await explorerRes.value.json()
-          const data = explorer?.data
+        if (explorerRes.status === 'fulfilled') {
+          const data = explorerRes.value?.data
           if (data) {
             const lastUpdatedIso = data.index?.lastUpdated
             const lastUpdatedMs = lastUpdatedIso ? new Date(lastUpdatedIso).getTime() : NaN
@@ -87,23 +129,13 @@ export function Hero() {
           }
         }
 
-        if (readingsRes.status === 'fulfilled' && readingsRes.value.ok) {
-          const latest = await readingsRes.value.json()
+        if (readingsRes.status === 'fulfilled') {
+          const latest = readingsRes.value
           const readings = latest?.success && Array.isArray(latest.readings) ? latest.readings : []
           const top = pickTopMetricAlert(processDataIntoAlerts(readingsToEnvironmentalData(readings)))
           setStats((prev) => ({
             ...prev,
-            topAlert: top ? metricAlertToHeroDisplay(top) : null,
-          }))
-        }
-
-        if (providersRes.status === 'fulfilled' && providersRes.value.ok) {
-          const providers = await providersRes.value.json()
-          const list = providers?.controls?.providers ?? []
-          const count = list.filter((p: any) => p.enabled && p.rolloutEnabled).length
-          setStats((prev) => ({
-            ...prev,
-            overlay: { ...prev.overlay, providerCount: count },
+            topAlert: top ? { ...metricAlertToHeroDisplay(top), severity: top.severity } : null,
           }))
         }
       } catch (error) {
@@ -113,8 +145,8 @@ export function Hero() {
       }
     }
 
-    fetchStats()
-    const interval = setInterval(fetchStats, 45000)
+    fetchStats(false)
+    const interval = setInterval(() => fetchStats(true), 45000)
     return () => clearInterval(interval)
   }, [])
 
@@ -140,7 +172,9 @@ export function Hero() {
       <div
         className="absolute inset-0"
         style={{
-          background: `radial-gradient(ellipse at center, rgba(88, 28, 135, 0.4) 0%, rgba(59, 7, 100, 0.3) 35%, rgba(4, 2, 8, 1) 70%)`,
+          background: `radial-gradient(ellipse 85% 65% at 50% 35%, rgba(88, 28, 135, 0.38) 0%, rgba(59, 7, 100, 0.22) 40%, transparent 75%)`,
+          maskImage: "linear-gradient(to bottom, black 78%, transparent 100%)",
+          WebkitMaskImage: "linear-gradient(to bottom, black 78%, transparent 100%)",
         }}
       >
         <div className="opacity-30">
@@ -166,13 +200,13 @@ export function Hero() {
             <span className="gradient-heading">GaiaLog</span>
           </h1>
 
-          <p className="text-sm md:text-lg text-slate-300 mb-2 max-w-3xl mx-auto leading-relaxed relative z-20">
+          <p className="text-sm md:text-lg text-slate-300 mb-1 max-w-3xl mx-auto leading-snug relative z-20">
             Immutable environmental data, live from{' '}
             <span className="block md:inline">air, water, fire and seismic sensors.</span>
           </p>
 
-          <p className="hidden md:block text-base text-slate-400 mb-8 max-w-4xl mx-auto relative z-20">
-            Every measurement recorded on the BSV blockchain for transparency and verification.
+          <p className="hidden md:block text-base text-slate-400 mb-8 max-w-4xl mx-auto leading-snug relative z-20">
+            Every measurement on the BSV blockchain for transparency and verification.
           </p>
 
           <div className="flex flex-col sm:flex-row gap-4 justify-center relative z-20 mt-6 md:mt-0">
@@ -205,53 +239,81 @@ export function Hero() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <button
-                className="bg-transparent backdrop-blur-sm rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/20 transition-all text-left"
-                onClick={scrollToMonitoring}
-              >
-                <div className="flex items-center space-x-2 mb-2">
-                  <AlertTriangle className="h-4 w-4 text-red-400" />
-                  <span className="text-sm text-slate-300">Top Alert</span>
-                </div>
-                {stats.topAlert ? (
-                  <>
-                    <div className="text-xl md:text-2xl font-bold text-red-400">{stats.topAlert.label}: {stats.topAlert.value || 'Active'}</div>
-                    <div className="text-xs text-slate-400 truncate">{formatLocation(stats.topAlert.location)}</div>
-                  </>
-                ) : (
-                  <>
-                    <div className="text-xl md:text-2xl font-bold text-green-400">All Clear</div>
-                    <div className="text-xs text-slate-400">No critical alerts</div>
-                  </>
-                )}
-              </button>
+              {(() => {
+                const alertStyle = heroAlertStyle(stats.topAlert?.severity ?? 'low')
+                const AlertIcon = alertStyle.Icon
+                return (
+                  <button
+                    className={`backdrop-blur-md rounded-xl p-4 border transition-all text-left flex flex-col justify-between ${alertStyle.card}`}
+                    onClick={scrollToMonitoring}
+                  >
+                    <div className="flex items-center justify-between gap-2 mb-3">
+                      <div className="flex items-center gap-2">
+                        <span className={`inline-flex items-center justify-center w-7 h-7 rounded-lg ${alertStyle.iconWrap}`}>
+                          <AlertIcon className="h-4 w-4" />
+                        </span>
+                        <span className="text-xs font-medium uppercase tracking-wider text-slate-300">Top Alert</span>
+                      </div>
+                      <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold uppercase tracking-wide border ${alertStyle.badge}`}>
+                        <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${alertStyle.dot}`} />
+                        {stats.topAlert ? stats.topAlert.severity : 'Clear'}
+                      </span>
+                    </div>
+                    {stats.topAlert ? (
+                      <div>
+                        <div className={`text-lg md:text-xl font-bold leading-snug ${alertStyle.value}`}>
+                          {stats.topAlert.label}
+                          <span className="text-white font-semibold"> · {stats.topAlert.value || 'Active'}</span>
+                        </div>
+                        <div className="mt-1.5 flex items-center gap-1.5 text-xs text-slate-400">
+                          <MapPin className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+                          <span className="truncate">{formatLocation(stats.topAlert.location)}</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div>
+                        <div className="text-lg md:text-xl font-bold text-emerald-300">All Clear</div>
+                        <div className="mt-1.5 text-xs text-slate-400">No critical alerts detected</div>
+                      </div>
+                    )}
+                  </button>
+                )
+              })()}
 
               <button
                 id="blockchain-status"
-                className="bg-transparent backdrop-blur-sm rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/20 transition-all text-left"
+                className="bg-purple-950/20 backdrop-blur-md rounded-xl p-4 border border-purple-500/25 hover:border-purple-400/50 hover:bg-purple-950/35 transition-all text-left flex flex-col justify-between"
                 onClick={() => document.getElementById('blockchain')?.scrollIntoView({ behavior: 'smooth' })}
               >
-                <div className="flex items-center space-x-2 mb-2">
-                  <Shield className="h-4 w-4 text-blue-400" />
-                  <span className="text-sm text-slate-300">Total Data Records</span>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-purple-500/15 text-purple-300">
+                    <Shield className="h-4 w-4" />
+                  </span>
+                  <span className="text-xs font-medium uppercase tracking-wider text-slate-300">Total Data Records</span>
                 </div>
-                <div className="text-xl md:text-2xl font-bold text-white">{formatTotalReadings(stats.overlay.totalReadings) || '—'}</div>
-                <div className="text-xs text-slate-400">
-                  {stats.lastRecordAt ? `Last record: ${formatRelativeTime(stats.lastRecordAt, now)}` : 'Awaiting data…'}
+                <div>
+                  <div className="text-xl md:text-2xl font-bold text-white tabular-nums">{formatTotalReadings(stats.overlay.totalReadings) || '—'}</div>
+                  <div className="mt-1.5 text-xs text-slate-400">
+                    {stats.lastRecordAt ? `Last record: ${formatRelativeTime(stats.lastRecordAt, now)}` : 'Awaiting data…'}
+                  </div>
                 </div>
               </button>
 
               <button
                 id="data-sources-card"
-                className="bg-transparent backdrop-blur-sm rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/20 transition-all text-left"
+                className="bg-purple-950/20 backdrop-blur-md rounded-xl p-4 border border-purple-500/25 hover:border-purple-400/50 hover:bg-purple-950/35 transition-all text-left flex flex-col justify-between"
                 onClick={() => document.getElementById('data-sources')?.scrollIntoView({ behavior: 'smooth' })}
               >
-                <div className="flex items-center space-x-2 mb-2">
-                  <Globe className="h-4 w-4 text-blue-400" />
-                  <span className="text-sm text-slate-300">Data Sources</span>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-indigo-500/15 text-indigo-300">
+                    <Globe className="h-4 w-4" />
+                  </span>
+                  <span className="text-xs font-medium uppercase tracking-wider text-slate-300">Data Sources</span>
                 </div>
-                <div className="text-xl md:text-2xl font-bold text-white">{stats.overlay.providerCount ?? '—'}</div>
-                <div className="text-xs text-slate-400">All systems operational</div>
+                <div>
+                  <div className="text-xl md:text-2xl font-bold text-white tabular-nums">{stats.overlay.providerCount ?? '—'}</div>
+                  <div className="mt-1.5 text-xs text-slate-400">All systems operational</div>
+                </div>
               </button>
             </div>
           </div>

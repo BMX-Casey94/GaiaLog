@@ -120,7 +120,7 @@ export function BlockchainExplorer() {
 
   return (
     <section id="blockchain" className="py-20 px-4 sm:px-6 lg:px-8 relative scroll-mt-24">
-      <div className="absolute inset-0 bg-gradient-to-b from-black/80 via-slate-900/20 to-slate-950/50 pointer-events-none"></div>
+      <div className="absolute inset-0 bg-gradient-to-b from-transparent via-purple-950/15 to-transparent pointer-events-none"></div>
       <div className="relative z-10">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-16">
@@ -163,15 +163,15 @@ export function BlockchainExplorer() {
                 })
 
                 return (
-                  <GlowCard key={descriptor.id} glowColor="purple" customSize>
+                  <GlowCard key={descriptor.id} glowColor="purple" customSize className="h-full flex flex-col justify-between">
                     <div className="flex items-start gap-3 min-w-0">
-                      <div className="w-10 h-10 shrink-0 bg-slate-950/60 rounded-full flex items-center justify-center">
+                      <div className="w-10 h-10 shrink-0 rounded-xl bg-purple-500/10 border border-purple-400/20 flex items-center justify-center">
                         <Hash className="h-5 w-5 text-purple-300" />
                       </div>
                       <div className="min-w-0 flex-1">
-                        <div className="flex items-start justify-between gap-2 mb-1">
+                        <div className="flex items-start justify-between gap-2 mb-1.5">
                           <div className="flex items-center gap-2 min-w-0 flex-wrap">
-                            <span className="font-medium text-white">{descriptor.label}</span>
+                            <span className="font-semibold text-white">{descriptor.label}</span>
                             <Badge
                               variant="secondary"
                               className={homepageBadgeClass(badge.label)}
@@ -183,7 +183,7 @@ export function BlockchainExplorer() {
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="text-purple-300 hover:text-purple-200 shrink-0 h-auto px-2 py-1"
+                            className="text-purple-200 hover:text-white bg-purple-500/10 hover:bg-purple-500/20 border border-purple-400/20 rounded-lg shrink-0 h-auto px-2.5 py-1 text-xs"
                             onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
                           >
                             <span className="inline-flex items-center whitespace-nowrap">
@@ -192,24 +192,25 @@ export function BlockchainExplorer() {
                             </span>
                           </Button>
                         </div>
-                        <div className="text-sm text-slate-400 mb-1 line-clamp-2">
+                        <div className="text-sm text-slate-300/90 mb-1.5 line-clamp-2">
                           {description}
                         </div>
                         {tx.location && (
-                          <div className="flex items-start gap-1 text-xs text-slate-500 mb-1 min-w-0">
-                            <MapPin className="h-3 w-3 shrink-0 mt-0.5" />
+                          <div className="flex items-start gap-1.5 text-xs text-slate-400 min-w-0">
+                            <MapPin className="h-3.5 w-3.5 shrink-0 mt-0.5 text-purple-300/70" />
                             <span className="min-w-0 line-clamp-2 break-words">{tx.location}</span>
                           </div>
                         )}
-                        <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-xs text-slate-500">
-                          <Clock className="h-3 w-3 shrink-0" />
-                          <span>{tx.timestamp}</span>
-                          <span>•</span>
-                          <span className="font-mono">
-                            {tx.id.slice(0, 8)}...{tx.id.slice(-8)}
-                          </span>
-                        </div>
                       </div>
+                    </div>
+                    <div className="flex items-center justify-between flex-wrap gap-2 text-xs text-slate-400 border-t border-white/5 pt-2.5 mt-3">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Clock className="h-3 w-3 shrink-0 text-slate-500" />
+                        <span>{tx.timestamp}</span>
+                      </span>
+                      <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-white/5 border border-white/10 text-slate-300">
+                        {tx.id.slice(0, 8)}…{tx.id.slice(-8)}
+                      </span>
                     </div>
                   </GlowCard>
                 )
