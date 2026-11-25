@@ -473,10 +473,11 @@ async function handleStatusEvent(event: StatusEvent): Promise<void> {
     }
   } catch (error) {
     console.warn(
-      `[broadcaster-sse] follow-up (${followUp}) for ${event.txid.substring(0, 12)}… failed: ${
+      `[broadcaster-sse] follow-up (${followUp}) for ${event.txid.substring(0, 12)}… failed (leaving phase unchanged for reconciler retry): ${
         describeError(error)
       }`,
     )
+    return
   }
 
   await upsertArcBroadcastStatus({
