@@ -24,6 +24,7 @@ export function ExplorerClient() {
   const [searchQuery, setSearchQuery] = useState("")
   const suggestionsOpenRef = useRef(false)
   const suppressAutoSearchUntilRef = useRef<number>(0)
+  const activeSearchAbortRef = useRef<AbortController | null>(null)
 
   // Filter state
   const [selectedType, setSelectedType] = useState<string | null>(null)
@@ -49,6 +50,11 @@ export function ExplorerClient() {
     pageNum: number = 1,
     queryOverride?: string,
   ) => {
+    // Cancel any previous in-flight search so slow filters never overwrite newer ones.
+    activeSearchAbortRef.current?.abort()
+    const controller = new AbortController()
+    activeSearchAbortRef.current = controller
+
     setLoading(true)
     setError(null)
 
@@ -57,12 +63,14 @@ export function ExplorerClient() {
       const params = new URLSearchParams()
       if (q) params.set('q', q)
       if (selectedType) params.set('type', selectedType)
-      if (dateFrom) params.set('from', new Date(dateFrom).toISOString())
-      if (dateTo) params.set('to', new Date(dateTo).toISOString())
+      if (dateFrom) params.set('from', new Date(`${dateFrom}T00:00:00.000Z`).toISOString())
+      if (dateTo) params.set('to', new Date(`${dateTo}T23:59:59.999Z`).toISOString())
       params.set('page', String(pageNum))
       params.set('pageSize', '24')
 
-      const res = await fetch(`/api/explorer/search?${params}`)
+      const res = await fetch(`/api/explorer/search?${params}`, {
+        signal: controller.signal,
+      })
       const text = await res.text()
       let data: any = null
       try {
@@ -70,6 +78,8 @@ export function ExplorerClient() {
       } catch {
         data = null
       }
+
+      if (controller.signal.aborted) return
 
       if (!res.ok) {
         setError(
@@ -91,9 +101,12 @@ export function ExplorerClient() {
         setError(data?.error || 'Search failed')
       }
     } catch (e) {
+      if (e instanceof Error && e.name === 'AbortError') return
       setError(e instanceof Error ? e.message : 'Search failed')
     } finally {
-      setLoading(false)
+      if (!controller.signal.aborted) {
+        setLoading(false)
+      }
     }
   }, [searchQuery, selectedType, dateFrom, dateTo])
 

@@ -9,7 +9,7 @@
  * belong in overlay-explorer-service.ts.
  */
 
-import { query } from './db'
+import { query, queryWithDeadline } from './db'
 import type { OverlayExplorerReading } from './explorer-decoder'
 import { getDataFamilyFilterValues, normaliseDataFamily } from './stream-registry'
 import type { SearchParams, StoredReading, LocationSuggestion } from './supabase-explorer'
@@ -157,14 +157,14 @@ export async function searchReadings(params: SearchParams): Promise<{
   const { whereSql, sqlParams } = buildWhereClause(params)
   const whereParams = [...sqlParams]
 
-  sqlParams.push(pageSize, offset)
+  sqlParams.push(pageSize + 1, offset)
   const limitIdx = sqlParams.length - 1
   const offsetIdx = sqlParams.length
 
-  // Rows and total run in parallel.  The total avoids COUNT(*) OVER(), which
-  // forced Postgres to count the entire filtered set on every page fetch.
-  const [result, total] = await Promise.all([
-    query<any>(
+  // Rows and total run in parallel.  Fetching pageSize + 1 lets us determine
+  // hasMore accurately even if a slow filtered COUNT(*) hits its deadline.
+  const [result, rawTotal] = await Promise.all([
+    queryWithDeadline<any>(
       `SELECT
          txid, data_family, location, lat, lon,
          reading_ts, provider_id, block_height, block_time,
@@ -174,18 +174,32 @@ export async function searchReadings(params: SearchParams): Promise<{
        ORDER BY reading_ts DESC
        LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
       sqlParams,
+      { timeoutMs: 10_000, label: 'explorer_search_rows' },
     ),
     countSearchTotal(params, whereSql, whereParams),
   ])
 
-  const rows = result.rows || []
+  const allRows = result.rows || []
+  const hasMoreBySlice = allRows.length > pageSize
+  const rows = hasMoreBySlice ? allRows.slice(0, pageSize) : allRows
   const items: StoredReading[] = rows.map(overlayRowToStoredReading)
   const phases = await lookupArcPhasesByTxid(items.map((item) => item.txid))
   for (const item of items) {
     item.arcPhase = phases.get(item.txid) ?? null
   }
 
-  return { items, total, page, pageSize, hasMore: offset + items.length < total }
+  const total =
+    rawTotal !== null
+      ? rawTotal
+      : offset + items.length + (hasMoreBySlice ? 1 : 0)
+
+  return {
+    items,
+    total,
+    page,
+    pageSize,
+    hasMore: rawTotal !== null ? offset + items.length < rawTotal : hasMoreBySlice,
+  }
 }
 
 // ─── Search total helpers ────────────────────────────────────────────────────
@@ -205,7 +219,7 @@ async function countSearchTotal(
   params: SearchParams,
   whereSql: string,
   whereParams: unknown[],
-): Promise<number> {
+): Promise<number | null> {
   const hasQuery = !!params.q?.trim()
   const hasDates = !!params.from || !!params.to
 
@@ -231,29 +245,36 @@ async function countSearchTotal(
     }
   }
 
-  // 3. Filtered search — cached COUNT(*).
+  // 3. Filtered search — cached COUNT(*) with a tight deadline so slow scans
+  // never time out the page load.
   const cacheKey = `${whereSql}|${JSON.stringify(whereParams)}`
   const cached = searchCountCache.get(cacheKey)
   if (cached && Date.now() - cached.ts < SEARCH_COUNT_CACHE_TTL_MS) {
     return cached.total
   }
 
-  const countResult = await query<{ total: string }>(
-    `SELECT COUNT(*)::bigint AS total
-     FROM overlay_explorer_readings
-     ${whereSql}`,
-    whereParams,
-  )
-  const total = Number(countResult.rows?.[0]?.total || 0)
+  try {
+    const countResult = await queryWithDeadline<{ total: string }>(
+      `SELECT COUNT(*)::bigint AS total
+       FROM overlay_explorer_readings
+       ${whereSql}`,
+      whereParams,
+      { timeoutMs: 2500, label: 'explorer_search_count' },
+    )
+    const total = Number(countResult.rows?.[0]?.total || 0)
 
-  if (searchCountCache.size >= SEARCH_COUNT_CACHE_MAX_ENTRIES) {
-    // Drop the oldest entry to bound memory (Map preserves insertion order).
-    const oldestKey = searchCountCache.keys().next().value
-    if (oldestKey !== undefined) searchCountCache.delete(oldestKey)
+    if (searchCountCache.size >= SEARCH_COUNT_CACHE_MAX_ENTRIES) {
+      // Drop the oldest entry to bound memory (Map preserves insertion order).
+      const oldestKey = searchCountCache.keys().next().value
+      if (oldestKey !== undefined) searchCountCache.delete(oldestKey)
+    }
+    searchCountCache.set(cacheKey, { total, ts: Date.now() })
+
+    return total
+  } catch (err) {
+    console.warn('Explorer filtered COUNT(*) timed out; falling back to slice pagination:', err instanceof Error ? err.message : err)
+    return null
   }
-  searchCountCache.set(cacheKey, { total, ts: Date.now() })
-
-  return total
 }
 
 export async function getLocationSuggestions(
