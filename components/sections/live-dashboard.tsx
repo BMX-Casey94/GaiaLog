@@ -303,7 +303,7 @@ export function LiveDashboard() {
             })}
 
             {/* Verified on-chain (display only — not used for Hero Top Alert) */}
-            <GlowCard glowColor="green" customSize className="h-full min-h-[240px]">
+            <GlowCard glowColor="purple" customSize className="h-full min-h-[240px]">
               <div className="shrink-0 flex items-center justify-between gap-2 -mx-4 -mt-4 px-4 py-3 bg-emerald-950/40 border-b border-emerald-500/25 rounded-t-2xl">
                 <div className="flex items-center gap-2 min-w-0">
                   <Shield className="h-4 w-4 shrink-0 text-emerald-400" />
