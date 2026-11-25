@@ -140,6 +140,10 @@ interface CliOptions {
   skipSnapshot: boolean
   // Only lock UTXOs at or below this size (keeps the index range tight).
   maxInputSats: number
+  // When a batch of sub-fee dust has outputSats <= 1, pair it with the
+  // largest available reserve/pool UTXO(s) from the same wallet so the
+  // transaction pays its fee and clears the dust rows cleanly.
+  subsidise: boolean
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -147,6 +151,7 @@ function parseArgs(argv: string[]): CliOptions {
   const rebalance = argv.includes('--rebalance')
   const includeUnconfirmed = argv.includes('--include-unconfirmed')
   const skipSnapshot = argv.includes('--skip-snapshot')
+  const subsidise = argv.includes('--subsidise') || argv.includes('--subsidize')
 
   const walletArg = takeValue(argv, '--wallet')
   const walletFilter =
@@ -223,6 +228,7 @@ function parseArgs(argv: string[]): CliOptions {
     maxConsecutiveFailures: Math.floor(maxFailures),
     skipSnapshot,
     maxInputSats: Math.floor(maxInputSatsRaw),
+    subsidise,
   }
 }
 
@@ -436,8 +442,8 @@ async function lockBatch(
     // the planner use overlay_admitted_utxos_acquire_ready_idx.
     await client.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`)
 
-    // Prefer pool dust (the starvation case); top up from reserve if needed.
-    const roles: Array<'pool' | 'reserve'> = ['pool', 'reserve']
+    // Prefer pool and dust rows (the starvation/cleanup case); top up from reserve if needed.
+    const roles: Array<'pool' | 'dust' | 'reserve'> = ['pool', 'dust', 'reserve']
     const selected: Array<{ topic: string; txid: string; vout: number }> = []
 
     for (const role of roles) {
@@ -476,6 +482,115 @@ async function lockBatch(
     const topics = selected.map((r) => r.topic)
     const txids = selected.map((r) => r.txid)
     const vouts = selected.map((r) => r.vout)
+
+    const res = await client.query<{
+      topic: string
+      txid: string
+      vout: number
+      satoshis: string
+      output_script: string
+    }>(
+      `UPDATE overlay_admitted_utxos u
+          SET locked = true,
+              locked_by = $4,
+              locked_at = now()
+         FROM unnest($1::text[], $2::text[], $3::int[]) AS t(topic, txid, vout)
+        WHERE u.topic = t.topic
+          AND u.txid = t.txid
+          AND u.vout = t.vout
+          AND u.removed = false
+          AND u.locked = false
+       RETURNING u.topic, u.txid, u.vout, u.satoshis, u.output_script`,
+      [topics, txids, vouts, lockedBy],
+    )
+
+    return res.rows.map((row) => ({
+      topic: row.topic,
+      txid: row.txid,
+      vout: row.vout,
+      satoshis: Number(row.satoshis),
+      output_script: row.output_script,
+    }))
+  })
+}
+
+async function lockSubsidyUtxos(
+  binding: WalletBinding,
+  baseInputCount: number,
+  baseInputSum: number,
+  feeRate: number,
+  includeUnconfirmed: boolean,
+  unconfirmedMinAgeSeconds: number,
+  lockedBy: string,
+): Promise<LockedInput[]> {
+  const statementTimeoutMs = Math.max(
+    30_000,
+    Number(process.env.CONSOLIDATE_STATEMENT_TIMEOUT_MS || 180_000),
+  )
+  const minSubsidySats = Math.max(2, Math.ceil(SIGNED_P2PKH_INPUT_BYTES * feeRate * 2))
+
+  return withOverlayTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`)
+
+    // Prefer largest reserve UTXOs first so we do not touch the active write pool
+    // unless necessary; fall back to pool if reserve is empty.
+    const roles: Array<'reserve' | 'pool'> = ['reserve', 'pool']
+    const candidates: Array<{ topic: string; txid: string; vout: number; satoshis: number }> = []
+
+    for (const role of roles) {
+      const pick = await client.query<{
+        topic: string
+        txid: string
+        vout: number
+        satoshis: string
+      }>(
+        `SELECT topic, txid, vout, satoshis
+           FROM overlay_admitted_utxos
+          WHERE wallet_index = $1
+            AND removed = false
+            AND locked = false
+            AND utxo_role = $2
+            AND satoshis >= $3
+            AND acquirable_at <= now()
+            AND ($4::boolean = true OR confirmed = true)
+            AND (confirmed = true OR admitted_at <= now() - ($5::bigint * interval '1 second'))
+          ORDER BY satoshis DESC, admitted_at ASC
+          LIMIT 25`,
+        [
+          binding.walletIndex,
+          role,
+          minSubsidySats,
+          includeUnconfirmed,
+          Math.max(0, Math.floor(unconfirmedMinAgeSeconds)),
+        ],
+      )
+      for (const row of pick.rows) {
+        candidates.push({
+          topic: row.topic,
+          txid: row.txid,
+          vout: row.vout,
+          satoshis: Number(row.satoshis),
+        })
+      }
+    }
+
+    if (candidates.length === 0) return []
+
+    // Pick only as many subsidy inputs as needed to make outputSats >= 2.
+    const chosen: Array<{ topic: string; txid: string; vout: number }> = []
+    let totalSum = baseInputSum
+    let totalCount = baseInputCount
+    for (const c of candidates) {
+      chosen.push({ topic: c.topic, txid: c.txid, vout: c.vout })
+      totalSum += c.satoshis
+      totalCount += 1
+      const fee = estimateFee(totalCount, 1, feeRate)
+      if (totalSum - fee >= 2) break
+    }
+
+    const topics = chosen.map((r) => r.topic)
+    const txids = chosen.map((r) => r.txid)
+    const vouts = chosen.map((r) => r.vout)
 
     const res = await client.query<{
       topic: string
@@ -901,10 +1016,11 @@ async function consolidateWallet(
       break
     }
 
-    const inputSum = inputs.reduce((acc, i) => acc + i.satoshis, 0)
-    const fee = estimateFee(inputs.length, 1, options.feeRate)
-    const outputSats = inputSum - fee
-    const txSizeBytes = estimateTxSize(inputs.length, 1)
+    const dustInputsCount = inputs.length
+    let inputSum = inputs.reduce((acc, i) => acc + i.satoshis, 0)
+    let fee = estimateFee(inputs.length, 1, options.feeRate)
+    let outputSats = inputSum - fee
+    let txSizeBytes = estimateTxSize(inputs.length, 1)
 
     console.log(
       `  Batch #${batchNo}: locked ${inputs.length.toLocaleString()} input(s)  ` +
@@ -914,12 +1030,36 @@ async function consolidateWallet(
         `txSize≈${(txSizeBytes / 1024).toFixed(1)} KB`,
     )
 
+    if (outputSats <= 1 && options.subsidise) {
+      const subsidy = await lockSubsidyUtxos(
+        binding,
+        inputs.length,
+        inputSum,
+        options.feeRate,
+        options.includeUnconfirmed,
+        options.unconfirmedMinAgeSeconds,
+        lockedBy,
+      )
+      if (subsidy.length > 0) {
+        inputs.push(...subsidy)
+        const subsidySats = subsidy.reduce((acc, i) => acc + i.satoshis, 0)
+        inputSum = inputs.reduce((acc, i) => acc + i.satoshis, 0)
+        fee = estimateFee(inputs.length, 1, options.feeRate)
+        outputSats = inputSum - fee
+        txSizeBytes = estimateTxSize(inputs.length, 1)
+        console.log(
+          `  Batch #${batchNo}: subsidised with ${subsidy.length} larger UTXO(s) (+${subsidySats.toLocaleString()} sats) -> ` +
+            `fee=${fee.toLocaleString()} sats  output=${outputSats.toLocaleString()} sats  ` +
+            `txSize≈${(txSizeBytes / 1024).toFixed(1)} KB`,
+        )
+      }
+    }
+
     if (outputSats <= 1) {
       console.warn(
         `  ⚠️  Batch #${batchNo}: outputSats=${outputSats} — releasing locks and skipping. ` +
           `Inputs are economically unspendable (per-input fee ≈ ${Math.ceil(SIGNED_P2PKH_INPUT_BYTES * options.feeRate)} sats > average input value). ` +
-          `Try \`--min-input-sats ${Math.ceil(SIGNED_P2PKH_INPUT_BYTES * options.feeRate * 3)}\` and/or ` +
-          `\`--include-unconfirmed\` if larger UTXOs exist in the unconfirmed set.`,
+          `Try \`--subsidise\` (with larger reserve/pool UTXOs available) or \`--min-input-sats ${Math.ceil(SIGNED_P2PKH_INPUT_BYTES * options.feeRate * 3)}\`.`,
       )
       await releaseBatch(inputs, lockedBy, 60_000)
       break
@@ -1062,8 +1202,8 @@ async function consolidateWallet(
       `  ✅ Batch #${batchNo}: txid=${txid} broadcast and admitted as reserve UTXO.`,
     )
 
-    // If we got back fewer rows than we asked for, no more eligible UTXOs exist.
-    if (inputs.length < options.batchSize) {
+    // If we got back fewer dust rows than we asked for, no more eligible UTXOs exist.
+    if (dustInputsCount < options.batchSize) {
       console.log(`  Batch #${batchNo}: partial batch — wallet ${binding.label} done.`)
       break
     }
