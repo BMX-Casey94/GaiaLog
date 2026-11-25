@@ -1,5 +1,7 @@
 import type { Metadata } from "next"
+import { Suspense } from "react"
 import { ExplorerClient } from "@/components/explorer/explorer-client"
+import { LocationDirectory } from "@/components/sections/location-directory"
 import {
   buildOpenGraph,
   buildTwitter,
@@ -108,6 +110,13 @@ export default function ExplorerPage() {
         dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }}
       />
       <ExplorerClient />
+      {/* Server-rendered so crawlers get internal links to the location pages;
+          the explorer results above it are fetched after hydration. */}
+      <Suspense fallback={null}>
+        <div className="bg-gradient-to-b from-black to-slate-950">
+          <LocationDirectory />
+        </div>
+      </Suspense>
     </>
   )
 }

@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server"
+import { slugToLocation } from "@/lib/location-slug"
 
 /**
  * Canonical-host enforcement.
@@ -21,10 +22,11 @@ import { NextResponse, type NextRequest } from "next/server"
  */
 
 const CANONICAL_HOST = "gaialog.world"
-const CANONICAL_ORIGIN = `https://${CANONICAL_HOST}`
 
 /** Paths that must never be redirected. */
 const SKIP_PREFIXES = ["/_next/", "/api/", "/data-decode", "/llms-txt"]
+
+const ADMIN_COOKIE = "admin_session"
 
 function isExemptHost(hostname: string): boolean {
   // Local development.
@@ -37,6 +39,57 @@ function isExemptHost(hostname: string): boolean {
 }
 
 export function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl
+
+  // ── Malformed location slugs ────────────────────────────────────────────
+  //
+  // A 404 raised with `notFound()` inside the page cannot set the status:
+  // `app/loading.tsx` puts a Suspense boundary above every route, so the shell
+  // is flushed with 200 before the page body runs. The not-found *body* still
+  // renders, and it carries `noindex`, but returning 200 for a URL that does
+  // not exist is a soft 404.
+  //
+  // Slugs that cannot decode to any location are rejected here, before
+  // rendering, so they get a real 404. This needs no database access: it is a
+  // pure check on the slug's shape. A well-formed slug that simply matches no
+  // location still resolves through the page (see the note in
+  // `app/location/[slug]/page.tsx`).
+  if (pathname.startsWith("/location/")) {
+    const raw = pathname.slice("/location/".length)
+    // Only a single segment is a valid location URL.
+    if (raw.length > 0 && !raw.includes("/")) {
+      let decoded: string
+      try {
+        decoded = decodeURIComponent(raw)
+      } catch {
+        return new NextResponse("Not found", { status: 404 })
+      }
+      if (slugToLocation(decoded) === null) {
+        return new NextResponse("Not found", { status: 404 })
+      }
+    }
+  }
+
+  // ── Admin gate ──────────────────────────────────────────────────────────
+  //
+  // `app/admin/layout.tsx` also redirects, but because the root layout has
+  // already begun streaming by the time that check runs, an unauthenticated
+  // request for `/admin` returns HTTP 200 with a loader shell rather than a
+  // 307. Middleware runs before rendering, so this produces a real redirect and
+  // avoids serving a 200 for a page no crawler should see.
+  //
+  // This only checks for the presence of the session cookie. Signature and
+  // expiry validation remain in `isAdminAuthenticated()` inside the layout; a
+  // forged or expired cookie still gets rejected there.
+  if (pathname === "/admin" || pathname.startsWith("/admin/")) {
+    if (!request.cookies.has(ADMIN_COOKIE)) {
+      const loginUrl = request.nextUrl.clone()
+      loginUrl.pathname = "/login"
+      loginUrl.search = ""
+      return NextResponse.redirect(loginUrl, 307)
+    }
+  }
+
   const hostHeader = request.headers.get("host")
   if (!hostHeader) return NextResponse.next()
 
@@ -49,7 +102,6 @@ export function middleware(request: NextRequest) {
   const method = request.method.toUpperCase()
   if (method !== "GET" && method !== "HEAD") return NextResponse.next()
 
-  const { pathname } = request.nextUrl
   if (SKIP_PREFIXES.some((prefix) => pathname.startsWith(prefix))) {
     return NextResponse.next()
   }
