@@ -271,7 +271,7 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
                 const AlertIcon = alertStyle.Icon
                 return (
                   <button
-                    className={`group relative overflow-hidden backdrop-blur-xl rounded-2xl p-5 border ring-1 ring-inset ring-white/[0.05] transition-all duration-200 hover:-translate-y-0.5 text-left flex flex-col justify-between min-h-[144px] ${alertStyle.card}`}
+                    className={`group relative overflow-hidden rounded-2xl p-5 border ring-1 ring-inset ring-white/[0.05] transition-all duration-200 hover:-translate-y-0.5 text-left flex flex-col justify-between min-h-[144px] ${alertStyle.card}`}
                     onClick={scrollToMonitoring}
                   >
                     <span
@@ -317,7 +317,7 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
 
               <button
                 id="blockchain-status"
-                className="group relative overflow-hidden rounded-2xl p-5 border border-purple-500/25 bg-gradient-to-b from-purple-950/35 via-[#10081c]/80 to-[#090512]/90 ring-1 ring-inset ring-white/[0.05] backdrop-blur-xl transition-all duration-200 hover:-translate-y-0.5 hover:border-purple-400/55 hover:shadow-[0_12px_32px_-12px_rgba(168,85,247,0.4)] text-left flex flex-col justify-between min-h-[144px]"
+                className="group relative overflow-hidden rounded-2xl p-5 border border-purple-500/25 bg-gradient-to-b from-purple-950/35 via-[#10081c]/80 to-[#090512]/90 ring-1 ring-inset ring-white/[0.05] transition-all duration-200 hover:-translate-y-0.5 hover:border-purple-400/55 hover:shadow-[0_12px_32px_-12px_rgba(168,85,247,0.4)] text-left flex flex-col justify-between min-h-[144px]"
                 onClick={() => document.getElementById('blockchain')?.scrollIntoView({ behavior: 'smooth' })}
               >
                 <span
@@ -348,7 +348,7 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
 
               <button
                 id="data-sources-card"
-                className="group relative overflow-hidden rounded-2xl p-5 border border-indigo-500/25 bg-gradient-to-b from-indigo-950/35 via-[#0c0a1d]/80 to-[#080613]/90 ring-1 ring-inset ring-white/[0.05] backdrop-blur-xl transition-all duration-200 hover:-translate-y-0.5 hover:border-indigo-400/55 hover:shadow-[0_12px_32px_-12px_rgba(99,102,241,0.4)] text-left flex flex-col justify-between min-h-[144px]"
+                className="group relative overflow-hidden rounded-2xl p-5 border border-indigo-500/25 bg-gradient-to-b from-indigo-950/35 via-[#0c0a1d]/80 to-[#080613]/90 ring-1 ring-inset ring-white/[0.05] transition-all duration-200 hover:-translate-y-0.5 hover:border-indigo-400/55 hover:shadow-[0_12px_32px_-12px_rgba(99,102,241,0.4)] text-left flex flex-col justify-between min-h-[144px]"
                 onClick={() => document.getElementById('data-sources')?.scrollIntoView({ behavior: 'smooth' })}
               >
                 <span
