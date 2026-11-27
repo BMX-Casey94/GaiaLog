@@ -27,6 +27,7 @@ import {
   type MetricSeverity,
 } from "@/lib/metric-alerts"
 import { fetchJsonDeduplicated } from "@/lib/client-fetch-cache"
+import { holdHomepageStage } from "@/lib/homepage-load-queue"
 
 type AlertType = MetricAlertType
 type AlertData = MetricAlert
@@ -167,9 +168,19 @@ export function LiveDashboard() {
   }, [])
 
   useEffect(() => {
-    fetchData(false)
+    const release = holdHomepageStage(0)
+    let released = false
+    const releaseOnce = () => {
+      if (released) return
+      released = true
+      release()
+    }
+    void fetchData(false).finally(releaseOnce)
     const interval = setInterval(() => fetchData(true), 45000)
-    return () => clearInterval(interval)
+    return () => {
+      releaseOnce()
+      clearInterval(interval)
+    }
   }, [fetchData])
 
   const cards = [

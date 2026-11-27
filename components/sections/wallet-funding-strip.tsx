@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react"
 import { Wallet, ExternalLink, RefreshCw } from "lucide-react"
+import { holdHomepageStage, whenHomepageStageOpen } from "@/lib/homepage-load-queue"
 
 interface WalletFundingRow {
   index: number
@@ -101,9 +102,32 @@ export function WalletFundingStrip() {
   }, [])
 
   useEffect(() => {
-    void fetchFunding()
-    const id = setInterval(() => { void fetchFunding() }, 60_000)
-    return () => clearInterval(id)
+    const release = holdHomepageStage(1)
+    let cancelled = false
+    let intervalId: ReturnType<typeof setInterval> | undefined
+    let released = false
+    const releaseOnce = () => {
+      if (released) return
+      released = true
+      release()
+    }
+
+    void whenHomepageStageOpen(1).then(() => {
+      if (cancelled) {
+        releaseOnce()
+        return
+      }
+      void fetchFunding().finally(() => {
+        releaseOnce()
+        if (!cancelled) intervalId = setInterval(() => { void fetchFunding() }, 60_000)
+      })
+    })
+
+    return () => {
+      cancelled = true
+      releaseOnce()
+      if (intervalId) clearInterval(intervalId)
+    }
   }, [fetchFunding])
 
   // Three identical groups for a seamless -33.333% loop. Extra horizontal

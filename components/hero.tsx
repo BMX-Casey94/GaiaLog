@@ -12,6 +12,7 @@ import {
   type MetricSeverity,
 } from "@/lib/metric-alerts"
 import { fetchJsonDeduplicated } from "@/lib/client-fetch-cache"
+import { holdHomepageStage } from "@/lib/homepage-load-queue"
 
 // Heavy canvas visuals are decorative — defer them so they never block first paint.
 const SparklesCore = dynamic(
@@ -109,14 +110,18 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
   }, [])
 
   useEffect(() => {
+    const needsProviderCount = initialProviderCount == null
+
     const fetchStats = async (forceRefresh = false) => {
       try {
         const [explorerRes, readingsRes, providersRes] = await Promise.allSettled([
           fetchJsonDeduplicated<any>('/api/explorer/stats', { ttlMs: 15_000, forceRefresh }),
           // Genuine sensor metrics only — never on-chain event/priority alerts.
           fetchJsonDeduplicated<any>('/api/explorer/latest-readings', { ttlMs: 15_000, forceRefresh }),
-          // Catalogue only. Long TTL so the 45s stats poll does not re-run provider health probes.
-          fetchJsonDeduplicated<any>('/api/providers/status', { ttlMs: 5 * 60_000, forceRefresh: false }),
+          // Skip when the server already supplied initialProviderCount.
+          needsProviderCount
+            ? fetchJsonDeduplicated<any>('/api/providers/status', { ttlMs: 5 * 60_000, forceRefresh: false })
+            : Promise.resolve(null),
         ])
 
         if (explorerRes.status === 'fulfilled') {
@@ -162,10 +167,20 @@ export function Hero({ initialProviderCount }: { initialProviderCount?: number }
       }
     }
 
-    fetchStats(false)
+    const release = holdHomepageStage(0)
+    let released = false
+    const releaseOnce = () => {
+      if (released) return
+      released = true
+      release()
+    }
+    void fetchStats(false).finally(releaseOnce)
     const interval = setInterval(() => fetchStats(true), 45000)
-    return () => clearInterval(interval)
-  }, [])
+    return () => {
+      releaseOnce()
+      clearInterval(interval)
+    }
+  }, [initialProviderCount])
 
   const formatTotalReadings = (n: number | null): string => {
     if (n == null || n === 0) return '—'
