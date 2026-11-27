@@ -261,33 +261,49 @@ const WorkflowStepCard = ({
 }: WorkflowStepProps) => (
   <div
     className="
-      md:backdrop-blur-[14px] bg-gradient-to-br rounded-2xl shadow-xl w-full max-w-full md:max-w-xs
-      px-7 py-8 flex flex-col transition-all duration-300
-      from-slate-100/90 to-white/85 md:from-black/5 md:to-black/0 border border-black/10
-      dark:from-slate-900/85 dark:to-slate-950/80 md:dark:from-white/10 md:dark:to-white/5 dark:border-white/10 md:dark:backdrop-brightness-[0.91]
+      group relative overflow-hidden h-full w-full
+      rounded-2xl shadow-xl p-5 sm:p-6 flex flex-col transition-all duration-300
+      md:backdrop-blur-[14px] bg-gradient-to-b
+      from-slate-100/95 to-white/90 border border-black/10
+      dark:from-slate-900/90 dark:via-[#0b1020]/85 dark:to-[#070a14]/90
+      dark:border-white/10 hover:border-cyan-400/35
+      md:dark:backdrop-brightness-[0.95]
     "
   >
-    <div className="flex items-center gap-3 mb-4">
-      <div className="w-12 h-12 shrink-0 rounded-xl bg-gradient-to-br from-cyan-400/25 to-blue-500/20 border border-cyan-400/25 flex items-center justify-center shadow-[0_0_24px_-8px_rgba(34,211,238,0.55)]">
+    <span
+      aria-hidden="true"
+      className="pointer-events-none absolute inset-x-6 top-0 h-px bg-gradient-to-r from-transparent via-cyan-400/45 to-transparent"
+    />
+
+    <div className="flex items-center gap-3.5 mb-4">
+      <div
+        className="w-11 h-11 shrink-0 bg-gradient-to-br from-cyan-400/20 to-blue-500/15 border border-cyan-400/30 flex items-center justify-center shadow-[0_0_24px_-8px_rgba(34,211,238,0.5)]"
+        style={{ borderRadius: '12px 0 12px 0' }}
+      >
         {icon}
       </div>
       <div className="flex-1 min-w-0">
-        <div className="text-sm text-cyan-400 font-medium">Step {stepNumber}</div>
-        <h3 className="text-xl font-semibold text-foreground">{title}</h3>
+        <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-cyan-400">
+          <span>Step 0{stepNumber}</span>
+        </div>
+        <h3 className="text-lg font-semibold text-foreground leading-snug mt-0.5">{title}</h3>
       </div>
     </div>
 
-    <p className="text-[16px] text-foreground/70 mb-6 font-sans">{description}</p>
+    <p className="text-sm leading-relaxed text-foreground/75 mb-5 font-sans">{description}</p>
 
-    <div className="card-divider w-full mb-5 h-px bg-[linear-gradient(90deg,transparent,rgba(0,0,0,0.1)_50%,transparent)] dark:bg-[linear-gradient(90deg,transparent,rgba(255,255,255,0.09)_20%,rgba(255,255,255,0.22)_50%,rgba(255,255,255,0.09)_80%,transparent)]" />
+    <div className="mt-auto">
+      <div className="card-divider w-full mb-4 h-px bg-[linear-gradient(90deg,transparent,rgba(0,0,0,0.1)_50%,transparent)] dark:bg-[linear-gradient(90deg,transparent,rgba(255,255,255,0.08)_20%,rgba(255,255,255,0.2)_50%,rgba(255,255,255,0.08)_80%,transparent)]" />
 
-    <ul className="flex flex-col gap-2 text-[14px] text-foreground/90 font-sans">
-      {features.map((feature) => (
-        <li key={feature} className="flex items-center gap-2">
-          <CheckIcon className="text-cyan-400 w-4 h-4 shrink-0" /> {feature}
-        </li>
-      ))}
-    </ul>
+      <ul className="flex flex-col gap-2 text-[13.5px] text-foreground/90 font-sans">
+        {features.map((feature) => (
+          <li key={feature} className="flex items-center gap-2.5">
+            <CheckIcon className="text-cyan-400 w-3.5 h-3.5 shrink-0" />
+            <span>{feature}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
   </div>
 )
 
@@ -351,57 +367,76 @@ export function HowItWorks() {
       <ShaderCanvas />
 
       <div className="relative z-10 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="text-center mb-16">
-          <h2 className="text-[48px] md:text-[64px] font-extralight leading-tight tracking-[-0.03em] bg-clip-text text-transparent bg-gradient-to-r from-slate-900 via-cyan-500 to-blue-600 dark:from-white dark:via-cyan-300 dark:to-blue-400 font-display">
+        <div className="text-center mb-12 sm:mb-16">
+          <h2 className="text-4xl sm:text-[48px] md:text-[64px] font-extralight leading-tight tracking-[-0.03em] bg-clip-text text-transparent bg-gradient-to-r from-slate-900 via-cyan-500 to-blue-600 dark:from-white dark:via-cyan-300 dark:to-blue-400 font-display">
             How GaiaLog Works
           </h2>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8 items-start md:justify-center">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5 lg:gap-6 items-stretch">
           {workflowSteps.map((step) => (
             <WorkflowStepCard key={step.stepNumber} {...step} />
           ))}
         </div>
 
-        <div className="mt-20">
+        <div className="mt-10 sm:mt-16">
           <div
-            className="md:backdrop-blur-[14px] bg-gradient-to-br rounded-2xl shadow-xl max-w-4xl mx-auto px-8 py-10
-            from-slate-100/90 to-white/85 md:from-black/5 md:to-black/0 border border-black/10
-            dark:from-slate-900/85 dark:to-slate-950/80 md:dark:from-white/10 md:dark:to-white/5 dark:border-white/10 md:dark:backdrop-brightness-[0.91]"
+            className="relative overflow-hidden md:backdrop-blur-[14px] bg-gradient-to-b rounded-2xl shadow-xl max-w-4xl mx-auto p-6 sm:px-8 sm:py-9
+            from-slate-100/95 to-white/90 border border-black/10
+            dark:from-slate-900/90 dark:via-[#0b1020]/85 dark:to-[#070a14]/90 dark:border-white/10 md:dark:backdrop-brightness-[0.95]"
           >
-            <h3 className="text-2xl font-semibold text-foreground mb-6 text-center">
+            <span
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-cyan-400/45 to-transparent"
+            />
+            <h3 className="text-xl sm:text-2xl font-semibold text-foreground mb-6 sm:mb-8 text-center">
               Why Blockchain for Environmental Data?
             </h3>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-              <div className="text-center">
-                <div className="w-16 h-16 bg-gradient-to-br from-cyan-400/25 to-blue-500/20 border border-cyan-400/25 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                  <Shield className="h-8 w-8 text-cyan-300" strokeWidth={1.75} />
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-5 sm:gap-8">
+              <div className="flex items-start gap-4 text-left md:block md:text-center">
+                <div
+                  className="w-12 h-12 md:w-14 md:h-14 shrink-0 bg-gradient-to-br from-cyan-400/20 to-blue-500/15 border border-cyan-400/30 flex items-center justify-center md:mx-auto md:mb-3.5"
+                  style={{ borderRadius: '14px 0 14px 0' }}
+                >
+                  <Shield className="h-6 w-6 md:h-7 md:w-7 text-cyan-300" strokeWidth={1.75} />
                 </div>
-                <h4 className="font-medium text-cyan-400 mb-2">Immutability</h4>
-                <p className="text-sm text-foreground/70">
-                  Data cannot be altered or deleted once recorded
-                </p>
+                <div className="min-w-0">
+                  <h4 className="font-semibold text-cyan-400 mb-1">Immutability</h4>
+                  <p className="text-sm leading-relaxed text-foreground/75">
+                    Data cannot be altered or deleted once recorded
+                  </p>
+                </div>
               </div>
 
-              <div className="text-center">
-                <div className="w-16 h-16 bg-gradient-to-br from-cyan-400/25 to-blue-500/20 border border-cyan-400/25 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                  <Eye className="h-8 w-8 text-cyan-300" strokeWidth={1.75} />
+              <div className="flex items-start gap-4 text-left md:block md:text-center">
+                <div
+                  className="w-12 h-12 md:w-14 md:h-14 shrink-0 bg-gradient-to-br from-cyan-400/20 to-blue-500/15 border border-cyan-400/30 flex items-center justify-center md:mx-auto md:mb-3.5"
+                  style={{ borderRadius: '14px 0 14px 0' }}
+                >
+                  <Eye className="h-6 w-6 md:h-7 md:w-7 text-cyan-300" strokeWidth={1.75} />
                 </div>
-                <h4 className="font-medium text-cyan-400 mb-2">Transparency</h4>
-                <p className="text-sm text-foreground/70">
-                  All measurements are publicly verifiable
-                </p>
+                <div className="min-w-0">
+                  <h4 className="font-semibold text-cyan-400 mb-1">Transparency</h4>
+                  <p className="text-sm leading-relaxed text-foreground/75">
+                    All measurements are publicly verifiable
+                  </p>
+                </div>
               </div>
 
-              <div className="text-center">
-                <div className="w-16 h-16 bg-gradient-to-br from-cyan-400/25 to-blue-500/20 border border-cyan-400/25 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                  <BadgeCheck className="h-8 w-8 text-cyan-300" strokeWidth={1.75} />
+              <div className="flex items-start gap-4 text-left md:block md:text-center">
+                <div
+                  className="w-12 h-12 md:w-14 md:h-14 shrink-0 bg-gradient-to-br from-cyan-400/20 to-blue-500/15 border border-cyan-400/30 flex items-center justify-center md:mx-auto md:mb-3.5"
+                  style={{ borderRadius: '14px 0 14px 0' }}
+                >
+                  <BadgeCheck className="h-6 w-6 md:h-7 md:w-7 text-cyan-300" strokeWidth={1.75} />
                 </div>
-                <h4 className="font-medium text-cyan-400 mb-2">Trust</h4>
-                <p className="text-sm text-foreground/70">
-                  No single point of failure or data manipulation
-                </p>
+                <div className="min-w-0">
+                  <h4 className="font-semibold text-cyan-400 mb-1">Trust</h4>
+                  <p className="text-sm leading-relaxed text-foreground/75">
+                    No single point of failure or data manipulation
+                  </p>
+                </div>
               </div>
             </div>
           </div>

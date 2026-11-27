@@ -1,11 +1,13 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
+import Link from "next/link"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   ExternalLink,
+  ArrowRight,
   Clock,
   Check,
   X,
@@ -303,10 +305,19 @@ export function BlockchainExplorer() {
               })}
             </div>
 
-            <div className="text-center">
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+              <Button
+                asChild
+                className="w-full sm:w-auto bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white border border-purple-400/30 shadow-[0_8px_24px_-8px_rgba(168,85,247,0.55)]"
+              >
+                <Link href="/explorer">
+                  Explore All On-Chain Readings
+                  <ArrowRight className="ml-2 h-4 w-4" />
+                </Link>
+              </Button>
               <Button
                 variant="outline"
-                className="border-slate-600 text-slate-300 hover:bg-slate-800 bg-transparent"
+                className="w-full sm:w-auto border-slate-600 text-slate-300 hover:bg-slate-800 bg-transparent"
                 onClick={() => setShowWalletModal(true)}
               >
                 View Transaction History
