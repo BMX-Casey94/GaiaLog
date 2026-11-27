@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useCallback, useRef } from "react"
 import dynamic from "next/dynamic"
-import { NodeExplorerPromoBar } from "@/components/explorer/node-explorer-promo-bar"
 import { Button } from "@/components/ui/button"
 import { Footer } from "@/components/sections/footer"
 import { Globe } from "lucide-react"
@@ -321,7 +320,7 @@ export function ExplorerClient() {
   }, [handleSearch])
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-black via-slate-950 to-black pt-0 pb-44 sm:pb-28">
+    <div className="min-h-screen bg-gradient-to-b from-black via-slate-950 to-black pt-0 pb-24 sm:pb-0">
       <main>
       {/* ─── Hero Section ─── */}
       <section className="relative overflow-hidden pt-28 sm:pt-32 pb-10 sm:pb-16 px-4 sm:px-6 lg:px-8">
@@ -481,7 +480,6 @@ export function ExplorerClient() {
       </main>
 
       <Footer />
-      <NodeExplorerPromoBar />
     </div>
   )
 }
