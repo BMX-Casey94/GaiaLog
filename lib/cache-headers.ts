@@ -25,13 +25,13 @@ export function applyPublicReadCacheHeaders(
   opts: PublicCacheOptions = {},
 ): NextResponse {
   const sMaxAge = Math.max(1, Math.floor(opts.sMaxAgeSeconds ?? 15))
-  const swr = Math.max(0, Math.floor(opts.staleWhileRevalidateSeconds ?? 60))
+  const swr = Math.max(0, Math.floor(opts.staleWhileRevalidateSeconds ?? 300))
 
   response.headers.set(
     'Cache-Control',
     `public, max-age=0, s-maxage=${sMaxAge}, stale-while-revalidate=${swr}`,
   )
   response.headers.set('Vary', 'Accept-Encoding')
-  response.headers.set('CDN-Cache-Control', `public, s-maxage=${sMaxAge}`)
+  response.headers.set('CDN-Cache-Control', `public, s-maxage=${sMaxAge}, stale-while-revalidate=${swr}`)
   return response
 }

@@ -111,8 +111,13 @@ export const MeshCanvas = () => {
       mesh = new THREE.Mesh(geometry, material)
       scene.add(mesh)
 
+      let isVisible = true
+
       const animate = () => {
-        if (contextLost || !renderer || !material || !mesh || !scene) return
+        if (contextLost || !isVisible || document.hidden || !renderer || !material || !mesh || !scene) {
+          rafId = null
+          return
+        }
         rafId = requestAnimationFrame(animate)
         try {
           const elapsedTime = clock.getElapsedTime()
@@ -130,9 +135,82 @@ export const MeshCanvas = () => {
           }
         }
       }
-      animate()
 
+      const startLoop = () => {
+        if (rafId === null && !contextLost && isVisible && !document.hidden) {
+          animate()
+        }
+      }
+
+      const stopLoop = () => {
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId)
+          rafId = null
+        }
+      }
+
+      const handleVisibilityChange = () => {
+        if (document.hidden) {
+          stopLoop()
+        } else {
+          startLoop()
+        }
+      }
+
+      const intersectionObserver =
+        typeof IntersectionObserver !== "undefined"
+          ? new IntersectionObserver(
+              (entries) => {
+                isVisible = entries.some((entry) => entry.isIntersecting)
+                if (isVisible) {
+                  startLoop()
+                } else {
+                  stopLoop()
+                }
+              },
+              { rootMargin: "120px 0px" },
+            )
+          : null
+      intersectionObserver?.observe(mountElement)
+
+      document.addEventListener("visibilitychange", handleVisibilityChange)
       window.addEventListener("resize", handleResize)
+      startLoop()
+
+      return () => {
+        window.removeEventListener("resize", handleResize)
+        document.removeEventListener("visibilitychange", handleVisibilityChange)
+        intersectionObserver?.disconnect()
+        stopLoop()
+        if (canvas) {
+          canvas.removeEventListener("webglcontextlost", handleContextLost)
+          if (canvas.parentNode === mountElement) {
+            try {
+              mountElement.removeChild(canvas)
+            } catch {
+              // Element may have already been detached during fast unmount.
+            }
+          }
+        }
+        // Free GPU resources so repeated visits to the home page don't
+        // accumulate WebGL contexts (browsers cap them at ~16).
+        try {
+          geometry?.dispose()
+        } catch {}
+        try {
+          material?.dispose()
+        } catch {}
+        try {
+          renderer?.dispose()
+          renderer?.forceContextLoss()
+        } catch {}
+        scene = null
+        mesh = null
+        material = null
+        geometry = null
+        renderer = null
+        canvas = null
+      }
     } catch {
       // If WebGL is unavailable (driver issue, headless, blocklist) or the
       // shader fails to compile, bail silently. The hero still renders, the
@@ -157,8 +235,6 @@ export const MeshCanvas = () => {
           }
         }
       }
-      // Free GPU resources so repeated visits to the home page don't
-      // accumulate WebGL contexts (browsers cap them at ~16).
       try {
         geometry?.dispose()
       } catch {}

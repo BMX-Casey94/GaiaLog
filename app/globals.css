@@ -169,11 +169,16 @@
 @layer components {
   /* Shared glassmorphism card used across public pages */
   .glass-card {
-    background: var(--surface-glass);
+    background: rgba(15, 23, 42, 0.82);
     border: 1px solid var(--surface-glass-border);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
     border-radius: 1rem;
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .glass-card {
+      background: var(--surface-glass);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+    }
   }
   .glass-card-hover {
     transition: border-color 200ms ease, background-color 200ms ease, transform 200ms ease, box-shadow 200ms ease;
@@ -181,6 +186,108 @@
   .glass-card-hover:hover {
     border-color: rgba(139, 92, 246, 0.45);
     box-shadow: 0 0 32px -8px var(--glow-purple);
+  }
+
+  /* GlowCard (spotlight-card): static low-cost surface on touch/mobile devices to
+     prevent background-attachment: fixed repaints and GPU compositor tile thrashing.
+     Full pointer-tracking spotlight runs only on fine-pointer desktop devices. */
+  .glow-card {
+    background-color: rgba(15, 23, 42, 0.72);
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    position: relative;
+    touch-action: pan-y;
+  }
+
+  [data-glow] > [data-glow-inner] {
+    display: none;
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .glow-card {
+      backdrop-filter: blur(5px);
+      -webkit-backdrop-filter: blur(5px);
+    }
+
+    [data-glow] {
+      --radius: 16;
+      --border: 2;
+      --backdrop: hsl(0 0% 60% / 0.12);
+      --backup-border: var(--backdrop);
+      --size: 200;
+      --outer: 1;
+      --border-size: calc(var(--border, 2) * 1px);
+      --spotlight-size: calc(var(--size, 150) * 1px);
+      --hue: calc(var(--base, 220) + (var(--glow-xp, 0) * var(--spread, 200)));
+      background-image: radial-gradient(
+        var(--spotlight-size) var(--spotlight-size) at
+        calc(var(--glow-x, -9999) * 1px)
+        calc(var(--glow-y, -9999) * 1px),
+        hsl(var(--hue, 210) calc(var(--saturation, 100) * 1%) calc(var(--lightness, 70) * 1%) / var(--bg-spot-opacity, 0.1)), transparent
+      );
+      background-color: var(--backdrop, transparent);
+      background-size: calc(100% + (2 * var(--border-size))) calc(100% + (2 * var(--border-size)));
+      background-position: 50% 50%;
+      background-attachment: fixed;
+      border: var(--border-size) solid var(--backup-border);
+    }
+
+    [data-glow]::before,
+    [data-glow]::after,
+    [data-glow-inner]::before,
+    [data-glow-inner]::after {
+      pointer-events: none;
+      content: "";
+      position: absolute;
+      inset: calc(var(--border-size) * -1);
+      border: var(--border-size) solid transparent;
+      border-radius: calc(var(--radius) * 1px);
+      background-attachment: fixed;
+      background-size: calc(100% + (2 * var(--border-size))) calc(100% + (2 * var(--border-size)));
+      background-repeat: no-repeat;
+      background-position: 50% 50%;
+      mask: linear-gradient(transparent, transparent), linear-gradient(white, white);
+      mask-clip: padding-box, border-box;
+      mask-composite: intersect;
+    }
+
+    [data-glow]::before,
+    [data-glow-inner]::before {
+      background-image: radial-gradient(
+        calc(var(--spotlight-size) * 0.75) calc(var(--spotlight-size) * 0.75) at
+        calc(var(--glow-x, -9999) * 1px)
+        calc(var(--glow-y, -9999) * 1px),
+        hsl(var(--hue, 210) calc(var(--saturation, 100) * 1%) calc(var(--lightness, 50) * 1%) / var(--border-spot-opacity, 1)), transparent 100%
+      );
+      filter: brightness(2);
+    }
+
+    [data-glow]::after,
+    [data-glow-inner]::after {
+      background-image: radial-gradient(
+        calc(var(--spotlight-size) * 0.5) calc(var(--spotlight-size) * 0.5) at
+        calc(var(--glow-x, -9999) * 1px)
+        calc(var(--glow-y, -9999) * 1px),
+        hsl(0 100% 100% / var(--border-light-opacity, 1)), transparent 100%
+      );
+    }
+
+    [data-glow] > [data-glow-inner] {
+      display: block;
+      position: absolute;
+      inset: 0;
+      opacity: var(--outer, 1);
+      border-radius: calc(var(--radius) * 1px);
+      border-width: 0;
+      filter: blur(calc(var(--border-size) * 4));
+      background: none;
+      pointer-events: none;
+      border: none;
+    }
+
+    [data-glow] > [data-glow-inner]::before {
+      inset: -4px;
+      border-width: 4px;
+    }
   }
 
   /* Gradient text used for display headings on marketing pages */

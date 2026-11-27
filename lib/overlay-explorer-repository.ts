@@ -430,7 +430,7 @@ export async function getPriorityAlerts(limit: number = 8): Promise<PriorityAler
   const result = await query<PriorityAlertRow>(
     `SELECT txid, data_family, location, lat, lon, reading_ts, metrics_preview, block_height, confirmed
      FROM overlay_explorer_readings
-     WHERE reading_ts > NOW() - INTERVAL '7 days'
+     WHERE reading_ts > NOW() - INTERVAL '24 hours'
        AND (
          (data_family = 'seismic_activity' AND COALESCE((metrics_preview->>'magnitude')::float, 0) >= 5)
          OR (data_family = 'air_quality' AND (
@@ -483,14 +483,18 @@ export async function getLatestReadingsWithMetrics(
     block_height: number
     confirmed: boolean
   }>(
-    `SELECT DISTINCT ON (data_family)
-       txid, data_family, location, reading_ts, provider_id, metrics_preview, block_height,
-       (confirmed OR COALESCE(block_height, 0) > 0) AS confirmed
-     FROM overlay_explorer_readings
-     WHERE data_family = ANY($1::text[])
-       AND reading_ts > NOW() - INTERVAL '7 days'
-       AND (confirmed = true OR COALESCE(block_height, 0) > 0 OR reading_ts > NOW() - INTERVAL '2 hours')
-     ORDER BY data_family, (confirmed OR COALESCE(block_height, 0) > 0) DESC, reading_ts DESC`,
+    `SELECT latest.*
+     FROM unnest($1::text[]) AS fam(data_family)
+     CROSS JOIN LATERAL (
+       SELECT
+         txid, data_family, location, reading_ts, provider_id, metrics_preview, block_height,
+         (confirmed OR COALESCE(block_height, 0) > 0) AS confirmed
+       FROM overlay_explorer_readings
+       WHERE data_family = fam.data_family
+         AND reading_ts > NOW() - INTERVAL '7 days'
+       ORDER BY reading_ts DESC
+       LIMIT 1
+     ) AS latest`,
     [families],
   )
   return result.rows || []
@@ -511,14 +515,18 @@ export async function getRecentReadingsByFamily(
     block_height: number
     confirmed: boolean
   }>(
-    `SELECT DISTINCT ON (data_family)
-       txid, data_family, location, reading_ts, provider_id, block_height,
-       (confirmed OR COALESCE(block_height, 0) > 0) AS confirmed
-     FROM overlay_explorer_readings
-     WHERE data_family = ANY($1::text[])
-       AND reading_ts > NOW() - INTERVAL '7 days'
-       AND (confirmed = true OR COALESCE(block_height, 0) > 0 OR reading_ts > NOW() - INTERVAL '2 hours')
-     ORDER BY data_family, (confirmed OR COALESCE(block_height, 0) > 0) DESC, reading_ts DESC`,
+    `SELECT latest.*
+     FROM unnest($1::text[]) AS fam(data_family)
+     CROSS JOIN LATERAL (
+       SELECT
+         txid, data_family, location, reading_ts, provider_id, block_height,
+         (confirmed OR COALESCE(block_height, 0) > 0) AS confirmed
+       FROM overlay_explorer_readings
+       WHERE data_family = fam.data_family
+         AND reading_ts > NOW() - INTERVAL '7 days'
+       ORDER BY reading_ts DESC
+       LIMIT 1
+     ) AS latest`,
     [families],
   )
   return result.rows || []

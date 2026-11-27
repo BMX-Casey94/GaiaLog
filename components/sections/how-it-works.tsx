@@ -128,11 +128,30 @@ const ShaderCanvas = () => {
     applyBackground()
 
     let animationFrameId = 0
+    let isVisible = true
+
     const render = (time: number) => {
+      if (!isVisible || document.hidden) {
+        animationFrameId = 0
+        return
+      }
       gl.uniform1f(iTimeLoc, time * 0.001)
       gl.uniform2f(iResLoc, canvas.width, canvas.height)
       gl.drawArrays(gl.TRIANGLES, 0, 6)
       animationFrameId = requestAnimationFrame(render)
+    }
+
+    const startLoop = () => {
+      if (animationFrameId === 0 && isVisible && !document.hidden) {
+        animationFrameId = requestAnimationFrame(render)
+      }
+    }
+
+    const stopLoop = () => {
+      if (animationFrameId !== 0) {
+        cancelAnimationFrame(animationFrameId)
+        animationFrameId = 0
+      }
     }
 
     const handleResize = () => {
@@ -147,19 +166,46 @@ const ShaderCanvas = () => {
       }
     }
 
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        stopLoop()
+      } else {
+        startLoop()
+      }
+    }
+
     handleResize()
     // First layout can report 0×0; observe the canvas box until it has size.
     const resizeObserver = typeof ResizeObserver !== 'undefined'
       ? new ResizeObserver(() => handleResize())
       : null
     resizeObserver?.observe(canvas)
+
+    const intersectionObserver = typeof IntersectionObserver !== 'undefined'
+      ? new IntersectionObserver(
+          (entries) => {
+            isVisible = entries.some((entry) => entry.isIntersecting)
+            if (isVisible) {
+              startLoop()
+            } else {
+              stopLoop()
+            }
+          },
+          { rootMargin: '120px 0px' },
+        )
+      : null
+    intersectionObserver?.observe(canvas)
+
     window.addEventListener('resize', handleResize)
-    animationFrameId = requestAnimationFrame(render)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    startLoop()
 
     return () => {
       window.removeEventListener('resize', handleResize)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
       resizeObserver?.disconnect()
-      cancelAnimationFrame(animationFrameId)
+      intersectionObserver?.disconnect()
+      stopLoop()
       gl.deleteProgram(program)
       gl.deleteShader(vertexShader)
       gl.deleteShader(fragmentShader)
@@ -215,10 +261,10 @@ const WorkflowStepCard = ({
 }: WorkflowStepProps) => (
   <div
     className="
-      backdrop-blur-[14px] bg-gradient-to-br rounded-2xl shadow-xl w-full max-w-full md:max-w-xs
+      md:backdrop-blur-[14px] bg-gradient-to-br rounded-2xl shadow-xl w-full max-w-full md:max-w-xs
       px-7 py-8 flex flex-col transition-all duration-300
-      from-black/5 to-black/0 border border-black/10
-      dark:from-white/10 dark:to-white/5 dark:border-white/10 dark:backdrop-brightness-[0.91]
+      from-slate-100/90 to-white/85 md:from-black/5 md:to-black/0 border border-black/10
+      dark:from-slate-900/85 dark:to-slate-950/80 md:dark:from-white/10 md:dark:to-white/5 dark:border-white/10 md:dark:backdrop-brightness-[0.91]
     "
   >
     <div className="flex items-center gap-3 mb-4">
@@ -319,9 +365,9 @@ export function HowItWorks() {
 
         <div className="mt-20">
           <div
-            className="backdrop-blur-[14px] bg-gradient-to-br rounded-2xl shadow-xl max-w-4xl mx-auto px-8 py-10
-            from-black/5 to-black/0 border border-black/10
-            dark:from-white/10 dark:to-white/5 dark:border-white/10 dark:backdrop-brightness-[0.91]"
+            className="md:backdrop-blur-[14px] bg-gradient-to-br rounded-2xl shadow-xl max-w-4xl mx-auto px-8 py-10
+            from-slate-100/90 to-white/85 md:from-black/5 md:to-black/0 border border-black/10
+            dark:from-slate-900/85 dark:to-slate-950/80 md:dark:from-white/10 md:dark:to-white/5 dark:border-white/10 md:dark:backdrop-brightness-[0.91]"
           >
             <h3 className="text-2xl font-semibold text-foreground mb-6 text-center">
               Why Blockchain for Environmental Data?

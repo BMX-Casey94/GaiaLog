@@ -217,7 +217,7 @@ export function Hero() {
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <button
-                className="bg-transparent backdrop-blur-sm rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/20 transition-all text-left"
+                className="bg-slate-900/60 rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/40 transition-all text-left"
                 onClick={scrollToMonitoring}
               >
                 <div className="flex items-center space-x-2 mb-2">
@@ -239,7 +239,7 @@ export function Hero() {
 
               <button
                 id="blockchain-status"
-                className="bg-transparent backdrop-blur-sm rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/20 transition-all text-left"
+                className="bg-slate-900/60 rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/40 transition-all text-left"
                 onClick={() => document.getElementById('blockchain')?.scrollIntoView({ behavior: 'smooth' })}
               >
                 <div className="flex items-center space-x-2 mb-2">
@@ -254,7 +254,7 @@ export function Hero() {
 
               <button
                 id="data-sources-card"
-                className="bg-transparent backdrop-blur-sm rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/20 transition-all text-left"
+                className="bg-slate-900/60 rounded-xl p-4 border border-slate-600/30 hover:border-purple-500/40 hover:bg-slate-800/40 transition-all text-left"
                 onClick={() => document.getElementById('data-sources')?.scrollIntoView({ behavior: 'smooth' })}
               >
                 <div className="flex items-center space-x-2 mb-2">
