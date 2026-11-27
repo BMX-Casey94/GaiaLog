@@ -194,13 +194,65 @@ export function applySensitiveSpeciesPolicy(
 }
 
 // ─── Delay Gate ──────────────────────────────────────────────────────────────
+//
+// A delayed reading is held here until its release time, then handed back so it
+// can proceed to the queue. The buffer previously stored `payload: {}` and
+// `releaseExpiredDelays()` returned only the keys — nothing could be recovered
+// from a release, so every delayed reading was dropped silently. The payload is
+// now retained, bounded so a long provider outage cannot grow the buffer
+// without limit.
+//
+// What is stored is the payload *after* redaction and coordinate rounding, not
+// the raw reading: held data sits in process memory for up to the delay window,
+// and there is no reason for the sensitive fields to be in it.
 
-const _delayQueue = new Map<string, { payload: Record<string, unknown>; releaseAt: number }>()
+/** Maximum retained delayed readings. Oldest is evicted first at the cap. */
+export const MAX_DELAYED_ITEMS = 5_000
 
+export interface DelayedItem {
+  key: string
+  payload: any
+}
+
+interface DelayEntry {
+  payload: any
+  releaseAt: number
+  queuedAt: number
+}
+
+// Insertion-ordered, so the first key in iteration is the oldest entry.
+const _delayQueue = new Map<string, DelayEntry>()
+
+let _delayEvictionWarnedAt = 0
+
+function evictOldestIfFull(): void {
+  while (_delayQueue.size >= MAX_DELAYED_ITEMS) {
+    const oldest = _delayQueue.keys().next()
+    if (oldest.done) return
+    _delayQueue.delete(oldest.value)
+    const now = Date.now()
+    if (now - _delayEvictionWarnedAt > 60_000) {
+      _delayEvictionWarnedAt = now
+      console.warn(
+        `⚠️  Sensitivity delay buffer at capacity (${MAX_DELAYED_ITEMS}); evicted oldest held reading. ` +
+          `Held readings are being produced faster than their delay windows expire.`,
+      )
+    }
+  }
+}
+
+/**
+ * Returns true when this key must be held back.
+ *
+ * `payload` is what will be handed back on release. Omitting it retains the
+ * previous behaviour of holding an empty placeholder, which is only useful to
+ * callers that want the gate without the data.
+ */
 export function shouldDelay(
   key: string,
   delayHours: number,
   now: number = Date.now(),
+  payload?: any,
 ): boolean {
   if (delayHours <= 0) return false
 
@@ -213,7 +265,12 @@ export function shouldDelay(
     return true
   }
 
-  _delayQueue.set(key, { payload: {}, releaseAt: now + delayHours * 60 * 60 * 1000 })
+  evictOldestIfFull()
+  _delayQueue.set(key, {
+    payload: payload ?? {},
+    releaseAt: now + delayHours * 60 * 60 * 1000,
+    queuedAt: now,
+  })
   return true
 }
 
@@ -221,15 +278,68 @@ export function getDelayedItemCount(): number {
   return _delayQueue.size
 }
 
-export function releaseExpiredDelays(now: number = Date.now()): string[] {
-  const released: string[] = []
+/** Release time (epoch ms) for a held key, or null when it is not held. */
+export function getDelayedReleaseAt(key: string): number | null {
+  return _delayQueue.get(key)?.releaseAt ?? null
+}
+
+/**
+ * Remove and return every entry whose release time has passed.
+ *
+ * `keyPrefix` scopes the drain. Either a string prefix matched against the
+ * buffer key, or a predicate for callers that need a richer rule. Keys are
+ * built as `${workerId}:${family}:${providerId}:${timestamp}`, so a worker
+ * passes its own `workerId` prefix and receives only the readings it collected —
+ * two workers can never take the same released entry.
+ *
+ * Entries are deleted as they are returned, so each held reading is handed out
+ * exactly once.
+ */
+export function releaseExpiredDelays(
+  now: number = Date.now(),
+  keyPrefix?: string | ((key: string) => boolean),
+): DelayedItem[] {
+  const matches = typeof keyPrefix === 'function'
+    ? keyPrefix
+    : keyPrefix
+      ? (key: string) => key.startsWith(keyPrefix)
+      : null
+  const released: DelayedItem[] = []
   for (const [key, item] of _delayQueue) {
-    if (now >= item.releaseAt) {
-      _delayQueue.delete(key)
-      released.push(key)
-    }
+    if (now < item.releaseAt) continue
+    if (matches && !matches(key)) continue
+    _delayQueue.delete(key)
+    released.push({ key, payload: item.payload })
   }
   return released
+}
+
+/**
+ * Key-only form of {@link releaseExpiredDelays}.
+ *
+ * Retained for callers that only need to know what expired. Using it discards
+ * the held payload, so the reading it described is lost — prefer the item form.
+ */
+export function releaseExpiredDelayKeys(now: number = Date.now()): string[] {
+  return releaseExpiredDelays(now).map((item) => item.key)
+}
+
+/**
+ * Put a released entry back into the buffer with a new release time.
+ *
+ * Lets a caller that could not act on a released reading — typically because the
+ * queue refused it — return it to the buffer instead of dropping it. `releaseAt`
+ * is absolute epoch milliseconds, so the caller controls the retry cadence
+ * without needing to express it in the policy's unit of hours.
+ *
+ * An existing entry under the same key is replaced, so a re-hold is idempotent.
+ */
+export function reholdDelayedItem(key: string, releaseAt: number, payload: unknown): void {
+  evictOldestIfFull()
+  // Delete first so the re-inserted entry is treated as the newest for
+  // eviction-order purposes rather than keeping its original insertion slot.
+  _delayQueue.delete(key)
+  _delayQueue.set(key, { payload, releaseAt, queuedAt: Date.now() })
 }
 
 // ─── Full Pipeline Application ───────────────────────────────────────────────
@@ -240,6 +350,20 @@ export interface SensitivityResult {
   policy: SensitivityPolicy
   payload: Record<string, unknown>
   coordinates: { lat: number | null; lon: number | null }
+  /**
+   * Present only when `delayed` is true. Carries what the caller must hold and
+   * later re-feed into the pipeline once the delay expires.
+   */
+  delay?: {
+    /** Buffer key; also the prefix-scoping key used when draining. */
+    key: string
+    /** Release time, epoch milliseconds. */
+    releaseAt: number
+    /** Redacted payload to enqueue on release. */
+    payload: Record<string, unknown>
+    /** Coordinates after the family/provider precision policy. */
+    coordinates: { lat: number | null; lon: number | null }
+  }
 }
 
 export function applySensitivityControls(
@@ -250,6 +374,15 @@ export function applySensitivityControls(
     dedupeKey?: string
     lat?: number | null
     lon?: number | null
+    /**
+     * Builds the value kept in the hold buffer when this reading is delayed.
+     *
+     * Called with the already-redacted payload and rounded coordinates, so the
+     * caller can attach the surrounding record (type, source, hash, …) needed to
+     * re-enqueue the reading on release without re-deriving the policy. Defaults
+     * to `{ payload, coordinates }`.
+     */
+    holdValue?: (redacted: Record<string, unknown>, coordinates: { lat: number | null; lon: number | null }) => unknown
   },
 ): SensitivityResult {
   let policy = resolvePolicy(opts.family, opts.providerId)
@@ -270,19 +403,35 @@ export function applySensitivityControls(
   }
 
   const dedupeKey = opts.dedupeKey || `${opts.family}:${opts.providerId}:${Date.now()}`
-  const delayed = shouldDelay(dedupeKey, policy.delayHours)
+
+  // Redact and round before anything is held: the delay buffer keeps memory
+  // resident for the whole delay window, so sensitive fields must not be in it.
+  const redacted = redactFields(payload, policy.redactFields)
+  const coordinates = applyCoordinatePolicy(opts.lat, opts.lon, policy.coordinatePrecision)
+
+  const now = Date.now()
+  // Only build the held value when there is a delay to hold it for: the
+  // callback allocates a full queue record, and the overwhelming majority of
+  // readings carry delayHours = 0.
+  const held = policy.delayHours > 0
+    ? (opts.holdValue ? opts.holdValue(redacted, coordinates) : { payload: redacted, coordinates })
+    : undefined
+  const delayed = shouldDelay(dedupeKey, policy.delayHours, now, held)
   if (delayed) {
     return {
       allowed: false,
       delayed: true,
       policy,
-      payload,
-      coordinates: { lat: null, lon: null },
+      payload: redacted,
+      coordinates,
+      delay: {
+        key: dedupeKey,
+        releaseAt: now + policy.delayHours * 60 * 60 * 1000,
+        payload: redacted,
+        coordinates,
+      },
     }
   }
-
-  const redacted = redactFields(payload, policy.redactFields)
-  const coordinates = applyCoordinatePolicy(opts.lat, opts.lon, policy.coordinatePrecision)
 
   return {
     allowed: true,

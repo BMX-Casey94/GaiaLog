@@ -40,6 +40,7 @@ import {
 import { getBSVExplorerUrl, getBSVAddressUrl, isValidTxId } from "@/lib/utils"
 import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
 import { getKeyMetrics } from "@/lib/family-metrics"
+import { explorerCardBadge, type ArcPhase } from "@/lib/arc-tx-status"
 import { holdHomepageStage, whenHomepageStageOpen } from "@/lib/homepage-load-queue"
 
 const FAMILY_ICONS: Record<string, LucideIcon> = {
@@ -68,7 +69,19 @@ interface TransactionDisplay {
   location: string | null
   timestamp: string
   status: string
+  arcPhase: ArcPhase | null
   metrics: Record<string, unknown>
+}
+
+function homepageBadgeClass(label: string): string {
+  if (label === 'Rejected' || label === 'Reorg') {
+    return 'bg-red-900/50 text-red-400 rounded-sm'
+  }
+  if (label === 'Confirmed') {
+    return 'bg-green-900/50 text-green-400 rounded-sm'
+  }
+  // Pending and In mempool
+  return 'bg-yellow-900/50 text-yellow-400 rounded-sm'
 }
 
 export function BlockchainExplorer() {
@@ -123,6 +136,7 @@ export function BlockchainExplorer() {
               location: r.location ?? null,
               timestamp: formatTimestamp(r.timestamp),
               status: r.status || 'confirmed',
+              arcPhase: (r.arcPhase as ArcPhase | null | undefined) ?? null,
               metrics: r.data?.metrics ?? {},
             })
           })
@@ -175,7 +189,7 @@ export function BlockchainExplorer() {
 
   return (
     <section id="blockchain" className="py-20 px-4 sm:px-6 lg:px-8 relative scroll-mt-24">
-      <div className="absolute inset-0 bg-gradient-to-b from-black/80 via-slate-900/20 to-slate-950/50 pointer-events-none"></div>
+      <div className="absolute inset-0 bg-gradient-to-b from-transparent via-purple-950/15 to-transparent pointer-events-none"></div>
       <div className="relative z-10">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-16">
@@ -211,6 +225,11 @@ export function BlockchainExplorer() {
                 const tx = txByFamily.get(descriptor.id)!
                 const metricsSummary = buildMetricsSummary(descriptor.id, tx.metrics)
                 const description = metricsSummary ?? `${descriptor.label} data recorded`
+                const badge = explorerCardBadge({
+                  phase: tx.arcPhase,
+                  confirmed: tx.status === 'confirmed',
+                  blockHeight: 0,
+                })
 
                 const FamilyIcon = FAMILY_ICONS[descriptor.id] ?? Database
 
@@ -226,11 +245,10 @@ export function BlockchainExplorer() {
                             <span className="font-semibold text-white leading-tight">{descriptor.label}</span>
                             <Badge
                               variant="secondary"
-                              className={tx.status === 'pending'
-                                ? "bg-yellow-900/50 text-yellow-400 rounded-sm"
-                                : "bg-green-900/50 text-green-400 rounded-sm"}
+                              className={homepageBadgeClass(badge.label)}
+                              title={badge.title}
                             >
-                              {tx.status === 'pending' ? 'Unconfirmed' : 'Confirmed'}
+                              {badge.label}
                             </Badge>
                           </div>
                         </div>
@@ -251,8 +269,8 @@ export function BlockchainExplorer() {
                           {description}
                         </div>
                         {tx.location && (
-                          <div className="flex items-start gap-1 text-xs text-slate-500 mb-1 min-w-0">
-                            <MapPin className="h-3 w-3 shrink-0 mt-0.5" />
+                          <div className="flex items-start gap-1.5 text-xs text-slate-400 min-w-0">
+                            <MapPin className="h-3.5 w-3.5 shrink-0 mt-0.5 text-purple-300/70" />
                             <span className="min-w-0 line-clamp-2 break-words">{tx.location}</span>
                           </div>
                         )}

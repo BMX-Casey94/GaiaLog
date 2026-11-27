@@ -9,10 +9,49 @@
  * belong in overlay-explorer-service.ts.
  */
 
-import { query } from './db'
+import { query, queryWithDeadline } from './db'
 import type { OverlayExplorerReading } from './explorer-decoder'
 import { getDataFamilyFilterValues, normaliseDataFamily } from './stream-registry'
 import type { SearchParams, StoredReading, LocationSuggestion } from './supabase-explorer'
+import type { ArcPhase } from './arc-tx-status'
+
+const ARC_PHASES = new Set<ArcPhase>([
+  'rejected',
+  'orphan',
+  'pending',
+  'seen',
+  'mined',
+  'reorg',
+])
+
+function parseArcPhase(value: unknown): ArcPhase | null {
+  if (typeof value !== 'string') return null
+  return ARC_PHASES.has(value as ArcPhase) ? (value as ArcPhase) : null
+}
+
+/**
+ * Look up ARC broadcast phases for a page of txids after the explorer scan.
+ * If the table is not migrated yet, warn and treat every phase as null.
+ */
+async function lookupArcPhasesByTxid(txids: string[]): Promise<Map<string, ArcPhase | null>> {
+  const phases = new Map<string, ArcPhase | null>()
+  if (txids.length === 0) return phases
+  try {
+    const result = await query<{ txid: string; phase: string }>(
+      `SELECT txid, phase FROM arc_broadcast_status WHERE txid = ANY($1::text[])`,
+      [txids],
+    )
+    for (const row of result.rows || []) {
+      phases.set(row.txid, parseArcPhase(row.phase))
+    }
+  } catch (err) {
+    console.warn(
+      'arc_broadcast_status phase lookup failed; explorer will render without ARC phases:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+  return phases
+}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -118,31 +157,49 @@ export async function searchReadings(params: SearchParams): Promise<{
   const { whereSql, sqlParams } = buildWhereClause(params)
   const whereParams = [...sqlParams]
 
-  sqlParams.push(pageSize, offset)
-  const limitIdx = sqlParams.length - 1
-  const offsetIdx = sqlParams.length
+  // A family filter (with or without a date range) must not use
+  // `data_family = ANY(...)`. That plan gathers every row in the family and
+  // sorts it before LIMIT, which blows the deadline on large families such as
+  // planning_development. One equality branch per family value lets Postgres
+  // walk oer_family_reading_ts_asc_idx backwards and stop after one page.
+  const indexedFamilySql = !params.q?.trim() && params.dataType
+    ? buildIndexedFamilyPageSql(params, pageSize + 1, offset)
+    : null
 
-  // Rows and total run in parallel.  The total avoids COUNT(*) OVER(), which
-  // forced Postgres to count the entire filtered set on every page fetch.
-  const [result, total] = await Promise.all([
-    query<any>(
-      `SELECT
-         txid, data_family, location, lat, lon,
-         reading_ts, provider_id, block_height, block_time,
-         confirmed, metrics_preview
-       FROM overlay_explorer_readings
-       ${whereSql}
-       ORDER BY reading_ts DESC
-       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
-      sqlParams,
+  const rowSql = indexedFamilySql ?? buildOffsetPageSql(whereSql, sqlParams, pageSize + 1, offset)
+
+  // Rows and total run in parallel.  Fetching pageSize + 1 lets us determine
+  // hasMore accurately even if a slow filtered COUNT(*) hits its deadline.
+  const [result, rawTotal] = await Promise.all([
+    queryWithDeadline<any>(
+      rowSql.sql,
+      rowSql.params,
+      { timeoutMs: 10_000, label: 'explorer_search_rows' },
     ),
     countSearchTotal(params, whereSql, whereParams),
   ])
 
-  const rows = result.rows || []
+  const allRows = result.rows || []
+  const hasMoreBySlice = allRows.length > pageSize
+  const rows = hasMoreBySlice ? allRows.slice(0, pageSize) : allRows
   const items: StoredReading[] = rows.map(overlayRowToStoredReading)
+  const phases = await lookupArcPhasesByTxid(items.map((item) => item.txid))
+  for (const item of items) {
+    item.arcPhase = phases.get(item.txid) ?? null
+  }
 
-  return { items, total, page, pageSize, hasMore: offset + items.length < total }
+  const total =
+    rawTotal !== null
+      ? rawTotal
+      : offset + items.length + (hasMoreBySlice ? 1 : 0)
+
+  return {
+    items,
+    total,
+    page,
+    pageSize,
+    hasMore: rawTotal !== null ? offset + items.length < rawTotal : hasMoreBySlice,
+  }
 }
 
 // ─── Search total helpers ────────────────────────────────────────────────────
@@ -162,7 +219,7 @@ async function countSearchTotal(
   params: SearchParams,
   whereSql: string,
   whereParams: unknown[],
-): Promise<number> {
+): Promise<number | null> {
   const hasQuery = !!params.q?.trim()
   const hasDates = !!params.from || !!params.to
 
@@ -188,29 +245,36 @@ async function countSearchTotal(
     }
   }
 
-  // 3. Filtered search — cached COUNT(*).
+  // 3. Filtered search — cached COUNT(*) with a tight deadline so slow scans
+  // never time out the page load.
   const cacheKey = `${whereSql}|${JSON.stringify(whereParams)}`
   const cached = searchCountCache.get(cacheKey)
   if (cached && Date.now() - cached.ts < SEARCH_COUNT_CACHE_TTL_MS) {
     return cached.total
   }
 
-  const countResult = await query<{ total: string }>(
-    `SELECT COUNT(*)::bigint AS total
-     FROM overlay_explorer_readings
-     ${whereSql}`,
-    whereParams,
-  )
-  const total = Number(countResult.rows?.[0]?.total || 0)
+  try {
+    const countResult = await queryWithDeadline<{ total: string }>(
+      `SELECT COUNT(*)::bigint AS total
+       FROM overlay_explorer_readings
+       ${whereSql}`,
+      whereParams,
+      { timeoutMs: 2500, label: 'explorer_search_count' },
+    )
+    const total = Number(countResult.rows?.[0]?.total || 0)
 
-  if (searchCountCache.size >= SEARCH_COUNT_CACHE_MAX_ENTRIES) {
-    // Drop the oldest entry to bound memory (Map preserves insertion order).
-    const oldestKey = searchCountCache.keys().next().value
-    if (oldestKey !== undefined) searchCountCache.delete(oldestKey)
+    if (searchCountCache.size >= SEARCH_COUNT_CACHE_MAX_ENTRIES) {
+      // Drop the oldest entry to bound memory (Map preserves insertion order).
+      const oldestKey = searchCountCache.keys().next().value
+      if (oldestKey !== undefined) searchCountCache.delete(oldestKey)
+    }
+    searchCountCache.set(cacheKey, { total, ts: Date.now() })
+
+    return total
+  } catch (err) {
+    console.warn('Explorer filtered COUNT(*) timed out; falling back to slice pagination:', err instanceof Error ? err.message : err)
+    return null
   }
-  searchCountCache.set(cacheKey, { total, ts: Date.now() })
-
-  return total
 }
 
 export async function getLocationSuggestions(
@@ -471,6 +535,7 @@ export async function getLatestReadingsWithMetrics(
   metrics_preview: Record<string, unknown>
   block_height: number
   confirmed: boolean
+  arcPhase?: ArcPhase | null
 }>> {
   if (families.length === 0) return []
   const result = await query<{
@@ -497,7 +562,12 @@ export async function getLatestReadingsWithMetrics(
      ) AS latest`,
     [families],
   )
-  return result.rows || []
+  const rows = result.rows || []
+  const phases = await lookupArcPhasesByTxid(rows.map((row) => row.txid))
+  return rows.map((row) => ({
+    ...row,
+    arcPhase: phases.get(row.txid) ?? null,
+  }))
 }
 
 export async function getRecentReadingsByFamily(
@@ -562,6 +632,84 @@ function parseCoordinateQuery(q: string): { lat: number; lon: number } | null {
 }
 
 const COORD_SEARCH_RADIUS_DEG = 0.5
+
+const FAMILY_PAGE_COLUMNS = `txid, data_family, location, lat, lon,
+         reading_ts, provider_id, block_height, block_time,
+         confirmed, metrics_preview`
+
+/**
+ * One index-ordered branch per stored family value.
+ * `oer_family_reading_ts_asc_idx (data_family, reading_ts)` is read backwards,
+ * so each branch stops after `fetchLimit` rows instead of sorting the family.
+ */
+function buildIndexedFamilyPageSql(
+  params: SearchParams,
+  fetchLimit: number,
+  offset: number,
+): { sql: string; params: unknown[] } | null {
+  const families = params.dataType ? getDataFamilyFilterValues(params.dataType) : []
+  if (families.length === 0) return null
+
+  const sqlParams: unknown[] = []
+  const dateFilters: string[] = []
+  if (params.from) {
+    sqlParams.push(new Date(params.from).toISOString())
+    dateFilters.push(`reading_ts >= $${sqlParams.length}`)
+  }
+  if (params.to) {
+    sqlParams.push(new Date(params.to).toISOString())
+    dateFilters.push(`reading_ts <= $${sqlParams.length}`)
+  }
+
+  sqlParams.push(fetchLimit + offset)
+  const innerLimitIdx = sqlParams.length
+
+  const branches = families.map((family) => {
+    sqlParams.push(family)
+    const familyIdx = sqlParams.length
+    const filters = [`data_family = $${familyIdx}`, ...dateFilters]
+    return `(
+      SELECT ${FAMILY_PAGE_COLUMNS}
+      FROM overlay_explorer_readings
+      WHERE ${filters.join(' AND ')}
+      ORDER BY reading_ts DESC
+      LIMIT $${innerLimitIdx}
+    )`
+  })
+
+  sqlParams.push(fetchLimit, offset)
+  const outerLimitIdx = sqlParams.length - 1
+  const outerOffsetIdx = sqlParams.length
+
+  return {
+    sql: `SELECT ${FAMILY_PAGE_COLUMNS}
+      FROM (
+        ${branches.join('\nUNION ALL\n')}
+      ) AS family_hits
+      ORDER BY reading_ts DESC
+      LIMIT $${outerLimitIdx} OFFSET $${outerOffsetIdx}`,
+    params: sqlParams,
+  }
+}
+
+function buildOffsetPageSql(
+  whereSql: string,
+  whereParams: unknown[],
+  fetchLimit: number,
+  offset: number,
+): { sql: string; params: unknown[] } {
+  const sqlParams = [...whereParams, fetchLimit, offset]
+  const limitIdx = sqlParams.length - 1
+  const offsetIdx = sqlParams.length
+  return {
+    sql: `SELECT ${FAMILY_PAGE_COLUMNS}
+       FROM overlay_explorer_readings
+       ${whereSql}
+       ORDER BY reading_ts DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+    params: sqlParams,
+  }
+}
 
 function buildWhereClause(params: SearchParams): { whereSql: string; sqlParams: unknown[] } {
   const parts: string[] = []

@@ -1,439 +1,461 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { useCallback, useEffect, useState } from "react"
 import { Badge } from "@/components/ui/badge"
-import { Progress } from "@/components/ui/progress"
 import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Progress } from "@/components/ui/progress"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { 
-  Wind, 
-  Activity, 
-  TrendingUp, 
-  RefreshCw,
-  MapPin,
-  Thermometer,
-  Droplets,
-  Gauge
-} from "lucide-react"
-import { fetchFamilyAggregates, toNumber } from "@/lib/admin-db-stats"
+import { useAdminRefresh } from "@/components/admin-refresh"
+import { PanelEmpty, PanelError, StaleReadingNotice } from "@/components/panels/panel-states"
+import { fetchFamilySample, toNumber, toText, type FamilySample } from "@/lib/admin-db-stats"
+import {
+  MISSING,
+  ageMs,
+  formatMetric,
+  formatNumber,
+  formatReadingTime,
+  formatTimeAgo,
+  kphToMph,
+  toPercent,
+} from "@/lib/admin-format"
+import { describeRangePosition, getAqiCategory, getWindCategory, rangePosition } from "@/lib/admin-metrics"
+import { cn } from "@/lib/utils"
+import { Activity, Droplets, Gauge, MapPin, RefreshCw, Thermometer, TrendingUp, Wind } from "lucide-react"
 
-interface AirQualityData {
-  aqi: number
-  pm25: number
-  pm10: number
-  no2: number
-  o3: number
-  co: number
-  so2: number
-  temperature: number
-  humidity: number
-  pressure: number
-  windSpeed: number
-  windDirection: number
-  location: string
-  timestamp: number
-  source: string
+interface AirQualityReading {
+  collectedAt: string | null
+  location: string | null
+  stationCode: string | null
+  provider: string | null
+  aqi: number | null
+  pm25: number | null
+  pm10: number | null
+  no2: number | null
+  o3: number | null
+  co: number | null
+  so2: number | null
+  temperatureC: number | null
+  humidityPct: number | null
+  pressureMb: number | null
+  windKph: number | null
+  windDeg: number | null
 }
 
-interface AirQualityStats {
-  currentAQI: number
-  averageAQI: number
-  maxAQI: number
-  minAQI: number
-  totalReadings: number
-  alerts: number
-  lastUpdate: number
+function mapRow(row: Record<string, any>): AirQualityReading {
+  return {
+    collectedAt: toText(row.collected_at ?? row.timestamp),
+    location: toText(row.city) ?? toText(row.location),
+    stationCode: toText(row.station_code),
+    provider: toText(row.provider),
+    aqi: toNumber(row.aqi),
+    pm25: toNumber(row.pm25),
+    pm10: toNumber(row.pm10),
+    no2: toNumber(row.no2),
+    o3: toNumber(row.o3),
+    co: toNumber(row.co),
+    so2: toNumber(row.so2),
+    temperatureC: toNumber(row.temperature_c),
+    humidityPct: toNumber(row.humidity_pct),
+    pressureMb: toNumber(row.pressure_mb),
+    windKph: toNumber(row.wind_kph),
+    windDeg: toNumber(row.wind_deg),
+  }
 }
+
+const POLLUTANTS = [
+  {
+    key: "pm25",
+    label: "PM2.5",
+    description: "Fine particulate matter",
+    // WHO 24-hour guideline for PM2.5 is 15 µg/m³.
+    whoGuideline: 15,
+    unit: "µg/m³",
+  },
+  {
+    key: "pm10",
+    label: "PM10",
+    description: "Coarse particulate matter",
+    whoGuideline: 45,
+    unit: "µg/m³",
+  },
+  {
+    key: "no2",
+    label: "NO₂",
+    description: "Nitrogen dioxide",
+    whoGuideline: 25,
+    unit: "µg/m³",
+  },
+  {
+    key: "o3",
+    label: "O₃",
+    description: "Ozone",
+    whoGuideline: 100,
+    unit: "µg/m³",
+  },
+  {
+    key: "co",
+    label: "CO",
+    description: "Carbon monoxide",
+    whoGuideline: 4,
+    unit: "mg/m³",
+  },
+  {
+    key: "so2",
+    label: "SO₂",
+    description: "Sulfur dioxide",
+    whoGuideline: 40,
+    unit: "µg/m³",
+  },
+] as const
 
 export function AirQualityPanel() {
-  const [airQualityData, setAirQualityData] = useState<AirQualityData | null>(null)
-  const [airQualityStats, setAirQualityStats] = useState<AirQualityStats>({
-    currentAQI: 0,
-    averageAQI: 0,
-    maxAQI: 0,
-    minAQI: 0,
-    totalReadings: 0,
-    alerts: 0,
-    lastUpdate: 0
-  })
-  const [isRefreshing, setIsRefreshing] = useState(false)
-  const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
+  const { tick } = useAdminRefresh()
+  const [reading, setReading] = useState<AirQualityReading | null>(null)
+  const [sample, setSample] = useState<FamilySample | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
-  // Fetch air quality data from the database (kept fresh by local workers).
-  // The most recent row supplies the "current" reading; the last 24 hours of
-  // rows supply real aggregate statistics.
-  const fetchAirQualityData = async () => {
+  const load = useCallback(async () => {
     try {
-      const response = await fetch('/api/db/air-quality?limit=1&sort=collected_at_desc')
-
-      if (response.ok) {
-        const result = await response.json()
-        const latest = result?.success && Array.isArray(result.items) && result.items.length > 0
-          ? result.items[0]
-          : null
-
-        if (latest) {
-          const mapped: AirQualityData = {
-            aqi: toNumber(latest.aqi) ?? 0,
-            pm25: toNumber(latest.pm25) ?? 0,
-            pm10: toNumber(latest.pm10) ?? 0,
-            no2: toNumber(latest.no2) ?? 0,
-            o3: toNumber(latest.o3) ?? 0,
-            co: toNumber(latest.co) ?? 0,
-            so2: toNumber(latest.so2) ?? 0,
-            temperature: toNumber(latest.temperature_c) ?? 0,
-            humidity: toNumber(latest.humidity_pct) ?? 0,
-            pressure: toNumber(latest.pressure_mb) ?? 0,
-            windSpeed: toNumber(latest.wind_kph) ?? 0,
-            windDirection: toNumber(latest.wind_deg) ?? 0,
-            location: latest.city || 'Unknown',
-            timestamp: latest.collected_at ? Date.parse(latest.collected_at) : Date.now(),
-            source: latest.provider || 'WAQI',
-          }
-          setAirQualityData(mapped)
-          setLastUpdate(new Date())
-
-          const aggregates = await fetchFamilyAggregates({
-            endpoint: '/api/db/air-quality',
-            valueOf: (row) => toNumber(row.aqi),
-            isAlert: (row) => (toNumber(row.aqi) ?? 0) > 100 || (toNumber(row.pm25) ?? 0) > 35.4,
-          })
-          if (aggregates) {
-            setAirQualityStats({
-              currentAQI: mapped.aqi || 0,
-              averageAQI: Math.round(aggregates.average),
-              maxAQI: Math.round(aggregates.max),
-              minAQI: Math.round(aggregates.min),
-              totalReadings: aggregates.totalReadings,
-              alerts: aggregates.alerts,
-              lastUpdate: Date.now(),
-            })
-          }
-        } else {
-          console.warn('No air quality data available from database')
-          setAirQualityData(null)
-        }
-      } else {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-      }
-    } catch (error) {
-      console.error('Error fetching air quality data from database:', error)
-      setAirQualityData(null)
+      const next = await fetchFamilySample({
+        endpoint: "/api/db/air-quality",
+        valueOf: (row) => toNumber(row.aqi),
+        isAlert: (row) => (toNumber(row.aqi) ?? 0) > 100 || (toNumber(row.pm25) ?? 0) > 35.4,
+        // One city at a time: AQI readings from different places describe
+        // different air, so averaging them says nothing useful. The endpoint's
+        // search only covers city, provider and txid, so city is the key.
+        narrowTo: (row) => toText(row.city),
+      })
+      setSample(next)
+      setReading(next.latest ? mapRow(next.latest) : null)
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load air quality data")
+    } finally {
+      setLoading(false)
     }
-  }
-
-  // No simulated data fallback - use real data only
-
-  // Real-time data updates - match Live Dashboard refresh rate
-  useEffect(() => {
-    fetchAirQualityData()
-    const interval = setInterval(fetchAirQualityData, 5 * 60 * 1000) // Update every 5 minutes (same as Live Dashboard)
-
-    return () => clearInterval(interval)
   }, [])
 
+  useEffect(() => {
+    void load()
+    const id = setInterval(() => void load(), 5 * 60 * 1000)
+    return () => clearInterval(id)
+  }, [load, tick])
+
   const handleRefresh = async () => {
-    setIsRefreshing(true)
-    await fetchAirQualityData()
-    setTimeout(() => setIsRefreshing(false), 1000)
+    setRefreshing(true)
+    await load()
+    setRefreshing(false)
   }
 
-  const getAQICategory = (aqi: number) => {
-    if (aqi <= 50) return { category: "Good", color: "text-green-500", bgColor: "bg-green-500" }
-    if (aqi <= 100) return { category: "Moderate", color: "text-yellow-500", bgColor: "bg-yellow-500" }
-    if (aqi <= 150) return { category: "Unhealthy for Sensitive Groups", color: "text-orange-500", bgColor: "bg-orange-500" }
-    if (aqi <= 200) return { category: "Unhealthy", color: "text-red-500", bgColor: "bg-red-500" }
-    if (aqi <= 300) return { category: "Very Unhealthy", color: "text-purple-500", bgColor: "bg-purple-500" }
-    return { category: "Hazardous", color: "text-red-800", bgColor: "bg-red-800" }
+  const aggregates = sample?.aggregates ?? null
+  const aqiCategory = getAqiCategory(reading?.aqi ?? null)
+  const windMph = kphToMph(reading?.windKph ?? null)
+  const windCategory = getWindCategory(windMph)
+  const position = rangePosition(reading?.aqi ?? null, aggregates?.min ?? null, aggregates?.max ?? null)
+  const rangeLabel = describeRangePosition(reading?.aqi ?? null, aggregates?.average ?? null)
+
+  const header = (
+    <div className="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h1 className="flex items-center gap-2 font-display text-3xl font-bold">
+          <Wind className="h-8 w-8" aria-hidden />
+          Air quality monitor
+        </h1>
+        <p className="mt-1 text-muted-foreground">
+          Latest air quality reading recorded by the collectors.
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Reading time: {formatReadingTime(reading?.collectedAt)} · Fetched:{" "}
+          {sample ? formatTimeAgo(sample.fetchedAt) : MISSING}
+        </p>
+      </div>
+      <Button onClick={handleRefresh} disabled={refreshing || loading}>
+        <RefreshCw className={cn("mr-2 h-4 w-4", refreshing && "animate-spin")} aria-hidden />
+        Refresh
+      </Button>
+    </div>
+  )
+
+  if (loading) {
+    return (
+      <div className="space-y-6 p-6">
+        {header}
+        <p className="text-sm text-muted-foreground">Loading the latest readings…</p>
+      </div>
+    )
   }
 
-  const formatLastUpdate = (date: Date) => {
-    const now = new Date()
-    const diffMs = now.getTime() - date.getTime()
-    const diffMins = Math.floor(diffMs / 60000)
-    
-    if (diffMins < 1) return 'Just now'
-    if (diffMins < 60) return `${diffMins}m ago`
-    const diffHours = Math.floor(diffMins / 60)
-    return `${diffHours}h ago`
+  if (error) {
+    return (
+      <div className="space-y-6 p-6">
+        {header}
+        <PanelError
+          title="Air quality data could not be loaded"
+          message={error}
+          onRetry={handleRefresh}
+          retrying={refreshing}
+        />
+      </div>
+    )
   }
 
-  const aqiCategory = airQualityData ? getAQICategory(airQualityData.aqi) : { category: "Unknown", color: "text-gray-500", bgColor: "bg-gray-500" }
+  if (!reading) {
+    return (
+      <div className="space-y-6 p-6">
+        {header}
+        <PanelEmpty
+          title="No air quality readings yet"
+          message="The collector workers have not stored an air quality reading. Check that the WAQI or OpenWeatherMap credentials are configured and that the workers are running."
+        />
+      </div>
+    )
+  }
 
   return (
-    <div className="p-6 space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold text-foreground flex items-center gap-2">
-            <Wind className="h-8 w-8" />
-            Air Quality Monitor
-          </h1>
-          <p className="text-muted-foreground mt-1">
-            Real-time air quality monitoring and environmental metrics
-          </p>
-          <p className="text-xs text-muted-foreground mt-1">
-            Last updated: {formatLastUpdate(lastUpdate)}
-          </p>
-        </div>
-        <Button onClick={handleRefresh} disabled={isRefreshing}>
-          <RefreshCw className={`h-4 w-4 mr-2 ${isRefreshing ? 'animate-spin' : ''}`} />
-          Refresh
-        </Button>
-      </div>
+    <div className="space-y-6 p-6">
+      {header}
 
-      {/* Key Metrics */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      <StaleReadingNotice collectedAt={reading.collectedAt} ageMs={ageMs(reading.collectedAt)} />
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">Current AQI</CardTitle>
-            <Activity className="h-4 w-4 text-muted-foreground" />
+            <Activity className="h-4 w-4 text-muted-foreground" aria-hidden />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{airQualityData?.aqi || 0}</div>
-            <div className="flex items-center gap-2 mt-1">
-              <Badge className={aqiCategory.bgColor}>{aqiCategory.category}</Badge>
-            </div>
+            <p className="text-2xl font-bold">{formatNumber(reading.aqi)}</p>
+            <Badge className={cn("mt-1 rounded-sm", aqiCategory.className)}>{aqiCategory.label}</Badge>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">PM2.5</CardTitle>
-            <Gauge className="h-4 w-4 text-muted-foreground" />
+            <Gauge className="h-4 w-4 text-muted-foreground" aria-hidden />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{airQualityData?.pm25 || 0} µg/m³</div>
-            <p className="text-xs text-muted-foreground">
-              Fine particulate matter
-            </p>
+            <p className="text-2xl font-bold">{formatMetric(reading.pm25, "µg/m³", 1)}</p>
+            <p className="text-xs text-muted-foreground">Fine particulate matter</p>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">Temperature</CardTitle>
-            <Thermometer className="h-4 w-4 text-muted-foreground" />
+            <Thermometer className="h-4 w-4 text-muted-foreground" aria-hidden />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{airQualityData?.temperature || 0}°C</div>
-            <p className="text-xs text-muted-foreground">
-              Ambient temperature
-            </p>
+            <p className="text-2xl font-bold">{formatMetric(reading.temperatureC, "°C", 1)}</p>
+            <p className="text-xs text-muted-foreground">Ambient temperature</p>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">Humidity</CardTitle>
-            <Droplets className="h-4 w-4 text-muted-foreground" />
+            <Droplets className="h-4 w-4 text-muted-foreground" aria-hidden />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{airQualityData?.humidity || 0}%</div>
-            <p className="text-xs text-muted-foreground">
-              Relative humidity
-            </p>
+            <p className="text-2xl font-bold">{formatMetric(reading.humidityPct, "%", 0)}</p>
+            <p className="text-xs text-muted-foreground">Relative humidity</p>
           </CardContent>
         </Card>
       </div>
 
-      {/* Attributions */}
       <div className="pt-2 text-[10px] text-muted-foreground">
-        Data sources may include the World Air Quality Index Project (WAQI) and WeatherAPI.
-        Attribution required by providers; see their terms. Links:
-        {" "}
-        <a href="https://waqi.info/" target="_blank" rel="noopener noreferrer" className="underline">WAQI</a>
-        {" • "}
-        <a href="https://www.weatherapi.com/" target="_blank" rel="noopener noreferrer" className="underline">WeatherAPI</a>
+        Readings are collected from the World Air Quality Index Project (WAQI), WeatherAPI and
+        OpenWeatherMap. Attribution is required by those providers; see{" "}
+        <a href="https://waqi.info/" target="_blank" rel="noopener noreferrer" className="underline">
+          waqi.info
+        </a>
+        {" and "}
+        <a
+          href="https://www.weatherapi.com/"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline"
+        >
+          weatherapi.com
+        </a>
+        .
       </div>
 
-      {/* Main Content Tabs */}
       <Tabs defaultValue="overview" className="space-y-4">
-        <TabsList>
+        <TabsList className="flex w-full flex-wrap gap-1 overflow-x-auto sm:w-auto">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="pollutants">Pollutants</TabsTrigger>
           <TabsTrigger value="weather">Weather</TabsTrigger>
           <TabsTrigger value="analytics">Analytics</TabsTrigger>
         </TabsList>
 
-        {/* Overview Tab */}
         <TabsContent value="overview" className="space-y-4">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <MapPin className="h-5 w-5" />
-                  Current Location
+                  <MapPin className="h-5 w-5" aria-hidden />
+                  Monitoring station
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="text-center">
-                  <div className="text-3xl font-bold mb-2">{airQualityData?.location || "Loading..."}</div>
-                  <Badge variant="outline">{airQualityData?.source || "WAQI"}</Badge>
+                  <p className="mb-2 text-3xl font-bold">
+                    {reading.location ?? reading.stationCode ?? "Unknown station"}
+                  </p>
+                  <Badge variant="outline">{reading.provider ?? "Unknown provider"}</Badge>
                 </div>
-                <div className="space-y-3">
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-muted-foreground">AQI Status</span>
-                    <Badge className={aqiCategory.bgColor}>{aqiCategory.category}</Badge>
+                <dl className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <dt className="text-sm text-muted-foreground">AQI category</dt>
+                    <dd>
+                      <Badge className={cn("rounded-sm", aqiCategory.className)}>{aqiCategory.label}</Badge>
+                    </dd>
                   </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-muted-foreground">Wind Speed</span>
-                    <span className="font-semibold">{airQualityData?.windSpeed || 0} km/h</span>
+                  <div className="flex items-center justify-between">
+                    <dt className="text-sm text-muted-foreground">Wind speed</dt>
+                    <dd className="font-semibold">{formatMetric(windMph, "mph", 1)}</dd>
                   </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-muted-foreground">Pressure</span>
-                    <span className="font-semibold">{airQualityData?.pressure || 0} hPa</span>
+                  <div className="flex items-center justify-between">
+                    <dt className="text-sm text-muted-foreground">Pressure</dt>
+                    <dd className="font-semibold">{formatMetric(reading.pressureMb, "hPa", 0)}</dd>
                   </div>
-                </div>
+                  <div className="flex items-center justify-between">
+                    <dt className="text-sm text-muted-foreground">Reading time</dt>
+                    <dd className="font-semibold">{formatReadingTime(reading.collectedAt)}</dd>
+                  </div>
+                </dl>
               </CardContent>
             </Card>
 
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <TrendingUp className="h-5 w-5" />
-                  AQI Trends
+                  <TrendingUp className="h-5 w-5" aria-hidden />
+                  AQI over the last 24 hours
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="space-y-3">
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm">Current AQI</span>
-                    <span className="font-semibold">{airQualityStats.currentAQI}</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm">Average (24h)</span>
-                    <span className="font-semibold">{airQualityStats.averageAQI}</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm">Maximum</span>
-                    <span className="font-semibold text-red-600">{airQualityStats.maxAQI}</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm">Minimum</span>
-                    <span className="font-semibold text-green-600">{airQualityStats.minAQI}</span>
-                  </div>
-                </div>
-                <Progress value={(airQualityStats.currentAQI / 300) * 100} className="h-2" />
-                <p className="text-xs text-muted-foreground">
-                  AQI Scale: 0-300 (Hazardous)
-                </p>
+                {aggregates && aggregates.totalReadings > 0 ? (
+                  <>
+                    <dl className="space-y-3">
+                      <div className="flex items-center justify-between">
+                        <dt className="text-sm">Current</dt>
+                        <dd className="font-semibold">{formatNumber(reading.aqi)}</dd>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <dt className="text-sm">Average</dt>
+                        <dd className="font-semibold">{formatNumber(aggregates.average, 1)}</dd>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <dt className="text-sm">Maximum</dt>
+                        <dd className="font-semibold text-red-600">{formatNumber(aggregates.max, 1)}</dd>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <dt className="text-sm">Minimum</dt>
+                        <dd className="font-semibold text-green-600">{formatNumber(aggregates.min, 1)}</dd>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <dt className="text-sm">Readings</dt>
+                        <dd className="font-semibold">{formatNumber(aggregates.totalReadings)}</dd>
+                      </div>
+                    </dl>
+                    <div className="space-y-1">
+                      <Progress
+                        value={position ?? 0}
+                        className="h-2"
+                        aria-label="Current AQI within the 24-hour range"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        {rangeLabel.label}
+                        {sample?.groupKey ? ` at ${sample.groupKey}` : ""}
+                        {aggregates.sampleTruncated ? " · based on the 500 most recent readings" : ""}
+                      </p>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    No readings in the last 24 hours, so no range can be calculated.
+                  </p>
+                )}
               </CardContent>
             </Card>
           </div>
         </TabsContent>
 
-        {/* Pollutants Tab */}
         <TabsContent value="pollutants" className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">PM2.5 (Fine Particles)</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="text-2xl font-bold mb-2">{airQualityData?.pm25 || 0} µg/m³</div>
-                <Progress value={(airQualityData?.pm25 || 0) / 50 * 100} className="h-2 mb-2" />
-                <p className="text-xs text-muted-foreground">
-                  WHO Guideline: 10 µg/m³
-                </p>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">PM10 (Coarse Particles)</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="text-2xl font-bold mb-2">{airQualityData?.pm10 || 0} µg/m³</div>
-                <Progress value={(airQualityData?.pm10 || 0) / 100 * 100} className="h-2 mb-2" />
-                <p className="text-xs text-muted-foreground">
-                  WHO Guideline: 20 µg/m³
-                </p>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">NO₂ (Nitrogen Dioxide)</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="text-2xl font-bold mb-2">{airQualityData?.no2 || 0} µg/m³</div>
-                <Progress value={(airQualityData?.no2 || 0) / 100 * 100} className="h-2 mb-2" />
-                <p className="text-xs text-muted-foreground">
-                  WHO Guideline: 40 µg/m³
-                </p>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">O₃ (Ozone)</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="text-2xl font-bold mb-2">{airQualityData?.o3 || 0} µg/m³</div>
-                <Progress value={(airQualityData?.o3 || 0) / 80 * 100} className="h-2 mb-2" />
-                <p className="text-xs text-muted-foreground">
-                  WHO Guideline: 100 µg/m³
-                </p>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">CO (Carbon Monoxide)</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="text-2xl font-bold mb-2">{airQualityData?.co || 0} mg/m³</div>
-                <Progress value={(airQualityData?.co || 0) / 5 * 100} className="h-2 mb-2" />
-                <p className="text-xs text-muted-foreground">
-                  WHO Guideline: 4 mg/m³
-                </p>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">SO₂ (Sulfur Dioxide)</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="text-2xl font-bold mb-2">{airQualityData?.so2 || 0} µg/m³</div>
-                <Progress value={(airQualityData?.so2 || 0) / 20 * 100} className="h-2 mb-2" />
-                <p className="text-xs text-muted-foreground">
-                  WHO Guideline: 20 µg/m³
-                </p>
-              </CardContent>
-            </Card>
+          <p className="text-xs text-muted-foreground">
+            The upstream providers publish pollutant readings, while AQI and its component
+            sub-indices are calculated from them. Values are shown exactly as stored. WHO
+            guideline values are the 24-hour air quality guideline levels.
+          </p>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+            {POLLUTANTS.map((pollutant) => {
+              const value = reading[pollutant.key]
+              const ratio = value != null ? toPercent(value, pollutant.whoGuideline * 5) : 0
+              return (
+                <Card key={pollutant.key}>
+                  <CardHeader>
+                    <CardTitle className="text-sm">
+                      {pollutant.label} — {pollutant.description}
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <p className="mb-2 text-2xl font-bold">
+                      {formatMetric(value, pollutant.unit, 1)}
+                    </p>
+                    <Progress
+                      value={ratio}
+                      className="mb-2 h-2"
+                      aria-label={`${pollutant.label} relative to five times the WHO guideline`}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      WHO guideline: {formatMetric(pollutant.whoGuideline, pollutant.unit, 1)}
+                    </p>
+                  </CardContent>
+                </Card>
+              )
+            })}
           </div>
         </TabsContent>
 
-        {/* Weather Tab */}
         <TabsContent value="weather" className="space-y-4">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <Thermometer className="h-5 w-5" />
-                  Environmental Conditions
+                  <Thermometer className="h-5 w-5" aria-hidden />
+                  Environmental conditions
                 </CardTitle>
               </CardHeader>
-              <CardContent className="space-y-4">
+              <CardContent>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="text-center">
-                    <div className="text-3xl font-bold text-blue-600">{airQualityData?.temperature || 0}°C</div>
-                    <div className="text-sm text-muted-foreground">Temperature</div>
+                    <p className="text-3xl font-bold text-blue-600">
+                      {formatMetric(reading.temperatureC, "°C", 1)}
+                    </p>
+                    <p className="text-sm text-muted-foreground">Temperature</p>
                   </div>
                   <div className="text-center">
-                    <div className="text-3xl font-bold text-cyan-600">{airQualityData?.humidity || 0}%</div>
-                    <div className="text-sm text-muted-foreground">Humidity</div>
+                    <p className="text-3xl font-bold text-cyan-600">
+                      {formatMetric(reading.humidityPct, "%", 0)}
+                    </p>
+                    <p className="text-sm text-muted-foreground">Humidity</p>
                   </div>
                   <div className="text-center">
-                    <div className="text-3xl font-bold text-gray-600">{airQualityData?.pressure || 0} hPa</div>
-                    <div className="text-sm text-muted-foreground">Pressure</div>
+                    <p className="text-3xl font-bold text-gray-600">
+                      {formatMetric(reading.pressureMb, "hPa", 0)}
+                    </p>
+                    <p className="text-sm text-muted-foreground">Pressure</p>
                   </div>
                   <div className="text-center">
-                    <div className="text-3xl font-bold text-green-600">{airQualityData?.windSpeed || 0} km/h</div>
-                    <div className="text-sm text-muted-foreground">Wind Speed</div>
+                    <p className="text-3xl font-bold text-green-600">
+                      {formatMetric(windMph, "mph", 1)}
+                    </p>
+                    <p className="text-sm text-muted-foreground">Wind speed</p>
                   </div>
                 </div>
               </CardContent>
@@ -442,89 +464,110 @@ export function AirQualityPanel() {
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <Wind className="h-5 w-5" />
-                  Wind Information
+                  <Wind className="h-5 w-5" aria-hidden />
+                  Wind
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="text-center">
-                  <div className="text-4xl font-bold mb-2">{airQualityData?.windDirection || 0}°</div>
-                  <div className="text-sm text-muted-foreground">Wind Direction</div>
+                  <p className="mb-2 text-4xl font-bold">{formatMetric(reading.windDeg, "°", 0)}</p>
+                  <p className="text-sm text-muted-foreground">Wind direction</p>
                 </div>
-                <div className="space-y-3">
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-muted-foreground">Wind Speed</span>
-                    <span className="font-semibold">{airQualityData?.windSpeed || 0} km/h</span>
+                <dl className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <dt className="text-sm text-muted-foreground">Wind speed</dt>
+                    <dd className="font-semibold">{formatMetric(windMph, "mph", 1)}</dd>
                   </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-muted-foreground">Wind Category</span>
-                    <Badge variant="outline">
-                      {airQualityData?.windSpeed && airQualityData.windSpeed < 10 ? "Light" :
-                       airQualityData?.windSpeed && airQualityData.windSpeed < 20 ? "Moderate" :
-                       airQualityData?.windSpeed && airQualityData.windSpeed < 30 ? "Strong" : "Very Strong"}
-                    </Badge>
+                  <div className="flex items-center justify-between">
+                    <dt className="text-sm text-muted-foreground">Wind category</dt>
+                    <dd>
+                      <Badge variant="outline">{windCategory.label}</Badge>
+                    </dd>
                   </div>
-                </div>
+                </dl>
               </CardContent>
             </Card>
           </div>
         </TabsContent>
 
-        {/* Analytics Tab */}
         <TabsContent value="analytics" className="space-y-4">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             <Card>
               <CardHeader>
-                <CardTitle>Air Quality Statistics</CardTitle>
+                <CardTitle>Air quality statistics</CardTitle>
                 <CardDescription>Last 24 hours of monitoring</CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="space-y-4">
-                  <div className="flex justify-between items-center">
-                    <span>Total Readings</span>
-                    <span className="font-semibold">{airQualityStats.totalReadings}</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span>Alerts Generated</span>
-                    <span className="font-semibold text-red-600">{airQualityStats.alerts}</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span>Data Source</span>
-                    <Badge variant="outline">{airQualityData?.source || "WAQI"}</Badge>
-                  </div>
-                  <Progress value={(airQualityStats.totalReadings / 1000) * 100} className="h-2" />
-                </div>
+                {aggregates && aggregates.totalReadings > 0 ? (
+                  <dl className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <dt>Total readings</dt>
+                      <dd className="font-semibold">{formatNumber(aggregates.totalReadings)}</dd>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <dt>Readings above the alert threshold</dt>
+                      <dd className="font-semibold text-red-600">{formatNumber(aggregates.alerts)}</dd>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <dt>Data source</dt>
+                      <dd>
+                        <Badge variant="outline">{reading.provider ?? "Unknown"}</Badge>
+                      </dd>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <dt>Sample</dt>
+                      <dd className="text-sm text-muted-foreground">
+                        {aggregates.sampleTruncated
+                          ? "500 most recent readings"
+                          : "All readings in the window"}
+                      </dd>
+                    </div>
+                  </dl>
+                ) : (
+                  <p className="text-sm text-muted-foreground">No readings in the last 24 hours.</p>
+                )}
               </CardContent>
             </Card>
 
-      <Card>
-        <CardHeader>
-                <CardTitle>Health Recommendations</CardTitle>
-                <CardDescription>Based on current AQI levels</CardDescription>
-        </CardHeader>
-        <CardContent>
-                <div className="space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>Health guidance</CardTitle>
+                <CardDescription>Based on the current AQI of {formatNumber(reading.aqi)}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <dl className="space-y-4">
                   <div className="flex items-center justify-between">
-                    <span className="text-sm">Outdoor Activities</span>
-                    <Badge variant={airQualityData?.aqi && airQualityData.aqi > 100 ? "destructive" : "default"}>
-                      {airQualityData?.aqi && airQualityData.aqi > 100 ? "Avoid" : "Safe"}
-                    </Badge>
+                    <dt className="text-sm">Outdoor activity</dt>
+                    <dd>
+                      <Badge
+                        variant={(reading.aqi ?? 0) > 100 ? "destructive" : "default"}
+                        className={(reading.aqi ?? 0) > 100 ? "" : "bg-green-600"}
+                      >
+                        {(reading.aqi ?? 0) > 100 ? "Limit" : "Safe"}
+                      </Badge>
+                    </dd>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-sm">Sensitive Groups</span>
-                    <Badge variant={airQualityData?.aqi && airQualityData.aqi > 150 ? "destructive" : "secondary"}>
-                      {airQualityData?.aqi && airQualityData.aqi > 150 ? "High Risk" : "Moderate"}
-                    </Badge>
+                    <dt className="text-sm">Sensitive groups</dt>
+                    <dd>
+                      <Badge
+                        variant={(reading.aqi ?? 0) > 150 ? "destructive" : "secondary"}
+                      >
+                        {(reading.aqi ?? 0) > 150 ? "High risk" : "Moderate"}
+                      </Badge>
+                    </dd>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-sm">Air Purification</span>
-                    <Badge variant={airQualityData?.aqi && airQualityData.aqi > 200 ? "destructive" : "outline"}>
-                      {airQualityData?.aqi && airQualityData.aqi > 200 ? "Recommended" : "Optional"}
-                    </Badge>
+                    <dt className="text-sm">Air purification</dt>
+                    <dd>
+                      <Badge variant={(reading.aqi ?? 0) > 200 ? "destructive" : "outline"}>
+                        {(reading.aqi ?? 0) > 200 ? "Recommended" : "Optional"}
+                      </Badge>
+                    </dd>
                   </div>
-                </div>
-        </CardContent>
-      </Card>
+                </dl>
+              </CardContent>
+            </Card>
           </div>
         </TabsContent>
       </Tabs>

@@ -3,6 +3,7 @@ export const runtime = 'nodejs'
 import { z } from 'zod'
 import { getContactMessagesPage, insertContactMessage, markContactMessageRead, setContactMessageArchived } from '@/lib/repositories'
 import { verifyCaptchaToken } from '@/lib/simple-captcha'
+import { isAdminAuthenticated } from '@/lib/simple-auth'
 
 const postSchema = z.object({
   name: z.string().min(1).max(200),
@@ -30,6 +31,12 @@ export async function POST(req: Request) {
 }
 
 export async function GET(req: Request) {
+  // Contact messages contain personal data (name, e-mail, body). Reading them
+  // requires an authenticated admin session. `robots.txt` is not access
+  // control: any client that ignores it could read this endpoint.
+  if (!(await isAdminAuthenticated())) {
+    return NextResponse.json({ error: 'Unauthorised' }, { status: 401 })
+  }
   try {
     const { searchParams } = new URL(req.url)
     const limit = Math.min(Number(searchParams.get('limit') || 20), 100)
@@ -44,6 +51,10 @@ export async function GET(req: Request) {
 }
 
 export async function PATCH(req: Request) {
+  // Mutating read/archived state is an admin action.
+  if (!(await isAdminAuthenticated())) {
+    return NextResponse.json({ error: 'Unauthorised' }, { status: 401 })
+  }
   try {
     const body = await req.json()
     const id = Number(body.id)

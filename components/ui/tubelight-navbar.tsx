@@ -142,8 +142,11 @@ export function NavBar({ items, className }: NavBarProps) {
   }, [items, pathname, sectionIdToName])
 
   return (
-    <div className={cn("fixed bottom-0 sm:top-0 left-1/2 -translate-x-1/2 z-50 mb-6 sm:pt-6 pointer-events-none", className)}>
-      <div className="flex items-center gap-2 sm:gap-3 bg-background/5 border border-border backdrop-blur-lg py-1 px-2 sm:px-1 rounded-full shadow-lg pointer-events-auto max-w-[95vw] sm:max-w-none">
+    <nav
+      aria-label="Primary"
+      className={cn("fixed bottom-0 sm:top-0 left-1/2 -translate-x-1/2 z-50 mb-6 sm:pt-5 pointer-events-none", className)}
+    >
+      <div className="flex items-center gap-1 md:gap-1.5 lg:gap-2 bg-[#0b0618]/75 border border-purple-500/20 backdrop-blur-xl py-1.5 px-1.5 rounded-full shadow-lg shadow-purple-950/40 pointer-events-auto max-w-[calc(100vw-1.5rem)] overflow-x-auto">
         {items.map((item) => {
           const Icon = item.icon
           const isActive = activeTab === item.name
@@ -152,14 +155,14 @@ export function NavBar({ items, className }: NavBarProps) {
 
           const lampAndLabel = (
             <>
-              <span className="hidden md:inline">{item.name}</span>
-              <span className="md:hidden">
+              <span className="hidden md:inline whitespace-nowrap">{item.name}</span>
+              <span className="md:hidden flex items-center justify-center" aria-hidden="true">
                 <Icon size={18} strokeWidth={2.5} />
               </span>
               {isActive && (
                 <motion.div
                   layoutId="lamp"
-                  className="absolute inset-0 w-full bg-primary/5 rounded-full -z-10"
+                  className="absolute inset-0 w-full bg-primary/10 rounded-full -z-10"
                   initial={false}
                   transition={{
                     type: "spring",
@@ -178,9 +181,9 @@ export function NavBar({ items, className }: NavBarProps) {
           )
 
           const linkClassName = cn(
-            "relative cursor-pointer text-sm font-semibold px-4 sm:px-6 py-2 rounded-full transition-colors",
+            "relative cursor-pointer shrink-0 whitespace-nowrap text-xs lg:text-sm font-semibold px-3 md:px-3.5 lg:px-5 py-2 rounded-full transition-colors",
             "text-slate-300 hover:text-primary",
-            isActive && "bg-muted text-primary",
+            isActive && "bg-muted/80 text-primary",
           )
 
           // Hash links (e.g. `/#monitoring`) keep the SPA <Link> path so
@@ -190,6 +193,7 @@ export function NavBar({ items, className }: NavBarProps) {
               <Link
                 key={item.name}
                 href={item.url}
+                aria-label={item.name}
                 onClick={(e) => {
                   e.preventDefault()
                   setActiveTab(item.name)
@@ -227,6 +231,7 @@ export function NavBar({ items, className }: NavBarProps) {
             <a
               key={item.name}
               href={item.url}
+              aria-label={item.name}
               className={linkClassName}
             >
               {lampAndLabel}
@@ -234,6 +239,6 @@ export function NavBar({ items, className }: NavBarProps) {
           )
         })}
       </div>
-    </div>
+    </nav>
   )
 }

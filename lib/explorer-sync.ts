@@ -10,6 +10,7 @@ import {
   type StoredReading,
 } from './explorer-read-source'
 import { normaliseDataFamily } from './stream-registry'
+import { validateGaiaLog } from './opreturn-validator'
 
 const START_BLOCK = parseInt(process.env.EXPLORER_SYNC_START_BLOCK || '0', 10)
 const BATCH_SIZE = parseInt(process.env.EXPLORER_SYNC_BATCH_SIZE || '20', 10)
@@ -42,7 +43,7 @@ interface WocTxHistory {
   height: number
 }
 
-interface WocTxDetails {
+export interface WocTxDetails {
   txid: string
   hash: string
   blockheight: number
@@ -111,7 +112,13 @@ async function fetchTxDetails(txid: string): Promise<WocTxDetails | null> {
   }
 }
 
-function decodeGaiaLogFromTx(tx: WocTxDetails): DecodedGaiaLogTx | null {
+/**
+ * Decode a WoC transaction into a GaiaLog reading.
+ *
+ * Uses the shared push-aware validator so gzipped payloads and payloads whose
+ * push-length byte happens to be 0x7b decode accurately.
+ */
+export function decodeGaiaLogFromTx(tx: WocTxDetails): DecodedGaiaLogTx | null {
   try {
     const opReturnOut = tx.vout.find(out =>
       out.scriptPubKey.type === 'nulldata' ||
@@ -121,42 +128,21 @@ function decodeGaiaLogFromTx(tx: WocTxDetails): DecodedGaiaLogTx | null {
 
     if (!opReturnOut) return null
 
+    // Use the shared push-aware validator rather than hunting for the raw byte
+    // 0x7b ('{') in the script hex. A gzipped payload, or any push-length byte
+    // that happens to be 0x7b, would send a raw scan to the wrong offset.
     const scriptHex = opReturnOut.scriptPubKey.hex
-    const gaiaLogHex = Buffer.from('GaiaLog').toString('hex')
-    const markerIndex = scriptHex.indexOf(gaiaLogHex)
-    if (markerIndex < 0) return null
+    if (!scriptHex) return null
 
-    const searchStart = markerIndex + gaiaLogHex.length
-    const jsonStart = scriptHex.indexOf('7b', searchStart)
-    if (jsonStart < 0) return null
-
-    const hexPayload = scriptHex.substring(jsonStart)
-    let decoded = ''
-    let braceCount = 0
-    let started = false
-
-    for (let i = 0; i < hexPayload.length; i += 2) {
-      const byte = parseInt(hexPayload.substring(i, i + 2), 16)
-      if (isNaN(byte) || byte === 0) break
-
-      const char = String.fromCharCode(byte)
-      if (char === '{') {
-        started = true
-        braceCount++
-      }
-
-      if (started) {
-        decoded += char
-        if (char === '}') {
-          braceCount--
-          if (braceCount === 0) break
-        }
-      }
+    let decodedEnvelope: any
+    try {
+      decodedEnvelope = validateGaiaLog(scriptHex).json
+    } catch {
+      return null
     }
+    if (!decodedEnvelope || typeof decodedEnvelope !== 'object') return null
 
-    if (!decoded || braceCount !== 0) return null
-
-    const opReturnData = JSON.parse(decoded)
+    const opReturnData = decodedEnvelope
     const payload = opReturnData.payload || opReturnData
     const dataType = opReturnData.data_type || payload.data_type || 'unknown'
 

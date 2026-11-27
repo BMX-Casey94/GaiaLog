@@ -47,6 +47,7 @@ export async function GET(req: NextRequest) {
               // 1+ on-chain confirmation (or a stored block height) = confirmed.
               // "pending" is reserved for mempool / not-yet-mined broadcasts only.
               status: (r.confirmed || Number(r.block_height) > 0) ? 'confirmed' : 'pending',
+              arcPhase: r.arcPhase ?? null,
               data: {
                 provider: r.provider_id || 'unknown',
                 metrics: r.metrics_preview ?? {},

@@ -21,6 +21,16 @@ function formatIntervalMs(ms: number): string {
   return `${ms}ms`
 }
 
+export interface InitialProviderSource {
+  id: string
+  name: string
+  primaryFamily: string
+  type: string
+  intervalMs: number
+  coverage: string
+  status: string
+}
+
 interface ProviderSource {
   id: string
   name: string
@@ -33,15 +43,33 @@ interface ProviderSource {
 
 const PAGE_SIZE = 8
 
-export function DataSources() {
-  const [sources, setSources] = useState<ProviderSource[]>([])
-  const [loading, setLoading] = useState(true)
+function mapInitialSources(items: InitialProviderSource[]): ProviderSource[] {
+  return items.map((p) => ({
+    id: p.id,
+    name: p.name,
+    type: p.type,
+    icon: FAMILY_ICONS[p.primaryFamily] ?? FAMILY_ICONS.default,
+    refreshRate: formatIntervalMs(p.intervalMs),
+    coverage: p.coverage,
+    status: p.status,
+  }))
+}
+
+export function DataSources({ initialSources }: { initialSources?: InitialProviderSource[] } = {}) {
+  const [sources, setSources] = useState<ProviderSource[]>(() =>
+    initialSources && initialSources.length > 0 ? mapInitialSources(initialSources) : [],
+  )
+  const [loading, setLoading] = useState(!(initialSources && initialSources.length > 0))
   const [showAll, setShowAll] = useState(false)
 
   useEffect(() => {
+    // When server-provided initialSources are present, we already have the exact
+    // enabled provider catalogue without triggering live external health probes.
+    if (initialSources && initialSources.length > 0) return
+
     const fetchProviders = async () => {
       try {
-        const res = await fetch('/api/providers/status', { cache: 'no-store' })
+        const res = await fetch('/api/providers/status')
         const data = await res.json()
         const providers = data?.controls?.providers ?? []
         const enabled = providers.filter((p: any) => p.enabled && p.rolloutEnabled)
@@ -68,7 +96,7 @@ export function DataSources() {
     fetchProviders()
     const interval = setInterval(fetchProviders, 60000)
     return () => clearInterval(interval)
-  }, [])
+  }, [initialSources])
 
   const allSources = sources
   const visibleSources = showAll ? allSources : allSources.slice(0, PAGE_SIZE)
@@ -76,7 +104,7 @@ export function DataSources() {
 
   return (
     <section id="data-sources" className="py-20 px-4 sm:px-6 lg:px-8 relative scroll-mt-24">
-      <div className="absolute inset-0 bg-gradient-to-b from-slate-950/50 via-slate-900/30 to-black/80 pointer-events-none"></div>
+      <div className="absolute inset-0 bg-gradient-to-b from-transparent via-purple-950/15 to-transparent pointer-events-none"></div>
       <div className="relative z-10">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-16">
@@ -115,31 +143,32 @@ export function DataSources() {
             {visibleSources.map((source) => {
               const Icon = source.icon
               return (
-              <GlowCard key={source.id} glowColor="purple" customSize className="h-full">
-                <div className="flex items-center space-x-3 mb-4">
-                  <div className="w-10 h-10 bg-slate-950/60 rounded-full flex items-center justify-center">
+              <GlowCard key={source.id} glowColor="purple" customSize className="h-full flex flex-col justify-between">
+                <div className="flex items-start gap-3 -mx-4 -mt-4 mb-4 min-w-0">
+                  <div className="w-12 h-12 shrink-0 rounded-tl-2xl rounded-br-xl bg-purple-500/10 border-b border-r border-purple-400/20 flex items-center justify-center">
                     <Icon className="h-5 w-5 text-purple-300" />
                   </div>
-                  <div>
-                    <div className="text-white font-semibold">{source.name}</div>
-                    <div className="text-sm text-slate-400 font-normal">{source.type}</div>
+                  <div className="min-w-0 pt-3 pr-4">
+                    <div className="text-white font-semibold leading-snug truncate">{source.name}</div>
+                    <div className="text-xs text-slate-400 font-normal mt-0.5 truncate">{source.type}</div>
                   </div>
                 </div>
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-slate-400">Refresh Rate</span>
-                    <div className="flex items-center space-x-1 text-sm text-white">
-                      <RefreshCw className="h-3 w-3" />
+                <div className="space-y-2.5 border-t border-white/5 pt-3.5 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-slate-400">Refresh Rate</span>
+                    <div className="flex items-center gap-1.5 text-slate-200 font-medium tabular-nums">
+                      <RefreshCw className="h-3 w-3 text-purple-300/80" />
                       <span>{source.refreshRate}</span>
                     </div>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-slate-400">Coverage</span>
-                    <span className="text-sm text-white">{source.coverage}</span>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-slate-400">Coverage</span>
+                    <span className="text-slate-200 font-medium">{source.coverage}</span>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-slate-400">Status</span>
-                    <Badge variant="secondary" className="bg-green-900/50 text-green-400 rounded-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-slate-400">Status</span>
+                    <Badge variant="secondary" className="bg-emerald-950/70 text-emerald-300 border border-emerald-500/25 rounded-full px-2.5 py-0.5 text-[11px] font-medium inline-flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
                       {source.status}
                     </Badge>
                   </div>

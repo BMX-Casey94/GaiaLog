@@ -220,7 +220,7 @@ const ShaderCanvas = () => {
     <canvas
       ref={canvasRef}
       aria-hidden
-      className="pointer-events-none absolute inset-0 z-0 h-full w-full block"
+      className="pointer-events-none absolute inset-0 z-0 h-full w-full block [mask-image:linear-gradient(to_bottom,transparent_0%,#000_240px)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0%,#000_240px)]"
     />
   )
 }

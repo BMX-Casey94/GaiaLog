@@ -7,6 +7,77 @@ export function calculateSourceHash(obj: any): string {
   return createHash('sha256').update(stringifyCanonical(obj)).digest('hex')
 }
 
+// ─── Written-reading ledger ──────────────────────────────────────────────────
+//
+// `written_readings` (migration 0034) is the durable, family-agnostic record
+// that a reading has been broadcast. It replaces the implicit "the legacy
+// reading table has a txid" check, which only ever covered four families.
+//
+// The table may not exist yet: it arrives in its own migration, and the app is
+// deployed independently of migrations. Both functions below therefore treat
+// Postgres 42P01 (undefined_table) as "no record" and carry on, so a worker
+// started before the migration behaves exactly as it did before — no crash, no
+// failed broadcast. The warning is emitted once per process, not per query.
+
+let _writtenReadingsMissingWarned = false
+
+function isUndefinedTable(error: unknown): boolean {
+  return (error as { code?: string } | null | undefined)?.code === '42P01'
+}
+
+function warnWrittenReadingsMissing(operation: string, error: unknown): void {
+  if (_writtenReadingsMissingWarned) return
+  _writtenReadingsMissingWarned = true
+  const message = error instanceof Error ? error.message : String(error)
+  console.warn(
+    `⚠️  written_readings table is absent (${operation} skipped): ${message}. ` +
+      `Apply db/migrations/0034_written_readings_idempotency.sql to enable cross-family ` +
+      `post-broadcast idempotency. Legacy per-family txid checks remain in force.`,
+  )
+}
+
+export async function hasWrittenReading(dataFamily: string, sourceHash: string): Promise<boolean> {
+  if (!dataFamily || !sourceHash) return false
+  try {
+    const res = await query<{ txid: string | null }>(
+      `SELECT txid FROM written_readings WHERE data_family = $1 AND source_hash = $2 LIMIT 1`,
+      [dataFamily, sourceHash],
+    )
+    return res.rows.length > 0 && !!res.rows[0].txid
+  } catch (error) {
+    if (isUndefinedTable(error)) {
+      warnWrittenReadingsMissing('hasWrittenReading', error)
+      return false
+    }
+    throw error
+  }
+}
+
+export async function recordWrittenReading(
+  dataFamily: string,
+  sourceHash: string,
+  txid: string,
+): Promise<void> {
+  if (!dataFamily || !sourceHash || !txid) return
+  try {
+    // DO NOTHING rather than DO UPDATE: the first txid that paid for this
+    // reading is the authoritative one. A retry that somehow reaches this point
+    // again must not overwrite it with a second broadcast.
+    await query(
+      `INSERT INTO written_readings (data_family, source_hash, txid)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (data_family, source_hash) DO NOTHING`,
+      [dataFamily, sourceHash, txid],
+    )
+  } catch (error) {
+    if (isUndefinedTable(error)) {
+      warnWrittenReadingsMissing('recordWrittenReading', error)
+      return
+    }
+    throw error
+  }
+}
+
 export async function insertAirQuality(row: {
   provider: string
   station_code?: string | null

@@ -6,6 +6,7 @@
 import { PrivateKey } from '@bsv/sdk'
 import { bsvConfig } from './bsv-config'
 import { normaliseDataFamily, resolveProviderIdFromSource } from './stream-registry'
+import { validateGaiaLog } from './opreturn-validator'
 
 const WHATSONCHAIN_API_KEY = process.env.WHATSONCHAIN_API_KEY
 
@@ -195,6 +196,9 @@ export async function fetchWalletTransactions(
 
 /**
  * Fetch and decode a transaction's OP_RETURN data
+ *
+ * Every output is offered to the shared validator. WhatsOnChain's ASM is not
+ * used: its tokens are not raw push data, so splitting them drops payloads.
  */
 export async function fetchTxOpReturn(
   network: 'main' | 'test',
@@ -203,86 +207,33 @@ export async function fetchTxOpReturn(
 ): Promise<{ data_type: string; payload: any; timestamp: number; provider?: string; provider_id?: string; dataset_id?: string } | null> {
   const txRes = await fetchWoC(`https://api.whatsonchain.com/v1/bsv/${network}/tx/${txid}`, walletAddr)
   if (!txRes.ok) return null
-  
-  const j = await txRes.json()
-  const vout = Array.isArray(j?.vout) ? j.vout : []
-  
-  // Try to find OP_RETURN output - check both asm and hex
-  let opret: any = null
-  let scriptHex: string | null = null
-  
-  for (const o of vout) {
-    const asm = String(o?.scriptPubKey?.asm || '')
-    const hex = String(o?.scriptPubKey?.hex || '')
-    
-    if (asm.includes('OP_RETURN') || hex.startsWith('006a') || hex.startsWith('516a')) {
-      opret = o
-      scriptHex = hex || null
-      break
-    }
-  }
-  
-  if (!opret) return null
-  
-  // Parse from ASM if available, otherwise try hex
-  let pushes: string[] = []
-  let tagHex = ''
-  let dataHex = ''
-  
-  if (opret.scriptPubKey?.asm) {
-    const parts = String(opret.scriptPubKey.asm).split(' ')
-    const idx = parts.indexOf('OP_RETURN')
-    if (idx >= 0) {
-      pushes = parts.slice(idx + 1)
-      if (pushes.length >= 3) {
-        tagHex = pushes[0]
-        dataHex = pushes[2]
-      }
-    }
-  }
-  
-  // Fallback: try parsing from hex directly
-  if (!tagHex && scriptHex) {
-    try {
-      const { parsePushes } = await import('./opreturn-validator')
-      const parsed = parsePushes(scriptHex)
-      if (parsed.pushes.length >= 3) {
-        tagHex = parsed.pushes[0].toString('hex')
-        dataHex = parsed.pushes[2].toString('hex')
-      }
-    } catch {
-      // Continue with ASM parsing
-    }
-  }
-  
-  if (!tagHex || !dataHex) return null
-  
-  // Check tag
+
+  let body: any
   try {
-    const tag = Buffer.from(tagHex, 'hex').toString('utf8')
-    if (tag !== 'GaiaLog') return null
+    body = await txRes.json()
   } catch {
     return null
   }
-  
-  // Check for optional encoding flag
-  const extras = pushes.slice(3)
-  const encodingHex = Buffer.from('encoding=gzip', 'utf8').toString('hex')
-  const isGzip = extras.some(e => {
+  const vout: any[] = Array.isArray(body?.vout) ? body.vout : []
+
+  for (const output of vout) {
+    // The script hex has been seen at both locations depending on the endpoint.
+    const scriptHex =
+      typeof output?.scriptPubKey?.hex === 'string' && output.scriptPubKey.hex.length > 0
+        ? output.scriptPubKey.hex
+        : typeof output?.hex === 'string' && output.hex.length > 0
+          ? output.hex
+          : null
+    if (!scriptHex) continue
+
+    let parsed: any
     try {
-      return Buffer.from(e, 'hex').toString('utf8') === 'encoding=gzip'
+      parsed = validateGaiaLog(scriptHex).json
     } catch {
-      return false
+      continue
     }
-  })
-  
-  try {
-    const raw = Buffer.from(dataHex, 'hex')
-    const { gunzipSync } = await import('zlib')
-    const bytes = isGzip ? gunzipSync(raw) : raw
-    const txt = bytes.toString('utf8')
-    const parsed = JSON.parse(txt)
-    
+    if (!parsed || typeof parsed !== 'object') continue
+
     return {
       data_type: parsed?.data_type || '',
       payload: parsed?.payload || {},
@@ -291,12 +242,9 @@ export async function fetchTxOpReturn(
       provider_id: parsed?.provider_id || parsed?.payload?.provider_id || resolveProviderIdFromSource(parsed?.provider),
       dataset_id: parsed?.dataset_id || parsed?.payload?.dataset_id,
     }
-  } catch (error: any) {
-    if (process.env.NODE_ENV === 'development') {
-      console.warn(`[WoC] Failed to decode OP_RETURN for ${txid.substring(0, 12)}...:`, error.message)
-    }
-    return null
   }
+
+  return null
 }
 
 /**

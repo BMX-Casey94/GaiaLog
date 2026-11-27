@@ -7,8 +7,7 @@
  * The system optimistically inserts change outputs into overlay_admitted_utxos
  * with confirmed=false at broadcast time, then expects the confirmation worker
  * to flip them to confirmed=true once they land in a block. If broadcasts
- * silently land in orphan mempool (e.g. BSV_ARC_ACCEPT_ORPHAN_MEMPOOL=true
- * was misconfigured), the system happily chains new broadcasts on phantom
+ * silently land in orphan mempool, the system happily chains new broadcasts on phantom
  * outputs forever and our DB drifts arbitrarily far from on-chain reality.
  *
  * This script is the recovery path:

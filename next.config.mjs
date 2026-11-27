@@ -75,6 +75,14 @@ const nextConfig = {
   },
   async rewrites() {
     return [
+      // `app/llms.txt` cannot be a route directory: Next treats a dotted
+      // segment as a Pages Router page and the build fails on `/_document`.
+      // The handler lives at `/llms-txt` and is served at the conventional
+      // `/llms.txt` path instead.
+      {
+        source: '/llms.txt',
+        destination: '/llms-txt',
+      },
       // WOC Data Plugin style endpoints -> Next.js API route
       {
         source: '/data-decode/:network/gaialog/:txid/:vout',
@@ -86,22 +94,13 @@ const nextConfig = {
       },
     ]
   },
-  webpack: (config, { isServer }) => {
-    // Force single instance of 'bsv' to avoid duplicate-module warnings
+  webpack: (config) => {
     config.resolve = config.resolve || {}
     config.resolve.alias = {
       ...(config.resolve.alias || {}),
       // Explicit repo-root alias — some VPS builds failed to resolve `@/components/...`
       // when tsconfig paths lacked baseUrl / Next did not inject the mapping.
       '@': path.join(__dirname),
-      bsv: require.resolve('bsv', { paths: [__dirname] }),
-    }
-    // Ensure server bundles use the single Node runtime copy of bsv
-    if (isServer) {
-      config.externals = config.externals || []
-      if (Array.isArray(config.externals)) {
-        config.externals.push('bsv')
-      }
     }
     return config
   },

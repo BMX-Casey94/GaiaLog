@@ -83,9 +83,9 @@ export function WalletFundingStrip() {
   const [updatedAt, setUpdatedAt] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  const fetchFunding = useCallback(async () => {
+  const fetchFunding = useCallback(async (force = false) => {
     try {
-      const res = await fetch('/api/blockchain/wallet-funding', { cache: 'no-store' })
+      const res = await fetch('/api/blockchain/wallet-funding', force ? { cache: 'no-store' } : undefined)
       const data = (await res.json()) as WalletFundingResponse
       if (!res.ok || !data.ok || !Array.isArray(data.wallets)) {
         throw new Error('Failed to load wallet funding')
@@ -138,14 +138,14 @@ export function WalletFundingStrip() {
   return (
     <section
       aria-label="Treasury wallet funding"
-      className="relative w-full border-y border-white/10 bg-black/60 backdrop-blur-sm"
+      className="relative w-full border-y border-purple-500/20 bg-purple-950/20 backdrop-blur-md"
     >
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between gap-4">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3.5 flex items-center justify-between gap-4">
         <div className="shrink-0">
-          <div className="text-xs uppercase tracking-wider text-cyan-400/90 font-medium">
+          <div className="text-xs uppercase tracking-wider text-purple-300/90 font-medium">
             Treasury funding
           </div>
-          <div className="text-sm text-slate-300 tabular-nums">
+          <div className="text-sm text-slate-200 tabular-nums font-medium">
             {loading && wallets.length === 0
               ? 'Loading balances…'
               : error && wallets.length === 0
@@ -155,8 +155,8 @@ export function WalletFundingStrip() {
         </div>
         <button
           type="button"
-          onClick={() => { void fetchFunding() }}
-          className="shrink-0 inline-flex items-center gap-1.5 text-xs text-slate-400 hover:text-cyan-300 transition-colors"
+          onClick={() => { void fetchFunding(true) }}
+          className="shrink-0 inline-flex items-center gap-1.5 text-xs text-slate-400 hover:text-purple-300 transition-colors"
           aria-label="Refresh wallet balances"
         >
           <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />

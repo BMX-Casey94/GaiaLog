@@ -1,44 +1,39 @@
 "use client"
 
-import { OverviewPanel } from "@/components/panels/overview-panel"
+import type { ReactNode } from "react"
 import { AirQualityPanel } from "@/components/panels/air-quality-panel"
-import { WaterLevelsPanel } from "@/components/panels/water-levels-panel"
-import { SeismicPanel } from "@/components/panels/seismic-panel"
 import { AdvancedPanel } from "@/components/panels/advanced-panel"
 import { BSVBlockchainPanel } from "@/components/panels/bsv-blockchain-panel"
 import { DataEntriesPanel } from "@/components/panels/data-entries-panel"
-import { SettingsPanel } from "@/components/panels/settings-panel"
 import { MessagesPanel } from "@/components/panels/messages-panel"
+import { OverviewPanel } from "@/components/panels/overview-panel"
+import { SeismicPanel } from "@/components/panels/seismic-panel"
+import { SettingsPanel } from "@/components/panels/settings-panel"
+import { WaterLevelsPanel } from "@/components/panels/water-levels-panel"
 
 interface MainPanelProps {
   activeSection: string
 }
 
 export function MainPanel({ activeSection }: MainPanelProps) {
-  const renderPanel = () => {
-    switch (activeSection) {
-      case "overview":
-        return <OverviewPanel />
-      case "air-quality":
-        return <AirQualityPanel />
-      case "water-levels":
-        return <WaterLevelsPanel />
-      case "seismic":
-        return <SeismicPanel />
-      case "advanced":
-        return <AdvancedPanel />
-      case "bsv-blockchain":
-        return <BSVBlockchainPanel />
-      case "data-entries":
-        return <DataEntriesPanel />
-      case "messages":
-        return <MessagesPanel />
-      case "settings":
-        return <SettingsPanel />
-      default:
-        return <OverviewPanel />
-    }
+  const panels: Record<string, ReactNode> = {
+    overview: <OverviewPanel />,
+    "air-quality": <AirQualityPanel />,
+    "water-levels": <WaterLevelsPanel />,
+    seismic: <SeismicPanel />,
+    advanced: <AdvancedPanel />,
+    "bsv-blockchain": <BSVBlockchainPanel />,
+    "data-entries": <DataEntriesPanel />,
+    messages: <MessagesPanel />,
+    settings: <SettingsPanel />,
   }
 
-  return <div className="flex-1 overflow-auto bg-background">{renderPanel()}</div>
+  // Only the active panel is mounted, so switching sections stops its polling
+  // interval and its in-flight requests rather than leaking them in the
+  // background.
+  return (
+    <div className="flex-1 overflow-auto bg-background">
+      {panels[activeSection] ?? <OverviewPanel />}
+    </div>
+  )
 }

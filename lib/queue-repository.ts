@@ -43,12 +43,59 @@ export function ensureQueueTable(): Promise<void> {
   return _queueTableReady
 }
 
+/**
+ * Insert a queue row, or revive a previously failed one.
+ *
+ * The `DO NOTHING` this replaces meant a failed id was wedged permanently: the
+ * id is derived from (family, source_hash), so re-collecting the same reading
+ * produced the same id, hit the conflict, and did nothing. The reading could
+ * never be queued again even after whatever failed had been fixed, and the row
+ * survived until the 24-hour cleanup.
+ *
+ * The update is deliberately conditional on three things:
+ *
+ *   - `status = 'failed'`       — a row that is queued, processing, or already
+ *                                 completed is left alone. Reviving a live row
+ *                                 would reset another worker's claim.
+ *   - `updated_at < now() - 1h` — a failure that just happened is still being
+ *                                 retried or investigated; only genuinely stale
+ *                                 failures are eligible.
+ *   - retry_count and last_error are reset, so the revived row starts a fresh
+ *     retry budget instead of re-failing on its next tick with the old budget
+ *     already exhausted.
+ *
+ * `timestamp` is also reset to the incoming value. cleanupOldFailedItems ages
+ * failed rows on `timestamp`, so a revived row carrying its original timestamp
+ * would be immediately eligible for deletion.
+ *
+ * An existing `broadcastTxid` marker inside `data` is preserved rather than
+ * replaced. It records that this reading was already broadcast (see
+ * setQueueItemBroadcastTxid), so the revived row must reach the idempotency
+ * guard and complete rather than broadcast the same reading a second time. A
+ * plain `data = EXCLUDED.data` would erase the marker, because the collector's
+ * fresh payload never contains it.
+ */
 export async function enqueueQueueItem(row: Omit<QueueRow, 'status' | 'last_error' | 'updated_at'>): Promise<void> {
   await ensureQueueTable()
   await query(
     `INSERT INTO worker_queue (id, priority, data, timestamp, retry_count, max_retries, status)
      VALUES ($1,$2,$3,$4,$5,$6,'queued')
-     ON CONFLICT (id) DO NOTHING`,
+     ON CONFLICT (id) DO UPDATE SET
+       status = 'queued',
+       priority = EXCLUDED.priority,
+       data = CASE
+         WHEN worker_queue.data ? 'broadcastTxid'
+           THEN EXCLUDED.data
+             || jsonb_build_object('broadcastTxid', worker_queue.data -> 'broadcastTxid')
+         ELSE EXCLUDED.data
+       END,
+       timestamp = EXCLUDED.timestamp,
+       retry_count = 0,
+       max_retries = EXCLUDED.max_retries,
+       last_error = NULL,
+       updated_at = now()
+     WHERE worker_queue.status = 'failed'
+       AND worker_queue.updated_at < now() - interval '1 hour'`,
     [row.id, row.priority, JSON.stringify(row.data), row.timestamp, row.retry_count, row.max_retries]
   )
 }
@@ -182,6 +229,31 @@ export async function markQueueItemsProcessing(ids: string[]): Promise<string[]>
 export async function markQueueItemCompleted(id: string): Promise<void> {
   // Completed items are transient; remove them immediately to avoid DB bloat
   await query(`DELETE FROM worker_queue WHERE id=$1`, [id])
+}
+
+/**
+ * Persist the txid a broadcast returned into the queue row's payload.
+ *
+ * Written immediately after a successful broadcast and before any of the
+ * durable "this reading is on-chain" records, so the reclaim path can tell a
+ * row that was never broadcast from one that was broadcast but not yet
+ * recorded. Without it, a crash between the broadcast and the record leaves a
+ * `processing` row that reclaims into a second, separately-paid broadcast of
+ * the same reading.
+ *
+ * Stored inside `data` rather than in a new column because the queue table is
+ * created at runtime (see WORKER_QUEUE_DDL) as well as by migration, and a new
+ * column would have to be added in both places to avoid a schema mismatch on
+ * whichever path runs first.
+ */
+export async function setQueueItemBroadcastTxid(id: string, txid: string): Promise<void> {
+  await query(
+    `UPDATE worker_queue
+        SET data = data || jsonb_build_object('broadcastTxid', $2::text),
+            updated_at = now()
+      WHERE id = $1`,
+    [id, txid],
+  )
 }
 
 export async function markQueueItemFailed(id: string, error: string): Promise<void> {

@@ -1,8 +1,10 @@
 import { PrivateKey as SDKPrivateKey } from '@bsv/sdk'
-import * as bsv from 'bsv'
-// BSV has no protocol-enforced dust limit — override the BTC-inherited default
-;(bsv.Transaction as any).DUST_AMOUNT = 1
-import { bsvConfig } from './bsv-config'
+import {
+  buildSplitTx,
+  p2pkhLockingScriptHexFromWif as p2pkhLockingScriptHexFromWifSdk,
+} from './broadcast/tx-builder'
+import { getCachedPolicyFeeRateSatPerByte } from './broadcast/broadcaster-client'
+import { DEFAULT_TX_FEE_RATE, bsvConfig } from './bsv-config'
 import { getMutatorControlState, logMutatorSkip } from './mutator-control'
 import { getSpendSourceForWallet, getTreasuryTopicForWallet, getWalletIndexForAddress } from './spend-source'
 import {
@@ -19,9 +21,13 @@ import { fetchTreasuryOverlayInventorySnapshot, logTreasuryOverlayInventorySumma
 import { broadcastSplitTransactionRaw } from './broadcast-raw-tx'
 
 // ─── Auto-sizing from expected throughput ───────────────────────────────────
-// 2,000,000 TX/day across 3 wallets ≈ 666,667 TX/wallet/day.
-// With a ~20 minute confirmation window, each wallet needs materially higher
-// inventory until the admission-driven splitter replaces this legacy auto-sizing.
+// Auto-sizing from expected throughput.
+//
+// The target is per wallet, so the divisor is the number of configured wallets:
+// a single unified treasury wallet carries the entire throughput and therefore
+// needs the full target, and the arithmetic produces that without a special
+// case. During a transition the same formula still divides across however many
+// wallets remain, so 2 and 3 behave as they always did.
 // Users can override via env vars; otherwise we auto-calculate from BSV_EXPECTED_TX_PER_DAY.
 const EXPECTED_TX_PER_DAY = Number(process.env.BSV_EXPECTED_TX_PER_DAY || 2000000)
 const WALLET_COUNT = Math.max(1, (bsvConfig?.wallets?.privateKeys || []).filter(k => !!k).length)
@@ -35,10 +41,21 @@ const SPLIT_BATCH = Number(process.env.BSV_UTXO_SPLIT_BATCH || Math.min(SPLIT_BA
 const SPLIT_OUTPUT_SATS = Number(process.env.BSV_UTXO_SPLIT_OUTPUT_SATS || 2000)
 const MIN_CONF = getMaintainerMinConfirmations()
 const INTERVAL_MS = Number(process.env.BSV_UTXO_MAINTAINER_INTERVAL_MS || 30000) // 30s for high-throughput
-// GorillaPool/TAAL ARC policy floor: ~100 sat/kB. Operator standard 0.1025 sat/byte (102.5 sat/kB).
-// Margin is thin (2.5%); reliability requires deterministic explicit-fee builds — never tx.feePerKb().
-const FEE_RATE = Number((process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE) || 0.1025)
-const SPLIT_FEE_RATE = Number(process.env.BSV_UTXO_SPLIT_FEE_RATE_SAT_PER_BYTE || FEE_RATE)
+// Fee-rate planning floor. The configured rate (default DEFAULT_TX_FEE_RATE)
+// is used for threshold arithmetic — split floors, starved-wallet triggers —
+// because those must be stable across cycles. The fee actually paid is
+// estimated from the live Broadcaster policy rate at build time, which is
+// always at or above this floor.
+const FEE_RATE = (() => {
+  const configured = Number(
+    process.env.BSV_TX_FEE_RATE_SAT_PER_BYTE ?? process.env.BSV_TX_FEE_RATE,
+  )
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_TX_FEE_RATE
+})()
+const SPLIT_FEE_RATE = (() => {
+  const configured = Number(process.env.BSV_UTXO_SPLIT_FEE_RATE_SAT_PER_BYTE)
+  return Number.isFinite(configured) && configured > 0 ? configured : FEE_RATE
+})()
 // BSV has no protocol-enforced dust limit (unlike BTC's 546). 1 sat is the minimum viable output.
 const DUST_LIMIT = 1
 // Conservative size constants (must match data-write path in lib/blockchain.ts):
@@ -53,7 +70,12 @@ function estimateSplitBytes(outputCount: number): number {
   return SPLIT_BASE_BYTES + SPLIT_INPUT_BYTES + (outputCount + 1) * SPLIT_P2PKH_OUTPUT_BYTES
 }
 function estimateSplitFee(outputCount: number): number {
-  return Math.ceil(estimateSplitBytes(outputCount) * SPLIT_FEE_RATE)
+  return estimateSplitFeeAtRate(outputCount, SPLIT_FEE_RATE)
+}
+
+/** Split fee at an explicit rate, for callers using the live policy rate. */
+function estimateSplitFeeAtRate(outputCount: number, feeRate: number): number {
+  return Math.ceil(estimateSplitBytes(outputCount) * feeRate)
 }
 // Dynamic split cooldown:
 // ensure split production can keep pace with expected per-wallet TX throughput.
@@ -157,9 +179,7 @@ async function getUnspent(address: string): Promise<any[]> {
 }
 
 function p2pkhScriptHexFromWif(wif: string): string {
-  const key = SDKPrivateKey.fromWif(wif)
-  const pubKeyHash = Buffer.from(key.toPublicKey().toHash()).toString('hex')
-  return '76a914' + pubKeyHash + '88ac'
+  return p2pkhLockingScriptHexFromWifSdk(wif)
 }
 
 // ─── Phantom-input detection (ARC 460 "parent transaction not found") ────────
@@ -279,11 +299,19 @@ function estimateSplitRequirement(outputCount: number): number {
   return totalOut + fee + DUST_LIMIT
 }
 
-function maxSplitOutputsForInput(inputSatoshis: number): number {
-  // Solve: input ≥ N × SPLIT_OUTPUT_SATS + ceil((SPLIT_BASE + INPUT + (N+1) × OUTPUT) × FEE_RATE) + DUST_LIMIT
-  // Without ceiling: input ≥ N × (SPLIT_OUTPUT_SATS + OUTPUT × FEE_RATE) + (BASE + INPUT + OUTPUT) × FEE_RATE + DUST_LIMIT
-  const fixedOverhead = (SPLIT_BASE_BYTES + SPLIT_INPUT_BYTES + SPLIT_P2PKH_OUTPUT_BYTES) * SPLIT_FEE_RATE
-  const perOutputCost = SPLIT_OUTPUT_SATS + SPLIT_P2PKH_OUTPUT_BYTES * SPLIT_FEE_RATE
+/**
+ * How many split outputs an input can fund, at a given fee rate.
+ *
+ * Solves `input ≥ N × SPLIT_OUTPUT_SATS + ceil((BASE + INPUT + (N+1) × OUTPUT) × rate) + DUST_LIMIT`.
+ * Ignoring the ceiling: `input ≥ N × (SPLIT_OUTPUT_SATS + OUTPUT × rate)
+ * + (BASE + INPUT + OUTPUT) × rate + DUST_LIMIT`. The rate is a parameter
+ * because the live policy rate decides affordability, while `SPLIT_FEE_RATE`
+ * only feeds the planning thresholds.
+ */
+function maxSplitOutputsForInput(inputSatoshis: number, feeRate: number = SPLIT_FEE_RATE): number {
+  const fixedOverhead = (SPLIT_BASE_BYTES + SPLIT_INPUT_BYTES + SPLIT_P2PKH_OUTPUT_BYTES) * feeRate
+  const perOutputCost = SPLIT_OUTPUT_SATS + SPLIT_P2PKH_OUTPUT_BYTES * feeRate
+  if (perOutputCost <= 0) return 0
   return Math.floor((inputSatoshis - fixedOverhead - DUST_LIMIT) / perOutputCost)
 }
 
@@ -370,59 +398,90 @@ async function doSplit(
   inputSource: InventoryUtxo,
   outputCount: number,
 ): Promise<{ txid: string; address: string; outputs: number } | null> {
-  const scriptHex = inputSource.output_script || (
-    (bsv.Script as any).fromAddress
-      ? (bsv.Script as any).fromAddress(address).toHex()
-      : p2pkhScriptHexFromWif(wif)
-  )
+  const scriptHex = inputSource.output_script || p2pkhScriptHexFromWif(wif)
 
-  const input = {
-    txId: inputSource.txid,
-    outputIndex: inputSource.vout,
-    address,
-    script: scriptHex,
-    satoshis: Number(inputSource.satoshis),
-  }
   const inputSats = Number(inputSource.satoshis)
-  const explicitFee = estimateSplitFee(outputCount)
-  // Sanity: maxSplitOutputsForInput should already guarantee this; double-check defensively.
-  const minRequired = outputCount * SPLIT_OUTPUT_SATS + explicitFee + DUST_LIMIT
-  if (inputSats < minRequired) {
-    await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout)
-    console.warn(`⚠️ UTXO-Split: input ${inputSats} sats < required ${minRequired} (outputs=${outputCount}, fee=${explicitFee}); releasing`)
+
+  // Fees are paid at the live Broadcaster policy rate, not the planning floor:
+  // the floor is what the thresholds are calculated from, but a fee rejection
+  // is terminal and cannot be retried at a cheaper host. Read it before sizing
+  // the output count, so a rate rise shrinks the split rather than producing a
+  // transaction that cannot pay for itself.
+  const liveFeeRate = await getCachedPolicyFeeRateSatPerByte(SPLIT_FEE_RATE)
+  const affordableOutputs = maxSplitOutputsForInput(inputSats, liveFeeRate)
+  const plannedOutputs = Math.min(outputCount, affordableOutputs)
+  if (plannedOutputs < 2) {
+    // Not enough headroom at the current rate. Cool the input down rather than
+    // releasing it bare: an immediate release hands the same UTXO back to the
+    // next cycle, which recomputes the same insufficient budget and fails
+    // identically every 30 seconds.
+    const cooldownMs = (() => {
+      const raw = Number(process.env.BSV_PROPAGATION_GRACE_MS)
+      return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 2500
+    })()
+    await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout, { cooldownMs })
+    console.warn(
+      `⚠️ UTXO-Split: input ${inputSats} sats funds only ${affordableOutputs} output(s) at the ` +
+        `live ${liveFeeRate.toFixed(3)} sat/byte rate (need 2 × ${SPLIT_OUTPUT_SATS} sats + fee); ` +
+        `releasing with cooldown`,
+    )
     return null
   }
-  const tx = new (bsv as any).Transaction().from([input])
-  for (let i = 0; i < outputCount; i++) tx.to(address, SPLIT_OUTPUT_SATS)
-  // Explicit fee — never tx.feePerKb(), which under-estimates pre-sign size by ~5x
-  // and produces ~22 sat/kB actual rate (cause of historical splitter ARC rejections).
-  tx.fee(explicitFee).change(address)
-  const signingKey = (bsv as any).PrivateKey.fromWIF(wif)
-  tx.sign(signingKey)
-  const raw = tx.serialize()
+
+  const liveFee = estimateSplitFeeAtRate(plannedOutputs, liveFeeRate)
+  const minRequired = plannedOutputs * SPLIT_OUTPUT_SATS + liveFee + DUST_LIMIT
+  if (inputSats < minRequired) {
+    await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout)
+    console.warn(`⚠️ UTXO-Split: input ${inputSats} sats < required ${minRequired} (outputs=${plannedOutputs}, fee=${liveFee}); releasing`)
+    return null
+  }
+  const splitOutputCount = plannedOutputs
+
+  let built: Awaited<ReturnType<typeof buildSplitTx>>
+  try {
+    built = await buildSplitTx({
+      wif,
+      input: {
+        txid: inputSource.txid,
+        vout: inputSource.vout,
+        satoshis: inputSats,
+        lockingScriptHex: scriptHex,
+      },
+      destinationAddress: address,
+      outputCount: splitOutputCount,
+      outputSats: SPLIT_OUTPUT_SATS,
+      explicitFeeSats: liveFee,
+    })
+  } catch (buildError) {
+    const message = buildError instanceof Error ? buildError.message : String(buildError)
+    await releaseUtxo(inputSource.topic, inputSource.txid, inputSource.vout)
+    console.error(`❌ UTXO-Split: build/sign failed for ${inputSource.txid.substring(0, 12)}...: ${message}`)
+    return null
+  }
+
+  const raw = built.rawHex
 
   try {
-    const txid = await broadcastSplitTransactionRaw(raw)
+    const txid = await broadcastSplitTransactionRaw(built.rawHex, built.efBytes)
     maintState.pendingSplitUntilByAddress.set(address, Date.now() + SPLIT_COOLDOWN_MS)
     try {
-      const outputs = tx.outputs.map((output: any, vout: number) => {
-        let outputScript = ''
-        try {
-          outputScript = typeof output?.script?.toHex === 'function'
-            ? output.script.toHex()
-            : String(output?.script || '')
-        } catch {}
-        const satoshis = Number(output?.satoshis || output?._satoshis || 0)
-        const isChange = vout >= outputCount
-        return {
-          vout,
-          satoshis,
-          outputScript,
-          utxoRole: isChange && satoshis >= Math.max(SPLIT_RESERVE_MIN_SATS, estimateSplitRequirement(Math.min(outputCount, SPLIT_BATCH)))
+      const reserveFloor = Math.max(
+        SPLIT_RESERVE_MIN_SATS,
+        estimateSplitRequirement(Math.min(splitOutputCount, SPLIT_BATCH)),
+      )
+      const outputs = built.outputs
+        .filter(output => output.satoshis >= 0)
+        .map(output => ({
+          vout: output.vout,
+          satoshis: output.satoshis,
+          outputScript: output.outputScript,
+          // Split outputs are pool inventory. The leftover change is promoted to
+          // reserve only when it is large enough to fund another split, which is
+          // what keeps the splitter able to replenish itself.
+          utxoRole: output.isChange && output.satoshis >= reserveFloor
             ? 'reserve' as const
             : 'pool' as const,
-        }
-      })
+        }))
       await admitSplitOutputs({
         topic: inputSource.topic,
         walletIndex,
@@ -442,7 +501,7 @@ async function doSplit(
       const message = submitError instanceof Error ? submitError.message : String(submitError)
       console.warn(`⚠️ Split overlay submit failed for ${txid.substring(0, 12)}...: ${message}`)
     }
-    return { txid, address, outputs: outputCount }
+    return { txid, address, outputs: splitOutputCount }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
 
