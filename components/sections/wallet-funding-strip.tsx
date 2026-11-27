@@ -43,21 +43,33 @@ function runwayTone(totalSats: number): string {
   return 'text-cyan-300'
 }
 
+function formatWalletLabel(label: string): string {
+  const match = /^W(\d+)$/i.exec(label.trim())
+  return match ? `Wallet ${match[1]}` : label
+}
+
 function WalletChip({ wallet }: { wallet: WalletFundingRow }) {
   const tone = wallet.error ? 'text-slate-400' : runwayTone(wallet.totalSats)
+  const displayLabel = formatWalletLabel(wallet.label)
+  const isPrimary = wallet.index === 0 || /^W1$/i.test(wallet.label.trim())
   return (
     <a
       href={wallet.explorerUrl}
       target="_blank"
       rel="noopener noreferrer"
-      className="inline-flex items-center gap-3 shrink-0 rounded-xl border border-white/10 bg-white/5 px-4 py-3 hover:bg-white/10 hover:border-cyan-400/30 transition-colors"
+      className="inline-flex items-center gap-3 shrink-0 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 hover:bg-white/[0.08] hover:border-cyan-400/35 transition-colors"
     >
       <div className="w-9 h-9 rounded-full bg-cyan-400/15 flex items-center justify-center shrink-0">
         <Wallet className="h-4 w-4 text-cyan-400" />
       </div>
       <div className="min-w-0">
         <div className="flex items-center gap-2 text-sm font-medium text-white">
-          <span>{wallet.label}</span>
+          <span>{displayLabel}</span>
+          {isPrimary && (
+            <span className="text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-200 border border-purple-400/30 leading-none">
+              Primary
+            </span>
+          )}
           <span className="font-mono text-xs text-slate-400">{shortAddress(wallet.address)}</span>
           <ExternalLink className="h-3 w-3 text-slate-500" />
         </div>
@@ -166,9 +178,13 @@ export function WalletFundingStrip() {
         </button>
       </div>
 
-      <div className="relative overflow-hidden pb-4">
-        <div className="pointer-events-none absolute inset-y-0 left-0 w-10 sm:w-16 bg-gradient-to-r from-black to-transparent z-10" />
-        <div className="pointer-events-none absolute inset-y-0 right-0 w-10 sm:w-16 bg-gradient-to-l from-black to-transparent z-10" />
+      <div
+        className="relative overflow-hidden pb-4"
+        style={{
+          maskImage: 'linear-gradient(to right, transparent 0%, #000 7%, #000 93%, transparent 100%)',
+          WebkitMaskImage: 'linear-gradient(to right, transparent 0%, #000 7%, #000 93%, transparent 100%)',
+        }}
+      >
 
         {wallets.length === 0 ? (
           <div className="px-4 sm:px-6 lg:px-8 text-sm text-slate-500 py-2">
