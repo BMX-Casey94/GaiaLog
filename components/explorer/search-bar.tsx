@@ -204,7 +204,10 @@ export function SearchBar({
           style={dropdownStyle}
           className="fixed z-[10000] bg-slate-900/95 backdrop-blur-md border border-slate-700/60 rounded-xl shadow-2xl overflow-y-auto overscroll-contain"
         >
-          {suggestions.map((s, i) => (
+          {suggestions.map((s, i) => {
+            const typeConfig = DATA_TYPE_CONFIG[s.dataType]
+            const TypeIcon = typeConfig?.icon
+            return (
             <button
               key={`${s.location}-${s.dataType}-${i}`}
               onClick={() => {
@@ -220,12 +223,16 @@ export function SearchBar({
               </div>
               <div className="flex items-center gap-3 flex-shrink-0">
                 <Badge variant="secondary" className="bg-slate-800/80 text-slate-300 text-xs">
-                  {DATA_TYPE_CONFIG[s.dataType]?.label || s.dataType}
+                  <span className="inline-flex items-center gap-1.5">
+                    {TypeIcon ? <TypeIcon className="h-3 w-3" /> : null}
+                    {typeConfig?.label || s.dataType}
+                  </span>
                 </Badge>
                 <span className="text-xs text-slate-500 whitespace-nowrap">{s.readingCount} readings</span>
               </div>
             </button>
-          ))}
+            )
+          })}
         </div>,
         document.body
       )}

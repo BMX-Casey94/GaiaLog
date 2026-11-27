@@ -13,6 +13,56 @@ import { ReadingCard, ReadingCardSkeleton } from "./reading-card"
 import { PaginationControls } from "./pagination-controls"
 import { DATA_TYPE_CONFIG, type ExplorerStats, type SearchResults } from "./explorer-types"
 
+const EXPLORER_PAGE_SIZE = 24
+const PAGE_CACHE_LIMIT = 4
+
+type ExplorerFilters = {
+  q: string
+  type: string | null
+  from: string
+  to: string
+}
+
+function explorerFilterKey(filters: ExplorerFilters): string {
+  return JSON.stringify(filters)
+}
+
+function explorerPageKey(filters: ExplorerFilters, pageNum: number): string {
+  return `${explorerFilterKey(filters)}|${pageNum}`
+}
+
+async function fetchExplorerPage(
+  filters: ExplorerFilters,
+  pageNum: number,
+  signal: AbortSignal,
+): Promise<SearchResults> {
+  const params = new URLSearchParams()
+  if (filters.q) params.set('q', filters.q)
+  if (filters.type) params.set('type', filters.type)
+  if (filters.from) params.set('from', new Date(`${filters.from}T00:00:00.000Z`).toISOString())
+  if (filters.to) params.set('to', new Date(`${filters.to}T23:59:59.999Z`).toISOString())
+  params.set('page', String(pageNum))
+  params.set('pageSize', String(EXPLORER_PAGE_SIZE))
+
+  const res = await fetch(`/api/explorer/search?${params}`, { signal })
+  const text = await res.text()
+  let data: any = null
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    data = null
+  }
+
+  if (!res.ok || !data?.success) {
+    throw new Error(
+      (data && typeof data.error === 'string' && data.error) ||
+        `Search failed (HTTP ${res.status})`,
+    )
+  }
+
+  return data.data as SearchResults
+}
+
 // Decorative particle canvas — defer so it never blocks first paint.
 const SparklesCore = dynamic(
   () => import("@/components/ui/sparkles").then((m) => m.SparklesCore),
@@ -25,6 +75,9 @@ export function ExplorerClient() {
   const suggestionsOpenRef = useRef(false)
   const suppressAutoSearchUntilRef = useRef<number>(0)
   const activeSearchAbortRef = useRef<AbortController | null>(null)
+  const pageCacheRef = useRef(new Map<string, SearchResults>())
+  const inflightRef = useRef(new Map<string, { controller: AbortController; promise: Promise<SearchResults> }>())
+  const [firstPageSettled, setFirstPageSettled] = useState(false)
 
   // Filter state
   const [selectedType, setSelectedType] = useState<string | null>(null)
@@ -46,73 +99,123 @@ export function ExplorerClient() {
     byType: null,
   })
 
+  const rememberPage = useCallback((key: string, data: SearchResults) => {
+    const cache = pageCacheRef.current
+    cache.delete(key)
+    cache.set(key, data)
+    while (cache.size > PAGE_CACHE_LIMIT) {
+      const oldest = cache.keys().next().value
+      if (oldest === undefined) break
+      cache.delete(oldest)
+    }
+  }, [])
+
+  const applyReadingTotal = useCallback((data: SearchResults) => {
+    const fastTotal = Number(data.pagination?.total)
+    if (!Number.isFinite(fastTotal) || fastTotal < 0) return
+    setStats((prev) => ({ ...prev, totalReadings: fastTotal }))
+  }, [])
+
+  const abortOtherFilters = useCallback((filters: ExplorerFilters) => {
+    const prefix = `${explorerFilterKey(filters)}|`
+    for (const [key, entry] of inflightRef.current) {
+      if (key.startsWith(prefix)) continue
+      entry.controller.abort()
+      inflightRef.current.delete(key)
+    }
+  }, [])
+
+  const loadPage = useCallback((filters: ExplorerFilters, pageNum: number): Promise<SearchResults> => {
+    const key = explorerPageKey(filters, pageNum)
+    const cached = pageCacheRef.current.get(key)
+    if (cached) return Promise.resolve(cached)
+
+    const existing = inflightRef.current.get(key)
+    if (existing) return existing.promise
+
+    const controller = new AbortController()
+    const promise = fetchExplorerPage(filters, pageNum, controller.signal)
+      .then((data) => {
+        rememberPage(key, data)
+        return data
+      })
+      .finally(() => {
+        const current = inflightRef.current.get(key)
+        if (current?.promise === promise) inflightRef.current.delete(key)
+      })
+
+    inflightRef.current.set(key, { controller, promise })
+    return promise
+  }, [rememberPage])
+
+  const prefetchNextPage = useCallback((filters: ExplorerFilters, data: SearchResults) => {
+    if (!data.pagination.hasMore) return
+    const nextPage = data.pagination.page + 1
+    const key = explorerPageKey(filters, nextPage)
+    if (pageCacheRef.current.has(key) || inflightRef.current.has(key)) return
+    void loadPage(filters, nextPage).catch((e) => {
+      if (e instanceof Error && e.name === 'AbortError') return
+    })
+  }, [loadPage])
+
   const handleSearch = useCallback(async (
     pageNum: number = 1,
     queryOverride?: string,
   ) => {
-    // Cancel any previous in-flight search so slow filters never overwrite newer ones.
+    const q = queryOverride !== undefined ? queryOverride : searchQuery
+    const filters: ExplorerFilters = {
+      q,
+      type: selectedType,
+      from: dateFrom,
+      to: dateTo,
+    }
+    const key = explorerPageKey(filters, pageNum)
+
+    // A new filter drops every other in-flight page. The page being opened
+    // keeps its request, including one already started as a silent prefetch.
     activeSearchAbortRef.current?.abort()
+    abortOtherFilters(filters)
+
+    const cached = pageCacheRef.current.get(key)
+    if (cached) {
+      setResults(cached)
+      setPage(pageNum)
+      setError(null)
+      setLoading(false)
+      setFirstPageSettled(true)
+      applyReadingTotal(cached)
+      prefetchNextPage(filters, cached)
+      return
+    }
+
     const controller = new AbortController()
     activeSearchAbortRef.current = controller
-
     setLoading(true)
     setError(null)
 
     try {
-      const q = queryOverride !== undefined ? queryOverride : searchQuery
-      const params = new URLSearchParams()
-      if (q) params.set('q', q)
-      if (selectedType) params.set('type', selectedType)
-      if (dateFrom) params.set('from', new Date(`${dateFrom}T00:00:00.000Z`).toISOString())
-      if (dateTo) params.set('to', new Date(`${dateTo}T23:59:59.999Z`).toISOString())
-      params.set('page', String(pageNum))
-      params.set('pageSize', '24')
-
-      const res = await fetch(`/api/explorer/search?${params}`, {
-        signal: controller.signal,
-      })
-      const text = await res.text()
-      let data: any = null
-      try {
-        data = text ? JSON.parse(text) : null
-      } catch {
-        data = null
-      }
-
+      const data = await loadPage(filters, pageNum)
       if (controller.signal.aborted) return
-
-      if (!res.ok) {
-        setError(
-          (data && typeof data.error === 'string' && data.error) ||
-            `Search failed (HTTP ${res.status})`,
-        )
-        return
-      }
-
-      if (data?.success) {
-        setResults(data.data)
-        setPage(pageNum)
-        // Reuse the search total for the stats bar — avoids a second round-trip.
-        const fastTotal = Number(data?.data?.pagination?.total)
-        if (Number.isFinite(fastTotal) && fastTotal >= 0) {
-          setStats((prev) => ({ ...prev, totalReadings: fastTotal }))
-        }
-      } else {
-        setError(data?.error || 'Search failed')
-      }
+      setResults(data)
+      setPage(pageNum)
+      applyReadingTotal(data)
+      prefetchNextPage(filters, data)
     } catch (e) {
+      if (controller.signal.aborted) return
       if (e instanceof Error && e.name === 'AbortError') return
       setError(e instanceof Error ? e.message : 'Search failed')
     } finally {
       if (!controller.signal.aborted) {
         setLoading(false)
+        setFirstPageSettled(true)
       }
     }
-  }, [searchQuery, selectedType, dateFrom, dateTo])
+  }, [searchQuery, selectedType, dateFrom, dateTo, abortOtherFilters, applyReadingTotal, loadPage, prefetchNextPage])
 
-  // Fetch stats once on mount (single request — the search response keeps the
-  // readings total fresh, so no polling loop is needed).
+  // Stats wait until the first page of readings has settled, so the cards
+  // are not competing with the aggregate queries on the opening request.
   useEffect(() => {
+    if (!firstPageSettled) return
     let cancelled = false
 
     async function fetchStats() {
@@ -156,7 +259,7 @@ export function ExplorerClient() {
 
     fetchStats()
     return () => { cancelled = true }
-  }, [])
+  }, [firstPageSettled])
 
   // Drop a selected type if stats say that family has no live rows.
   useEffect(() => {

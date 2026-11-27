@@ -14,25 +14,6 @@ import {
   MapPin,
   Wallet,
   Shield,
-  Wind,
-  Waves,
-  Activity,
-  Gauge,
-  Compass,
-  Flame,
-  Sun,
-  Cloud,
-  Leaf,
-  ShieldCheck,
-  Droplets,
-  CloudRain,
-  Trees,
-  AlertTriangle,
-  Pickaxe,
-  Navigation,
-  Building2,
-  Database,
-  type LucideIcon,
 } from "lucide-react"
 import {
   Dialog,
@@ -43,29 +24,10 @@ import {
 } from "@/components/ui/dialog"
 import { getBSVExplorerUrl, getBSVAddressUrl, isValidTxId } from "@/lib/utils"
 import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
+import { familyIcon } from "@/lib/family-icons"
 import { getKeyMetrics } from "@/lib/family-metrics"
 import { explorerCardBadge, type ArcPhase } from "@/lib/arc-tx-status"
 import { holdHomepageStage, whenHomepageStageOpen } from "@/lib/homepage-load-queue"
-
-const FAMILY_ICONS: Record<string, LucideIcon> = {
-  air_quality: Wind,
-  water_levels: Waves,
-  seismic_activity: Activity,
-  advanced_metrics: Gauge,
-  geomagnetism: Compass,
-  volcanic_activity: Flame,
-  space_weather: Sun,
-  upper_atmosphere: Cloud,
-  biodiversity: Leaf,
-  conservation_status: ShieldCheck,
-  hydrology: Droplets,
-  flood_risk: CloudRain,
-  land_use_change: Trees,
-  natural_events: AlertTriangle,
-  mining_activity: Pickaxe,
-  transport_tracking: Navigation,
-  planning_development: Building2,
-}
 
 interface TransactionDisplay {
   id: string
@@ -235,7 +197,7 @@ export function BlockchainExplorer() {
                   blockHeight: 0,
                 })
 
-                const FamilyIcon = FAMILY_ICONS[descriptor.id] ?? Database
+                const FamilyIcon = familyIcon(descriptor.id)
                 const isRejected = badge.label === 'Rejected' || badge.label === 'Reorg'
                 const isConfirmed = badge.label === 'Confirmed'
                 const StatusIcon = isConfirmed ? Check : isRejected ? X : Clock

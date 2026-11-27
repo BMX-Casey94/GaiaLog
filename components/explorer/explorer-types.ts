@@ -1,13 +1,6 @@
-import type React from "react"
-import {
-  Database,
-  Droplets,
-  Activity,
-  Thermometer,
-  Globe,
-  Layers,
-} from "lucide-react"
+import type { LucideIcon } from "lucide-react"
 import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
+import { familyIcon } from "@/lib/family-icons"
 
 export interface ExplorerReading {
   txid: string
@@ -55,20 +48,9 @@ export interface ExplorerStats {
   byType: Record<string, number> | null
 }
 
-const FAMILY_ICON_MAP: Record<string, React.ElementType> = {
-  Database,
-  Droplets,
-  Activity,
-  Thermometer,
-  Magnet: Globe,
-  Mountain: Layers,
-  Orbit: Globe,
-  Cloud: Globe,
-}
-
 export interface DataTypeConfig {
   label: string
-  icon: React.ElementType
+  icon: LucideIcon
   color: string
   glowColor: 'blue' | 'purple' | 'green' | 'red' | 'orange' | 'cyan'
   accent: string
@@ -79,7 +61,7 @@ export const DATA_TYPE_CONFIG: Record<string, DataTypeConfig> = Object.fromEntri
     key,
     {
       label: descriptor.label,
-      icon: FAMILY_ICON_MAP[descriptor.icon] || Database,
+      icon: familyIcon(key),
       color: descriptor.color === 'emerald' ? 'green' : descriptor.color === 'rose' ? 'red' : descriptor.color === 'indigo' ? 'purple' : descriptor.color === 'sky' ? 'cyan' : descriptor.color,
       glowColor: descriptor.glowColor === 'blue' || descriptor.glowColor === 'purple' || descriptor.glowColor === 'green' || descriptor.glowColor === 'red' || descriptor.glowColor === 'orange' || descriptor.glowColor === 'cyan'
         ? descriptor.glowColor
