@@ -148,7 +148,7 @@ export function DataSources({ initialSources }: { initialSources?: InitialProvid
                   <div className="w-12 h-12 shrink-0 rounded-tl-2xl rounded-br-xl bg-purple-500/10 border-b border-r border-purple-400/20 flex items-center justify-center">
                     <Icon className="h-5 w-5 text-purple-300" />
                   </div>
-                  <div className="min-w-0 pt-3 pr-4">
+                  <div className="min-w-0 flex-1 self-center text-center pt-1.5 pr-4">
                     <div className="text-white font-semibold leading-snug truncate">{source.name}</div>
                     <div className="text-xs text-slate-400 font-normal mt-0.5 truncate">{source.type}</div>
                   </div>

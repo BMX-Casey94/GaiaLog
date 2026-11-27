@@ -238,7 +238,7 @@ export function BlockchainExplorer() {
                     <div>
                       <div className="flex items-start justify-between gap-3 -mr-4 -mt-4 min-w-0">
                         <div className="flex items-center gap-2.5 min-w-0 flex-1 pt-3.5">
-                          <div className="w-8 h-8 shrink-0 rounded-none rounded-tr-lg bg-purple-500/15 border border-purple-400/25 flex items-center justify-center">
+                          <div className="w-8 h-8 shrink-0 rounded-none rounded-tl-lg bg-purple-500/15 border border-purple-400/25 flex items-center justify-center">
                             <FamilyIcon className="h-4 w-4 text-purple-300" />
                           </div>
                           <div className="flex items-center gap-2 min-w-0 flex-wrap">
