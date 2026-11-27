@@ -12,6 +12,7 @@ import {
   type MetricAlert,
   type MetricAlertType,
 } from "@/lib/metric-alerts"
+import { holdHomepageStage } from "@/lib/homepage-load-queue"
 
 type AlertType = MetricAlertType
 type AlertData = MetricAlert
@@ -107,9 +108,19 @@ export function LiveDashboard() {
   }, [])
 
   useEffect(() => {
-    fetchData()
+    const release = holdHomepageStage(0)
+    let released = false
+    const releaseOnce = () => {
+      if (released) return
+      released = true
+      release()
+    }
+    void fetchData().finally(releaseOnce)
     const interval = setInterval(fetchData, 45000)
-    return () => clearInterval(interval)
+    return () => {
+      releaseOnce()
+      clearInterval(interval)
+    }
   }, [fetchData])
 
   return (

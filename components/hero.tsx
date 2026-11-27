@@ -10,6 +10,7 @@ import {
   processDataIntoAlerts,
   readingsToEnvironmentalData,
 } from "@/lib/metric-alerts"
+import { holdHomepageStage } from "@/lib/homepage-load-queue"
 
 // Heavy canvas visuals are decorative — defer them so they never block first paint.
 const SparklesCore = dynamic(
@@ -113,9 +114,19 @@ export function Hero() {
       }
     }
 
-    fetchStats()
+    const release = holdHomepageStage(0)
+    let released = false
+    const releaseOnce = () => {
+      if (released) return
+      released = true
+      release()
+    }
+    void fetchStats().finally(releaseOnce)
     const interval = setInterval(fetchStats, 45000)
-    return () => clearInterval(interval)
+    return () => {
+      releaseOnce()
+      clearInterval(interval)
+    }
   }, [])
 
   const formatTotalReadings = (n: number | null): string => {

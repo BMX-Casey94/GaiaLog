@@ -4,7 +4,32 @@ import { useCallback, useEffect, useState } from "react"
 import { GlowCard } from "@/components/ui/spotlight-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { ExternalLink, Clock, Hash, MapPin, Wallet, Shield } from "lucide-react"
+import {
+  ExternalLink,
+  Clock,
+  MapPin,
+  Wallet,
+  Shield,
+  Wind,
+  Waves,
+  Activity,
+  Gauge,
+  Compass,
+  Flame,
+  Sun,
+  Cloud,
+  Leaf,
+  ShieldCheck,
+  Droplets,
+  CloudRain,
+  Trees,
+  AlertTriangle,
+  Pickaxe,
+  Navigation,
+  Building2,
+  Database,
+  type LucideIcon,
+} from "lucide-react"
 import {
   Dialog,
   DialogContent,
@@ -15,6 +40,27 @@ import {
 import { getBSVExplorerUrl, getBSVAddressUrl, isValidTxId } from "@/lib/utils"
 import { DATA_FAMILY_DESCRIPTORS } from "@/lib/stream-registry"
 import { getKeyMetrics } from "@/lib/family-metrics"
+import { holdHomepageStage, whenHomepageStageOpen } from "@/lib/homepage-load-queue"
+
+const FAMILY_ICONS: Record<string, LucideIcon> = {
+  air_quality: Wind,
+  water_levels: Waves,
+  seismic_activity: Activity,
+  advanced_metrics: Gauge,
+  geomagnetism: Compass,
+  volcanic_activity: Flame,
+  space_weather: Sun,
+  upper_atmosphere: Cloud,
+  biodiversity: Leaf,
+  conservation_status: ShieldCheck,
+  hydrology: Droplets,
+  flood_risk: CloudRain,
+  land_use_change: Trees,
+  natural_events: AlertTriangle,
+  mining_activity: Pickaxe,
+  transport_tracking: Navigation,
+  planning_development: Building2,
+}
 
 interface TransactionDisplay {
   id: string
@@ -90,9 +136,32 @@ export function BlockchainExplorer() {
   }, [])
 
   useEffect(() => {
-    fetchTransactions()
-    const interval = setInterval(fetchTransactions, 45000)
-    return () => clearInterval(interval)
+    const release = holdHomepageStage(2)
+    let cancelled = false
+    let intervalId: ReturnType<typeof setInterval> | undefined
+    let released = false
+    const releaseOnce = () => {
+      if (released) return
+      released = true
+      release()
+    }
+
+    void whenHomepageStageOpen(2).then(() => {
+      if (cancelled) {
+        releaseOnce()
+        return
+      }
+      void fetchTransactions().finally(() => {
+        releaseOnce()
+        if (!cancelled) intervalId = setInterval(fetchTransactions, 45000)
+      })
+    })
+
+    return () => {
+      cancelled = true
+      releaseOnce()
+      if (intervalId) clearInterval(intervalId)
+    }
   }, [fetchTransactions])
 
   const buildMetricsSummary = (family: string, metrics: Record<string, unknown>): string | null => {
@@ -143,16 +212,18 @@ export function BlockchainExplorer() {
                 const metricsSummary = buildMetricsSummary(descriptor.id, tx.metrics)
                 const description = metricsSummary ?? `${descriptor.label} data recorded`
 
+                const FamilyIcon = FAMILY_ICONS[descriptor.id] ?? Database
+
                 return (
-                  <GlowCard key={descriptor.id} glowColor="purple" customSize>
-                    <div className="flex items-start gap-3 min-w-0">
-                      <div className="w-10 h-10 shrink-0 bg-slate-950/60 rounded-full flex items-center justify-center">
-                        <Hash className="h-5 w-5 text-purple-300" />
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-start justify-between gap-2 mb-1">
+                  <GlowCard key={descriptor.id} glowColor="purple" customSize className="h-full flex flex-col justify-between !gap-0">
+                    <div>
+                      <div className="flex items-start justify-between gap-3 -mr-4 -mt-4 min-w-0">
+                        <div className="flex items-center gap-2.5 min-w-0 flex-1 pt-3.5">
+                          <div className="w-8 h-8 shrink-0 rounded-lg bg-purple-500/15 border border-purple-400/25 flex items-center justify-center">
+                            <FamilyIcon className="h-4 w-4 text-purple-300" />
+                          </div>
                           <div className="flex items-center gap-2 min-w-0 flex-wrap">
-                            <span className="font-medium text-white">{descriptor.label}</span>
+                            <span className="font-semibold text-white leading-tight">{descriptor.label}</span>
                             <Badge
                               variant="secondary"
                               className={tx.status === 'pending'
@@ -162,19 +233,21 @@ export function BlockchainExplorer() {
                               {tx.status === 'pending' ? 'Unconfirmed' : 'Confirmed'}
                             </Badge>
                           </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-purple-300 hover:text-purple-200 shrink-0 h-auto px-2 py-1"
-                            onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
-                          >
-                            <span className="inline-flex items-center whitespace-nowrap">
-                              View TX
-                              <ExternalLink className="ml-1 h-3 w-3" />
-                            </span>
-                          </Button>
                         </div>
-                        <div className="text-sm text-slate-400 mb-1 line-clamp-2">
+                        <button
+                          type="button"
+                          className="shrink-0 self-start rounded-tr-2xl rounded-bl-xl border-b border-l border-purple-400/20 bg-purple-500/10 px-3 py-2.5 text-xs font-medium text-purple-200 transition-colors hover:bg-purple-500/20 hover:text-white"
+                          onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
+                        >
+                          <span className="inline-flex items-center whitespace-nowrap">
+                            View TX
+                            <ExternalLink className="ml-1 h-3 w-3" />
+                          </span>
+                        </button>
+                      </div>
+
+                      <div className="mt-2.5 space-y-1.5 min-w-0">
+                        <div className="text-sm text-slate-300/90 line-clamp-2">
                           {description}
                         </div>
                         {tx.location && (
@@ -183,15 +256,17 @@ export function BlockchainExplorer() {
                             <span className="min-w-0 line-clamp-2 break-words">{tx.location}</span>
                           </div>
                         )}
-                        <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-xs text-slate-500">
-                          <Clock className="h-3 w-3 shrink-0" />
-                          <span>{tx.timestamp}</span>
-                          <span>•</span>
-                          <span className="font-mono">
-                            {tx.id.slice(0, 8)}...{tx.id.slice(-8)}
-                          </span>
-                        </div>
                       </div>
+                    </div>
+
+                    <div className="flex items-center justify-between flex-wrap gap-2 text-xs text-slate-400 border-t border-white/5 pt-2.5 mt-3">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Clock className="h-3 w-3 shrink-0 text-slate-500" />
+                        <span>{tx.timestamp}</span>
+                      </span>
+                      <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-white/5 border border-white/10 text-slate-300">
+                        {tx.id.slice(0, 8)}…{tx.id.slice(-8)}
+                      </span>
                     </div>
                   </GlowCard>
                 )
