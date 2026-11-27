@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
-import { Wallet, ExternalLink, RefreshCw } from "lucide-react"
+import { Wallet, Landmark, Coins, ExternalLink, RefreshCw, type LucideIcon } from "lucide-react"
 import { holdHomepageStage, whenHomepageStageOpen } from "@/lib/homepage-load-queue"
 
 interface WalletFundingRow {
@@ -48,28 +48,35 @@ function formatWalletLabel(label: string): string {
   return match ? `Wallet ${match[1]}` : label
 }
 
+const WALLET_ICONS: LucideIcon[] = [Landmark, Wallet, Coins]
+
 function WalletChip({ wallet }: { wallet: WalletFundingRow }) {
   const tone = wallet.error ? 'text-slate-400' : runwayTone(wallet.totalSats)
   const displayLabel = formatWalletLabel(wallet.label)
   const isPrimary = wallet.index === 0 || /^W1$/i.test(wallet.label.trim())
+  const Icon = WALLET_ICONS[wallet.index] ?? Wallet
   return (
-    <a
-      href={wallet.explorerUrl}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="inline-flex items-center gap-3 shrink-0 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 hover:bg-white/[0.08] hover:border-cyan-400/35 transition-colors"
-    >
-      <div className="w-9 h-9 rounded-full bg-cyan-400/15 flex items-center justify-center shrink-0">
-        <Wallet className="h-4 w-4 text-cyan-400" />
+    <div className="relative shrink-0">
+      {isPrimary && (
+        <span className="pointer-events-none absolute left-1/2 top-0 z-10 -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded-full border border-purple-300/40 bg-[#160b2e] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-purple-100 leading-none shadow-[0_4px_12px_-6px_rgba(0,0,0,0.8)]">
+          Primary
+        </span>
+      )}
+      <a
+        href={wallet.explorerUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="inline-flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 hover:bg-white/[0.08] hover:border-cyan-400/35 transition-colors"
+      >
+      <div
+        className="w-9 h-9 shrink-0 bg-cyan-400/15 border border-cyan-300/35 flex items-center justify-center"
+        style={{ borderRadius: '10px 0 10px 0' }}
+      >
+        <Icon className="h-4 w-4 text-cyan-300" strokeWidth={1.75} />
       </div>
       <div className="min-w-0">
         <div className="flex items-center gap-2 text-sm font-medium text-white">
           <span>{displayLabel}</span>
-          {isPrimary && (
-            <span className="text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-200 border border-purple-400/30 leading-none">
-              Primary
-            </span>
-          )}
           <span className="font-mono text-xs text-slate-400">{shortAddress(wallet.address)}</span>
           <ExternalLink className="h-3 w-3 text-slate-500" />
         </div>
@@ -84,7 +91,8 @@ function WalletChip({ wallet }: { wallet: WalletFundingRow }) {
           </div>
         )}
       </div>
-    </a>
+      </a>
+    </div>
   )
 }
 
@@ -195,7 +203,7 @@ export function WalletFundingStrip() {
             {groups.map((group) => (
               <div
                 key={group}
-                className="flex gap-3 shrink-0 px-10 sm:px-16"
+                className="flex items-stretch gap-3 shrink-0 px-10 pt-3.5 sm:px-16"
                 aria-hidden={group > 0 ? true : undefined}
               >
                 {wallets.map((wallet) => (
