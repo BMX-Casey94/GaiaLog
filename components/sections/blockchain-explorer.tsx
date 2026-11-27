@@ -248,7 +248,10 @@ export function BlockchainExplorer() {
                     <div>
                       <div className="flex items-start justify-between gap-3 -mr-4 -mt-4 min-w-0">
                         <div className="flex items-center gap-2.5 min-w-0 flex-1 pt-3.5">
-                          <div className="w-8 h-8 shrink-0 rounded-tl-xl rounded-br-xl rounded-tr-none rounded-bl-none bg-purple-500/15 border border-purple-400/25 flex items-center justify-center">
+                          <div
+                            className="w-8 h-8 shrink-0 bg-purple-500/15 border border-purple-400/25 flex items-center justify-center"
+                            style={{ borderRadius: '12px 0 12px 0' }}
+                          >
                             <FamilyIcon className="h-4 w-4 text-purple-300" />
                           </div>
                           <span className="font-semibold text-white leading-tight truncate">{descriptor.label}</span>
@@ -256,7 +259,8 @@ export function BlockchainExplorer() {
                         <button
                           type="button"
                           title={badge.title}
-                          className="shrink-0 self-start rounded-tr-2xl rounded-bl-xl border-b border-l border-purple-400/20 bg-purple-500/10 px-3 py-2.5 text-xs font-medium text-purple-200 transition-colors hover:bg-purple-500/20 hover:text-white"
+                          className="shrink-0 self-start border-b border-l border-purple-400/20 bg-purple-500/10 px-3 py-2.5 text-xs font-medium text-purple-200 transition-colors hover:bg-purple-500/20 hover:text-white"
+                          style={{ borderRadius: '0 16px 0 12px' }}
                           onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
                         >
                           <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
