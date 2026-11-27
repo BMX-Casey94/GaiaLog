@@ -7,6 +7,8 @@ import { Button } from "@/components/ui/button"
 import {
   ExternalLink,
   Clock,
+  Check,
+  X,
   MapPin,
   Wallet,
   Shield,
@@ -232,34 +234,40 @@ export function BlockchainExplorer() {
                 })
 
                 const FamilyIcon = FAMILY_ICONS[descriptor.id] ?? Database
+                const isRejected = badge.label === 'Rejected' || badge.label === 'Reorg'
+                const isConfirmed = badge.label === 'Confirmed'
+                const StatusIcon = isConfirmed ? Check : isRejected ? X : Clock
+                const statusCircleClass = isConfirmed
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400/40'
+                  : isRejected
+                    ? 'bg-red-500/20 text-red-300 border-red-400/40'
+                    : 'bg-amber-500/20 text-amber-300 border-amber-400/40'
 
                 return (
                   <GlowCard key={descriptor.id} glowColor="purple" customSize className="h-full flex flex-col justify-between !gap-0">
                     <div>
                       <div className="flex items-start justify-between gap-3 -mr-4 -mt-4 min-w-0">
                         <div className="flex items-center gap-2.5 min-w-0 flex-1 pt-3.5">
-                          <div className="w-8 h-8 shrink-0 rounded-none rounded-tl-lg bg-purple-500/15 border border-purple-400/25 flex items-center justify-center">
+                          <div className="w-8 h-8 shrink-0 rounded-tl-xl rounded-br-xl rounded-tr-none rounded-bl-none bg-purple-500/15 border border-purple-400/25 flex items-center justify-center">
                             <FamilyIcon className="h-4 w-4 text-purple-300" />
                           </div>
-                          <div className="flex items-center gap-2 min-w-0 flex-wrap">
-                            <span className="font-semibold text-white leading-tight">{descriptor.label}</span>
-                            <Badge
-                              variant="secondary"
-                              className={homepageBadgeClass(badge.label)}
-                              title={badge.title}
-                            >
-                              {badge.label}
-                            </Badge>
-                          </div>
+                          <span className="font-semibold text-white leading-tight truncate">{descriptor.label}</span>
                         </div>
                         <button
                           type="button"
+                          title={badge.title}
                           className="shrink-0 self-start rounded-tr-2xl rounded-bl-xl border-b border-l border-purple-400/20 bg-purple-500/10 px-3 py-2.5 text-xs font-medium text-purple-200 transition-colors hover:bg-purple-500/20 hover:text-white"
                           onClick={() => window.open(getWhatsonChainUrl(tx.id), '_blank')}
                         >
-                          <span className="inline-flex items-center whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+                            <span
+                              className={`inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border ${statusCircleClass}`}
+                              aria-label={badge.label}
+                            >
+                              <StatusIcon className="h-2.5 w-2.5" strokeWidth={2.5} />
+                            </span>
                             View TX
-                            <ExternalLink className="ml-1 h-3 w-3" />
+                            <ExternalLink className="h-3 w-3" />
                           </span>
                         </button>
                       </div>

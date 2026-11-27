@@ -143,8 +143,8 @@ export function DataSources({ initialSources }: { initialSources?: InitialProvid
             {visibleSources.map((source) => {
               const Icon = source.icon
               return (
-              <GlowCard key={source.id} glowColor="purple" customSize className="h-full flex flex-col justify-between">
-                <div className="flex items-start gap-3 -mx-4 -mt-4 mb-4 min-w-0">
+              <GlowCard key={source.id} glowColor="purple" customSize className="h-full flex flex-col justify-between !gap-0">
+                <div className="flex items-start gap-3 -mx-4 -mt-4 mb-3 min-w-0">
                   <div className="w-12 h-12 shrink-0 rounded-tl-2xl rounded-br-xl bg-purple-500/10 border-b border-r border-purple-400/20 flex items-center justify-center">
                     <Icon className="h-5 w-5 text-purple-300" />
                   </div>
@@ -153,7 +153,7 @@ export function DataSources({ initialSources }: { initialSources?: InitialProvid
                     <div className="text-xs text-slate-400 font-normal mt-0.5 truncate">{source.type}</div>
                   </div>
                 </div>
-                <div className="space-y-2.5 border-t border-white/5 pt-3.5 text-xs">
+                <div className="space-y-2.5 border-t border-white/5 pt-3 text-xs">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-slate-400">Refresh Rate</span>
                     <div className="flex items-center gap-1.5 text-slate-200 font-medium tabular-nums">
